@@ -179,8 +179,6 @@ pub struct Caches {
     pub providers_proxies: SnapshotCache,
     /// `/providers/rules`
     pub providers_rules: SnapshotCache,
-    /// `/connections` —— 高频但变化也快；TTL 200ms（≤ dashboard 默认 1Hz/5）。
-    pub connections: SnapshotCache,
 }
 
 impl Caches {
@@ -193,7 +191,6 @@ impl Caches {
             rules: SnapshotCache::new(medium),
             providers_proxies: SnapshotCache::new(short),
             providers_rules: SnapshotCache::new(medium),
-            connections: SnapshotCache::new(Duration::from_millis(200)),
         })
     }
 
@@ -209,9 +206,6 @@ impl Caches {
     pub fn invalidate_rule_state(&self) {
         self.rules.invalidate();
         self.providers_rules.invalidate();
-    }
-    pub fn invalidate_connection_state(&self) {
-        self.connections.invalidate();
     }
 }
 

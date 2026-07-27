@@ -406,13 +406,14 @@ async fn connections(
         let rx = s.ws_hubs.connections.subscribe();
         return ws.on_upgrade(move |sock| watch_to_ws(sock, rx, permit));
     }
-    // 非 WS：fetch 缓存（200ms TTL）。多 dashboard 同时打 GET → 一次 build。
-    let runtime = s.runtime.clone();
-    let bytes = s
-        .caches
-        .connections
-        .fetch_bytes(move || build_connections_value(&runtime));
-    json_bytes(bytes)
+    // Mihomo returns a live snapshot here. Caching this endpoint causes
+    // short-lived connections and close operations to disappear behind stale
+    // state, which breaks dashboard polling semantics.
+    json_bytes(
+        serde_json::to_vec(&build_connections_value(&s.runtime))
+            .unwrap_or_else(|_| b"{}".to_vec())
+            .into(),
+    )
 }
 
 async fn connections_to_ws(
@@ -431,7 +432,7 @@ async fn connections_to_ws(
     }
 }
 
-fn build_connections_value(runtime: &Arc<Runtime>) -> Value {
+pub(crate) fn build_connections_value(runtime: &Arc<Runtime>) -> Value {
     let manager = runtime.connections.manager_snapshot();
     let download_total = manager.download_total;
     let upload_total = manager.upload_total;
@@ -450,8 +451,6 @@ fn build_connections_value(runtime: &Arc<Runtime>) -> Value {
                 "providerChains": conn.provider_chains,
                 "rule": conn.rule,
                 "rulePayload": conn.rule_payload,
-                "maxUploadRate": conn.max_upload_rate,
-                "maxDownloadRate": conn.max_download_rate,
             })
         })
         .collect();
@@ -465,7 +464,6 @@ fn build_connections_value(runtime: &Arc<Runtime>) -> Value {
 
 async fn connections_close_all(State(s): State<NativeState>) -> impl IntoResponse {
     s.runtime.connections.close_all();
-    s.caches.invalidate_connection_state();
     StatusCode::NO_CONTENT
 }
 
@@ -474,9 +472,7 @@ async fn connections_close_one(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     // 同时兼容 numeric id 与 uuid 字符串（mihomo dashboard 传 uuid）。
-    if s.runtime.connections.close_by_uuid_or_numeric(&id) {
-        s.caches.invalidate_connection_state();
-    }
+    s.runtime.connections.close_by_uuid_or_numeric(&id);
     StatusCode::NO_CONTENT.into_response()
 }
 

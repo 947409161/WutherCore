@@ -140,7 +140,7 @@ impl UdpSession {
 
     pub fn cancel(&self) {
         self.cancel.send_replace(true);
-        self.guard.cancel.notify_waiters();
+        self.guard.cancel.cancel();
     }
 
     pub fn cancel_receiver(&self) -> watch::Receiver<bool> {

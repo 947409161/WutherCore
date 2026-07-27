@@ -241,61 +241,9 @@ impl Drop for WsHubs {
     }
 }
 
-/// 把 `manager_snapshot` 直接序列化成与 `compat::connections_snapshot` 等价
-/// 的 JSON 文本。复制一份在这里是为了让 producer 闭包不依赖 NativeState（避免
-/// 循环引用）。
 fn serialize_connections(runtime: &Arc<core_runtime::Runtime>) -> String {
-    let manager = runtime.connections.manager_snapshot();
-    let conns: Vec<serde_json::Value> = manager
-        .connections
-        .into_iter()
-        .map(|conn| {
-            serde_json::json!({
-                "id": conn.id,
-                "metadata": conn.metadata,
-                "upload": conn.upload,
-                "download": conn.download,
-                "start": iso8601_secs(conn.start),
-                "chains": conn.chains,
-                "providerChains": conn.provider_chains,
-                "rule": conn.rule,
-                "rulePayload": conn.rule_payload,
-                "maxUploadRate": conn.max_upload_rate,
-                "maxDownloadRate": conn.max_download_rate,
-            })
-        })
-        .collect();
-    serde_json::to_string(&serde_json::json!({
-        "downloadTotal": manager.download_total,
-        "uploadTotal": manager.upload_total,
-        "connections": conns,
-        "memory": manager.memory,
-    }))
-    .unwrap_or_else(|_| String::from("{}"))
-}
-
-fn iso8601_secs(ts_secs: u64) -> String {
-    // 与 compat::iso8601 同算法；这里独立一份避免跨模块依赖（compat::iso8601
-    // 是 module-private）。
-    let days = (ts_secs / 86_400) as i64;
-    let secs_of_day = (ts_secs % 86_400) as u32;
-    let hour = secs_of_day / 3600;
-    let minute = (secs_of_day / 60) % 60;
-    let second = secs_of_day % 60;
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u32;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i32 + (era as i32) * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = y + if m <= 2 { 1 } else { 0 };
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        year, m, d, hour, minute, second
-    )
+    serde_json::to_string(&crate::compat::build_connections_value(runtime))
+        .unwrap_or_else(|_| String::from("{}"))
 }
 
 #[cfg(test)]

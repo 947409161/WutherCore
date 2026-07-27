@@ -4,12 +4,12 @@
 //! * [`ConnectionMeta`] —— Clash dashboard 的 metadata 子对象，与 `constant.Metadata`
 //!   字段一一对应，能直接被 serde 序列化（包含 sourceIP / sourcePort / destinationIP /
 //!   destinationPort / inboundIP / inboundPort / inboundName / inboundUser / host /
-//!   dnsMode / process / processPath / specialProxy / specialRules / sniffHost / uuid /
-//!   chains / rule / rulePayload；providerChains 是 tracker 顶层字段，随 meta 在内存
-//!   中流转但不序列化进 metadata 子对象）。
+//!   dnsMode / process / processPath / specialProxy / specialRules / sniffHost。连接 id、
+//!   chains、providerChains、rule、rulePayload 是 tracker 顶层字段；内部索引字段
+//!   不会泄漏到 metadata 子对象。
 //! * [`ConnectionEntry`] —— 一条活跃连接的完整状态：immutable `Arc<ConnectionMeta>` +
 //!   实时累计字节数（`Arc<AtomicU64>`，由 splice 路径在 copy loop 内自增）+ 取消
-//!   信号（`Arc<Notify>`，DELETE /connections/:id 触发后让数据流主动 shutdown）+
+//!   信号（`CancellationToken`，DELETE /connections/:id 触发后让数据流主动 shutdown）+
 //!   smart-block 旗标（AtomicU8，flip 不需要重建 meta）。
 //! * [`ConnectionGuard`] —— RAII：splice 任务持有 guard，drop 时自动从表移除，
 //!   即便 panic / early-return 也不会漏关。
@@ -25,7 +25,7 @@
 //!   保持完全不可变 —— Arc 共享时不需要 make_mut clone。
 //!
 //! ## DELETE 语义
-//! * `close(id)` / `close_all()` 都会 **先** 调 `cancel.notify_waiters()` 再
+//! * `close(id)` / `close_all()` 都会 **先** 调 `cancel.cancel()` 再
 //!   从表里 remove。这样即使 splice 任务还在 select! 里等数据，也能立刻收到
 //!   取消信号开始 shutdown，而不是只在表里消失却继续传字节。
 
@@ -43,7 +43,7 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use serde::{Serialize, Serializer};
 use smallvec::SmallVec;
-use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 /// chains / geoip 类列表 —— 典型 1-4 项，内联保存避免堆分配。
@@ -78,14 +78,14 @@ pub struct ConnectionMeta {
     #[serde(rename = "sourceIP")]
     pub source_ip: CompactString,
     #[serde(rename = "sourceGeoIP")]
-    pub source_geoip: StringList,
+    pub source_geoip: Option<StringList>,
     #[serde(rename = "sourceIPASN")]
     pub source_ip_asn: CompactString,
     pub source_port: CompactString,
     #[serde(rename = "destinationIP")]
     pub destination_ip: CompactString,
     #[serde(rename = "destinationGeoIP")]
-    pub destination_geoip: StringList,
+    pub destination_geoip: Option<StringList>,
     #[serde(rename = "destinationIPASN")]
     pub destination_ip_asn: CompactString,
     pub destination_port: CompactString,
@@ -94,6 +94,7 @@ pub struct ConnectionMeta {
     pub inbound_port: CompactString,
     pub inbound_name: CompactString,
     pub inbound_user: CompactString,
+    pub rematch_name: CompactString,
     pub host: CompactString,
     pub dns_mode: CompactString,
     pub uid: u32,
@@ -104,56 +105,64 @@ pub struct ConnectionMeta {
     pub remote_destination: CompactString,
     pub dscp: u8,
     pub sniff_host: CompactString,
-    #[serde(rename = "id")]
+    #[serde(skip)]
     pub uuid: CompactString,
+    #[serde(skip)]
     pub smart_target: CompactString,
+    #[serde(skip)]
     pub chains: StringList,
     #[serde(skip)]
     pub provider_chains: StringList,
+    #[serde(skip)]
     pub rule: CompactString,
+    #[serde(skip)]
     pub rule_payload: CompactString,
 }
 
 impl ConnectionMeta {
     pub fn normalize_for_tracking(&mut self) {
+        self.kind = normalize_mihomo_inbound_type(self.kind.as_str()).into();
         if self.destination_ip.is_empty() {
             if let Ok(ip) = self.host.parse::<IpAddr>() {
                 self.destination_ip = ip.to_compact_string();
             }
         }
         if self.remote_destination.is_empty() {
-            let host: &str = if !self.host.is_empty() {
-                self.host.as_ref()
+            let host = if !self.host.is_empty() {
+                self.host.as_str()
             } else {
-                self.destination_ip.as_ref()
+                self.destination_ip.as_str()
             };
-            if let Some(endpoint) = join_host_port(host, &self.destination_port) {
-                self.remote_destination = endpoint;
-            }
+            self.remote_destination = CompactString::new(host.trim_matches(['[', ']']));
         }
     }
 }
 
-fn join_host_port(host: &str, port: &str) -> Option<CompactString> {
-    let host = host.trim();
-    let port = port.trim();
-    if host.is_empty() || port.is_empty() {
-        return None;
+fn normalize_mihomo_inbound_type(kind: &str) -> &'static str {
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "http" => "HTTP",
+        "https" => "HTTPS",
+        "socks4" => "Socks4",
+        "socks5" => "Socks5",
+        "shadowsocks" | "shadow-socks" => "ShadowSocks",
+        "snell" => "Snell",
+        "vmess" => "Vmess",
+        "vless" | "vless+mux" | "vless+xudp" | "xhttp" => "Vless",
+        "redir" | "redirect" => "Redir",
+        "tproxy" => "TProxy",
+        "trojan" => "Trojan",
+        "tunnel" => "Tunnel",
+        "tun" => "Tun",
+        "tuic" => "Tuic",
+        "hysteria2" => "Hysteria2",
+        "anytls" => "AnyTLS",
+        "mieru" => "Mieru",
+        "sudoku" => "Sudoku",
+        "trusttunnel" => "TrustTunnel",
+        "shadowquic" => "ShadowQuic",
+        "inner" => "Inner",
+        _ => "Unknown",
     }
-    // IPv6 文本（带 :）必须裹方括号；其它情况直接拼。
-    let need_brackets =
-        matches!(host.parse::<IpAddr>(), Ok(IpAddr::V6(_))) && !host.starts_with('[');
-    let mut out = CompactString::default();
-    if need_brackets {
-        out.push('[');
-        out.push_str(host);
-        out.push(']');
-    } else {
-        out.push_str(host);
-    }
-    out.push(':');
-    out.push_str(port);
-    Some(out)
 }
 
 /// 速率采样窗口：连续两次 snapshot 间的字节差 / 时间差 = bytes/s。
@@ -246,7 +255,7 @@ pub struct ConnectionEntry {
     pub bytes_down: Arc<AtomicU64>,
     pub max_upload_rate: Arc<AtomicU64>,
     pub max_download_rate: Arc<AtomicU64>,
-    pub cancel: Arc<Notify>,
+    pub cancel: CancellationToken,
     pub last_sample: Arc<Mutex<RateSample>>,
     pub smart_block: Arc<AtomicU8>,
 }
@@ -360,7 +369,7 @@ impl ConnectionTable {
         let bytes_down = Arc::new(AtomicU64::new(0));
         let max_upload_rate = Arc::new(AtomicU64::new(0));
         let max_download_rate = Arc::new(AtomicU64::new(0));
-        let cancel = Arc::new(Notify::new());
+        let cancel = CancellationToken::new();
         let now_ms = now_millis();
         let last_sample = Arc::new(Mutex::new(RateSample {
             up: 0,
@@ -416,7 +425,7 @@ impl ConnectionTable {
         let bytes_down = Arc::new(AtomicU64::new(0));
         let max_upload_rate = Arc::new(AtomicU64::new(0));
         let max_download_rate = Arc::new(AtomicU64::new(0));
-        let cancel = Arc::new(Notify::new());
+        let cancel = CancellationToken::new();
         let upload_window = Arc::new(Mutex::new(BucketWindow::new(10, 100)));
         let download_window = Arc::new(Mutex::new(BucketWindow::new(10, 100)));
         let smart_block = Arc::new(AtomicU8::new(SMART_BLOCK_NONE));
@@ -440,7 +449,7 @@ impl ConnectionTable {
         // 先取条目读 cancel，再 remove —— 避免移除后另一线程仍在 list() 看到。
         if let Some((_, entry)) = self.entries.remove(&id) {
             self.leave_indexes(&entry);
-            entry.cancel.notify_waiters();
+            entry.cancel.cancel();
             true
         } else {
             false
@@ -474,7 +483,7 @@ impl ConnectionTable {
         // 先收集 entries → notify all → 再 clear。
         let snapshot: Vec<_> = self.entries.iter().map(|e| e.value().clone()).collect();
         for e in &snapshot {
-            e.cancel.notify_waiters();
+            e.cancel.cancel();
             self.leave_indexes(e);
         }
         self.entries.clear();
@@ -855,7 +864,7 @@ pub struct ConnectionGuard {
     pub down: Arc<AtomicU64>,
     max_upload_rate: Arc<AtomicU64>,
     max_download_rate: Arc<AtomicU64>,
-    pub cancel: Arc<Notify>,
+    pub cancel: CancellationToken,
     upload_window: Arc<Mutex<BucketWindow>>,
     download_window: Arc<Mutex<BucketWindow>>,
     smart_block: Arc<AtomicU8>,
@@ -869,7 +878,7 @@ impl ConnectionGuard {
     pub fn counters(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>) {
         (self.up.clone(), self.down.clone())
     }
-    pub fn cancel_token(&self) -> Arc<Notify> {
+    pub fn cancel_token(&self) -> CancellationToken {
         self.cancel.clone()
     }
     pub fn accounting(&self) -> ConnectionAccounting {
@@ -914,7 +923,7 @@ pub struct ConnectionAccounting {
     down: Arc<AtomicU64>,
     max_upload_rate: Arc<AtomicU64>,
     max_download_rate: Arc<AtomicU64>,
-    cancel: Arc<Notify>,
+    cancel: CancellationToken,
     upload_window: Arc<Mutex<BucketWindow>>,
     download_window: Arc<Mutex<BucketWindow>>,
 }
@@ -924,7 +933,7 @@ impl ConnectionAccounting {
         (self.up.clone(), self.down.clone())
     }
 
-    pub fn cancel_token(&self) -> Arc<Notify> {
+    pub fn cancel_token(&self) -> CancellationToken {
         self.cancel.clone()
     }
 
@@ -1108,7 +1117,7 @@ mod tests {
         // 把 guard forget 掉，模拟“由 close(id) 主动结束”路径
         std::mem::forget(g);
         assert_eq!(t.len(), 1);
-        // notify_waiters 在没有等待者时是 noop —— 给一个等待者验证唤醒
+        // CancellationToken 是粘性信号：close 发生在等待前也不会丢失。
         let notified = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let nf = notified.clone();
         let cancel_clone = cancel.clone();
@@ -1118,16 +1127,64 @@ mod tests {
                 .build()
                 .unwrap();
             rt.block_on(async {
-                cancel_clone.notified().await;
+                cancel_clone.cancelled().await;
                 nf.store(true, std::sync::atomic::Ordering::Relaxed);
             });
         });
-        // 让等待者先挂上去
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // 先取消、后等待：验证信号是粘性的，不会像 Notify::notify_waiters 那样丢失。
         assert!(t.close(id));
         handle.join().unwrap();
         assert!(notified.load(std::sync::atomic::Ordering::Relaxed));
         assert_eq!(t.len(), 0);
+    }
+
+    #[test]
+    fn metadata_json_matches_mihomo_contract() {
+        let mut meta = ConnectionMeta {
+            kind: "VLESS+XUDP".into(),
+            host: "example.com".into(),
+            uuid: "internal-id".into(),
+            smart_target: "internal-index".into(),
+            chains: string_list_from(["node-a", "group-a"]),
+            rule: "MATCH".into(),
+            ..ConnectionMeta::default()
+        };
+        meta.normalize_for_tracking();
+        let value = serde_json::to_value(meta).unwrap();
+        let object = value.as_object().unwrap();
+        let actual: BTreeSet<&str> = object.keys().map(String::as_str).collect();
+        let expected = BTreeSet::from([
+            "network",
+            "type",
+            "sourceIP",
+            "sourceGeoIP",
+            "sourceIPASN",
+            "sourcePort",
+            "destinationIP",
+            "destinationGeoIP",
+            "destinationIPASN",
+            "destinationPort",
+            "inboundIP",
+            "inboundPort",
+            "inboundName",
+            "inboundUser",
+            "rematchName",
+            "host",
+            "dnsMode",
+            "uid",
+            "process",
+            "processPath",
+            "specialProxy",
+            "specialRules",
+            "remoteDestination",
+            "dscp",
+            "sniffHost",
+        ]);
+        assert_eq!(actual, expected);
+        assert_eq!(object["type"], "Vless");
+        assert_eq!(object["remoteDestination"], "example.com");
+        assert!(object["sourceGeoIP"].is_null());
+        assert!(object["destinationGeoIP"].is_null());
     }
 
     #[test]
@@ -1319,7 +1376,7 @@ mod tests {
         });
 
         let entry = t.get(g.id).unwrap();
-        assert_eq!(entry.meta.remote_destination.as_str(), "example.com:443");
+        assert_eq!(entry.meta.remote_destination.as_str(), "example.com");
         assert_eq!(entry.meta.smart_target.as_str(), "example.com");
 
         let snap = t.manager_snapshot();
@@ -1330,7 +1387,7 @@ mod tests {
         );
         assert_eq!(
             snap.connections[0].metadata.remote_destination.as_str(),
-            "example.com:443"
+            "example.com"
         );
     }
 

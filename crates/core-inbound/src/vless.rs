@@ -181,26 +181,37 @@ where
     let handler = ListenerHandler::new(runtime);
     match request.command {
         VLESS_COMMAND_TCP => {
+            let inbound_user = request.user.clone();
             let target = request
                 .target
                 .ok_or_else(|| invalid_data("VLESS TCP request has no target"))?;
             let metadata =
-                InboundMetadata::tcp("vless", "VLESS", peer, local, target.host, target.port);
+                InboundMetadata::tcp("vless", "VLESS", peer, local, target.host, target.port)
+                    .with_inbound_user(inbound_user);
             let prepared = handler.prepare_tcp(metadata).await?;
             stream.write_all(&[0, 0]).await?;
             stream.flush().await?;
             handler.relay_prepared_tcp(stream, prepared).await
         }
         VLESS_COMMAND_UDP => {
+            let inbound_user = request.user.clone();
             let target = request
                 .target
                 .ok_or_else(|| invalid_data("VLESS UDP request has no target"))?;
-            serve_vless_udp(stream, peer, local, target, handler).await
+            serve_vless_udp(stream, peer, local, target, handler, inbound_user).await
         }
         VLESS_COMMAND_MUX => {
             stream.write_all(&[0, 0]).await?;
             stream.flush().await?;
-            serve_vless_mux(stream, peer, local, handler, max_mux_sessions.max(1)).await
+            serve_vless_mux(
+                stream,
+                peer,
+                local,
+                handler,
+                max_mux_sessions.max(1),
+                request.user,
+            )
+            .await
         }
         command => Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -219,6 +230,7 @@ struct VlessTarget {
 struct VlessRequest {
     command: u8,
     target: Option<VlessTarget>,
+    user: String,
 }
 
 async fn read_vless_request<S>(stream: &mut S, users: &[[u8; 16]]) -> io::Result<VlessRequest>
@@ -242,6 +254,9 @@ where
             "VLESS UUID is not authorized",
         ));
     }
+    let user = Uuid::from_slice(&fixed[1..17])
+        .map_err(|_| invalid_data("invalid VLESS UUID"))?
+        .to_string();
     let mut addons = vec![0u8; fixed[17] as usize];
     stream.read_exact(&mut addons).await?;
     if !addons.is_empty() {
@@ -261,7 +276,11 @@ where
             ));
         }
     };
-    Ok(VlessRequest { command, target })
+    Ok(VlessRequest {
+        command,
+        target,
+        user,
+    })
 }
 
 async fn read_vless_target<S>(stream: &mut S) -> io::Result<VlessTarget>
@@ -310,6 +329,7 @@ async fn serve_vless_udp<S>(
     local: SocketAddr,
     target: VlessTarget,
     handler: ListenerHandler,
+    inbound_user: String,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -321,12 +341,14 @@ where
         Some(local),
         target.host,
         target.port,
-    );
+    )
+    .with_inbound_user(inbound_user);
     let prepared = handler.prepare_udp(metadata).await?;
     stream.write_all(&[0, 0]).await?;
     stream.flush().await?;
     let socket: Arc<dyn UdpSocketLike> = Arc::from(prepared.socket);
     let guard = prepared.guard;
+    let connection_cancel = guard.cancel_token();
     let target_host = prepared.target_host;
     let target_port = prepared.target_port;
     let (mut reader, mut writer) = tokio::io::split(stream);
@@ -376,6 +398,7 @@ where
         }
     };
     let result = tokio::select! {
+        () = connection_cancel.cancelled() => Ok(()),
         result = send => result,
         result = recv => result,
     };
@@ -404,6 +427,7 @@ async fn serve_vless_mux<S>(
     local: SocketAddr,
     handler: ListenerHandler,
     max_sessions: usize,
+    inbound_user: String,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -450,6 +474,7 @@ where
                 sessions.insert(frame.session_id, sender.clone());
                 let session_writer = writer.clone();
                 let session_handler = handler.clone();
+                let session_user = inbound_user.clone();
                 let session_id = frame.session_id;
                 match network {
                     MUX_NETWORK_TCP => tasks.spawn(async move {
@@ -461,6 +486,7 @@ where
                             session_handler,
                             session_writer,
                             receiver,
+                            session_user,
                         )
                         .await
                     }),
@@ -473,6 +499,7 @@ where
                             session_handler,
                             session_writer,
                             receiver,
+                            session_user,
                         )
                         .await
                     }),
@@ -541,6 +568,7 @@ async fn run_mux_tcp_session<W>(
     handler: ListenerHandler,
     writer: Arc<Mutex<W>>,
     mut receiver: mpsc::Receiver<MuxInput>,
+    inbound_user: String,
 ) -> io::Result<()>
 where
     W: AsyncWrite + Unpin + Send + 'static,
@@ -552,7 +580,8 @@ where
         local,
         target.host,
         target.port,
-    );
+    )
+    .with_inbound_user(inbound_user);
     let prepared = match handler.prepare_tcp(metadata).await {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -644,6 +673,7 @@ async fn run_mux_udp_session<W>(
     handler: ListenerHandler,
     writer: Arc<Mutex<W>>,
     mut receiver: mpsc::Receiver<MuxInput>,
+    inbound_user: String,
 ) -> io::Result<()>
 where
     W: AsyncWrite + Unpin + Send + 'static,
@@ -669,7 +699,8 @@ where
                 Some(local),
                 target.host.clone(),
                 target.port,
-            );
+            )
+            .with_inbound_user(inbound_user.clone());
             let prepared = match handler.prepare_udp(metadata).await {
                 Ok(prepared) => prepared,
                 Err(error) => {
@@ -689,11 +720,13 @@ where
             let receive_handler = handler.clone();
             let receive_target = target.clone();
             let receive_cancellation = cancellation.clone();
+            let connection_cancellation = association.guard.cancel_token();
             receive_tasks.push(tokio::spawn(async move {
                 let mut payload = vec![0u8; MAX_MUX_PAYLOAD_BYTES];
                 loop {
                     let length = tokio::select! {
                         () = receive_cancellation.cancelled() => return Ok(()),
+                        () = connection_cancellation.cancelled() => return Ok(()),
                         result = receive_socket.recv_from(&mut payload) => result?,
                     };
                     if length == 0 {
@@ -719,6 +752,10 @@ where
             ));
             break;
         };
+        if association.guard.cancel_token().is_cancelled() {
+            associations.remove(&target);
+            continue;
+        }
         let sent = association
             .socket
             .send_to(

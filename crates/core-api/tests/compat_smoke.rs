@@ -674,12 +674,15 @@ async fn connections_snapshot_uses_connection_manager() {
     let conn = &v["connections"][0];
     assert_eq!(conn["upload"], 7);
     assert_eq!(conn["download"], 11);
-    assert_eq!(conn["metadata"]["id"], conn["id"]);
-    assert_eq!(conn["metadata"]["smartTarget"], "example.com");
+    assert!(conn["id"].as_str().is_some());
+    assert!(conn["metadata"].get("id").is_none());
+    assert!(conn["metadata"].get("smartTarget").is_none());
     assert_eq!(conn["metadata"]["destinationIPASN"], "AS15169");
+    assert!(conn["metadata"]["sourceGeoIP"].is_null());
+    assert!(conn["metadata"]["destinationGeoIP"].is_null());
     assert!(conn.get("providerChains").is_some());
-    assert!(conn["maxUploadRate"].as_u64().unwrap() >= 7);
-    assert!(conn["maxDownloadRate"].as_u64().unwrap() >= 11);
+    assert!(conn.get("maxUploadRate").is_none());
+    assert!(conn.get("maxDownloadRate").is_none());
 
     drop(guard);
 }

@@ -350,6 +350,7 @@ async fn run_udp_dial_worker(
         UDP_SESSION_QUEUE_CAPACITY,
     );
     let session = Arc::new(session);
+    let connection_cancel = session.guard.cancel_token();
     if !ctx.udp_sessions.promote(key, &pending, session.clone()) {
         session.cancel();
         return;
@@ -380,7 +381,14 @@ async fn run_udp_dial_worker(
         handler.runtime().metrics.clone(),
     );
 
-    while let Some(datagram) = rx.recv().await {
+    loop {
+        let datagram = tokio::select! {
+            () = connection_cancel.cancelled() => return,
+            datagram = rx.recv() => {
+                let Some(datagram) = datagram else { break };
+                datagram
+            }
+        };
         let destination = datagram.outer_dst;
         if !transmit_datagram(
             &ctx,
@@ -402,6 +410,7 @@ async fn run_udp_dial_worker(
             break;
         }
         tokio::select! {
+            () = connection_cancel.cancelled() => break,
             changed = cancel.changed() => {
                 if changed.is_err() || *cancel.borrow() {
                     break;
@@ -437,12 +446,14 @@ fn spawn_udp_reverse_loop(
     tokio::spawn(async move {
         metrics.inc_connection();
         let mut cancel = session_for_loop.cancel_receiver();
+        let connection_cancel = session_for_loop.guard.cancel_token();
         let mut buf = vec![0u8; 65535];
         loop {
             if *cancel.borrow() {
                 break;
             }
             tokio::select! {
+                () = connection_cancel.cancelled() => break,
                 changed = cancel.changed() => {
                     if changed.is_err() || *cancel.borrow() {
                         break;

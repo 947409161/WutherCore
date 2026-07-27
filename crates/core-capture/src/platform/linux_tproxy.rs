@@ -800,7 +800,7 @@ fn spawn_tproxy_udp_return_loop(
         loop {
             tokio::select! {
                 _ = shutdown.changed() => break,
-                _ = cancel.notified() => break,
+                _ = cancel.cancelled() => break,
                 r = session.socket.recv_from(&mut buf) => {
                     let n = match r {
                         Ok(n) => n,
@@ -814,7 +814,7 @@ fn spawn_tproxy_udp_return_loop(
                     }
                     let returned = tokio::select! {
                         _ = shutdown.changed() => break,
-                        _ = cancel.notified() => break,
+                        _ = cancel.cancelled() => break,
                         returned = session.return_socket.send_to(&buf[..n], session.peer) => returned,
                     };
                     if let Err(e) = returned {
@@ -839,10 +839,7 @@ fn spawn_tproxy_udp_return_loop(
 
 fn remove_tproxy_udp_session(sessions: &TproxyUdpSessionTable, key: &UdpFlowKey) {
     if let Some((_, session)) = sessions.remove(key) {
-        // There is exactly one return loop per session. notify_one stores a
-        // permit when the loop is between awaits, avoiding notify_waiters'
-        // lost-wakeup race during purge or first-send failure.
-        session.guard.cancel.notify_one();
+        session.guard.cancel.cancel();
     }
 }
 

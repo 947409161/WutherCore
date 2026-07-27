@@ -1299,6 +1299,7 @@ dependencies = [
  "serde_json",
  "smallvec",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",

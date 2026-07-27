@@ -2,7 +2,6 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    net::IpAddr,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -68,7 +67,7 @@ pub struct Runtime {
     /// 规则集管理器 —— 周期任务、Clash API 手动刷新和路由数据面共享同一实例。
     pub ruleset_manager: parking_lot::RwLock<Option<Arc<core_ruleset::RulesetManager>>>,
     /// 进程反查 —— 与 mihomo `find-process-mode` 1:1。
-    /// `None` 表示 mode=off（默认）；`Some(finder)` 表示 strict 或 always。
+    /// `None` 表示 mode=off；`Some(finder)` 表示 strict（默认）或 always。
     /// strict 模式下调用方判定路由用到 process 字段才查；always 则每条都查。
     pub process_finder: Option<Arc<dyn core_process::ProcessFinder>>,
 }
@@ -84,7 +83,7 @@ impl RuntimeNodeInfo {
     fn from_node(provider: Option<String>, node: &ParsedNode) -> Self {
         Self {
             provider,
-            remote_destination: format_host_port(&node.host, node.port),
+            remote_destination: node.host.trim_matches(['[', ']']).to_string(),
             udp: node.udp,
         }
     }
@@ -1043,7 +1042,7 @@ impl Runtime {
         out
     }
 
-    fn remote_destination_for_outbound(&self, label: &str, host: &str, port: u16) -> String {
+    fn remote_destination_for_outbound(&self, label: &str, host: &str, _port: u16) -> String {
         if label != "DIRECT" && label != "BLOCK" {
             if let Some(info) = self.node_info.read().get(label) {
                 if !info.remote_destination.is_empty() {
@@ -1051,7 +1050,7 @@ impl Runtime {
                 }
             }
         }
-        format_host_port(host, port)
+        host.trim_matches(['[', ']']).to_string()
     }
 
     fn smart_target_for_decision(&self, decision: &RouteDecision, host: &str) -> String {
@@ -1128,14 +1127,6 @@ fn feed_member_name(member: &str) -> Option<&str> {
         .filter(|provider| !provider.trim().is_empty())
 }
 
-fn format_host_port(host: &str, port: u16) -> String {
-    let host = match host.parse::<IpAddr>() {
-        Ok(IpAddr::V6(_)) if !host.starts_with('[') => format!("[{host}]"),
-        _ => host.to_string(),
-    };
-    format!("{host}:{port}")
-}
-
 fn route_rule_name(kind: &str) -> &'static str {
     match kind {
         "any" | "fallback" => "MATCH",
@@ -1167,7 +1158,9 @@ fn build_chain(decision: &RouteDecision, label: &str) -> Vec<String> {
         RouteDecision::Block => vec!["BLOCK".to_string()],
         RouteDecision::Group(g) => {
             if label != g {
-                vec![g.clone(), label.to_string()]
+                // Mihomo 的 Chain 按实际出站到外层策略组排列：
+                // [picked-node, group]，Chain::Last() 即第一个实际出站。
+                vec![label.to_string(), g.clone()]
             } else {
                 vec![g.clone()]
             }
@@ -1237,10 +1230,9 @@ pub struct DialResult {
     pub outbound: String,
     pub decision: RouteDecision,
     pub elapsed: std::time::Duration,
-    /// 完整的代理链 —— Clash dashboard 的 connections.metadata.chains 字段。
-    /// 直连/拦截：`["DIRECT"]` / `["BLOCK"]`；分组：`["<group>", "<picked-node>"]`。
-    /// mihomo 主分支的 chain 通常是 `[outbound, group]` 倒序，本实现保持 `[group, node]`
-    /// 顺序方便阅读，dashboard 两种顺序都能正确展示链路。
+    /// 完整的代理链 —— Clash dashboard 的 connection.chains 顶层字段。
+    /// 直连/拦截：`["DIRECT"]` / `["BLOCK"]`；分组遵循 Mihomo 的
+    /// `["<picked-node>", "<group>"]` 顺序。
     pub chain: Vec<String>,
     pub provider_chains: Vec<String>,
     pub remote_destination: String,
@@ -1773,7 +1765,7 @@ route:
         assert_eq!(pick.label, "provider-a/node-1");
         assert_eq!(
             chain,
-            vec!["main".to_string(), "provider-a/node-1".to_string()]
+            vec!["provider-a/node-1".to_string(), "main".to_string()]
         );
         assert_eq!(
             runtime.provider_chains_for_chain(&chain),
@@ -1781,7 +1773,7 @@ route:
         );
         assert_eq!(
             runtime.remote_destination_for_outbound(&pick.label, "www.google.com", 443),
-            "203.0.113.10:10001"
+            "203.0.113.10"
         );
     }
 

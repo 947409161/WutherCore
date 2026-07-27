@@ -50,23 +50,28 @@ pub struct UserConfig {
     #[serde(default)]
     pub mesh: Option<Mesh>,
     /// 反查发起进程名 / 路径 —— 与 mihomo `find-process-mode` 1:1。
-    /// `off`（默认）跳过反查；`strict` 仅当路由规则用到 process 字段时反查；
+    /// `off` 跳过反查；`strict`（默认）仅当路由规则用到 process 字段时反查；
     /// `always` 每条连接都反查。Off 时 dashboard `process` 列永远空。
     #[serde(default, rename = "find-process-mode", alias = "find_process_mode")]
     pub find_process_mode: FindProcessMode,
 }
 
 /// `find-process-mode` 三态 —— 与 mihomo `C.FindProcessMode` 一致。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FindProcessMode {
-    /// 永不反查（mihomo 默认）。
-    #[default]
+    /// 永不反查。
     Off,
     /// 仅当 `route.steps` 用到 `process` 匹配时反查。
     Strict,
     /// 每条 TCP/UDP 连接都反查。
     Always,
+}
+
+impl Default for FindProcessMode {
+    fn default() -> Self {
+        Self::Strict
+    }
 }
 
 impl FindProcessMode {

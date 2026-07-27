@@ -5,7 +5,7 @@
 //!    流量计数实时更新（用于 dashboard 的 upload/download 列与速率列）。
 //! 2. 同时把 N 透传给可选的全局 [`crate::Metrics`] —— 让 `/traffic` WS 的
 //!    总上下行也增长。
-//! 3. 接受一个 `cancel: Arc<Notify>`，外部（如 DELETE /connections/:id）触发
+//! 3. 接受一个粘性的 `CancellationToken`，外部（如 DELETE /connections/:id）触发
 //!    时立刻 shutdown 双向 socket，让数据流尽快真正断开。
 //!
 //! 用法（与现有手写 split + try_join 等价，但少 30 行模板）：
@@ -25,10 +25,8 @@ use std::{
     },
 };
 
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    sync::Notify,
-};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio_util::sync::CancellationToken;
 
 use crate::{ConnectionAccounting, Metrics};
 
@@ -64,7 +62,7 @@ pub async fn copy_bidirectional_counted<A, B>(
     b: &mut B,
     up: Arc<AtomicU64>,
     down: Arc<AtomicU64>,
-    cancel: Arc<Notify>,
+    cancel: CancellationToken,
     metrics: Option<Arc<Metrics>>,
 ) -> io::Result<(u64, u64)>
 where
@@ -82,7 +80,7 @@ where
         let mut total: u64 = 0;
         loop {
             tokio::select! {
-                _ = cancel_up.notified() => {
+                _ = cancel_up.cancelled() => {
                     let _ = bw.shutdown().await;
                     break;
                 }
@@ -112,7 +110,7 @@ where
         let mut total: u64 = 0;
         loop {
             tokio::select! {
-                _ = cancel_down.notified() => {
+                _ = cancel_down.cancelled() => {
                     let _ = aw.shutdown().await;
                     break;
                 }
@@ -165,7 +163,7 @@ where
         let mut total: u64 = 0;
         loop {
             tokio::select! {
-                _ = cancel_up.notified() => {
+                _ = cancel_up.cancelled() => {
                     let _ = bw.shutdown().await;
                     break;
                 }
@@ -195,7 +193,7 @@ where
         let mut total: u64 = 0;
         loop {
             tokio::select! {
-                _ = cancel_down.notified() => {
+                _ = cancel_down.cancelled() => {
                     let _ = aw.shutdown().await;
                     break;
                 }
@@ -259,7 +257,7 @@ mod tests {
 
         let up = Arc::new(AtomicU64::new(0));
         let down = Arc::new(AtomicU64::new(0));
-        let cancel = Arc::new(Notify::new());
+        let cancel = CancellationToken::new();
 
         let up_c = up.clone();
         let down_c = down.clone();
@@ -276,7 +274,7 @@ mod tests {
         client_a.shutdown().await.unwrap();
         let mut got = vec![0u8; payload.len()];
         client_b.read_exact(&mut got).await.unwrap();
-        cancel.notify_waiters();
+        cancel.cancel();
         drop(client_a);
         drop(client_b);
 
@@ -305,7 +303,7 @@ mod tests {
         client_a.write_all(b"tracked").await.unwrap();
         let mut got = [0u8; 7];
         client_b.read_exact(&mut got).await.unwrap();
-        guard.cancel.notify_waiters();
+        guard.cancel.cancel();
         drop(client_a);
         drop(client_b);
 
@@ -329,7 +327,7 @@ mod tests {
 
         let up = Arc::new(AtomicU64::new(0));
         let down = Arc::new(AtomicU64::new(0));
-        let cancel = Arc::new(Notify::new());
+        let cancel = CancellationToken::new();
         let cancel_c = cancel.clone();
         let bridge = tokio::spawn(async move {
             copy_bidirectional_counted(&mut server_a, &mut server_b, up, down, cancel_c, None).await
@@ -341,7 +339,7 @@ mod tests {
 
         // 触发取消
         let start = std::time::Instant::now();
-        cancel.notify_waiters();
+        cancel.cancel();
 
         // bridge 应在 200ms 内返回
         let r = tokio::time::timeout(std::time::Duration::from_millis(500), bridge)

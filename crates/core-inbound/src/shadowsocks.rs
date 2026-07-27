@@ -481,6 +481,7 @@ async fn run_udp_association(
     handler: ListenerHandler,
     idle_timeout: Duration,
 ) -> io::Result<()> {
+    let cancellation = guard.cancel_token();
     let mut response = vec![0u8; UDP_PACKET_SIZE];
     let mut response_control = UdpSocketControlData::default();
     response_control.server_session_id = rand::random();
@@ -488,6 +489,7 @@ async fn run_udp_association(
         let idle = tokio::time::sleep(idle_timeout);
         tokio::pin!(idle);
         tokio::select! {
+            () = cancellation.cancelled() => break,
             _ = &mut idle => break,
             packet = packets.recv() => {
                 let Some(packet) = packet else { break };

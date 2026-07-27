@@ -473,7 +473,7 @@ async fn handle_socks5(
     udp_enabled: bool,
     udp_session_permits: Arc<Semaphore>,
 ) -> io::Result<()> {
-    negotiate_socks5_auth(&mut sock, auth).await?;
+    let inbound_user = negotiate_socks5_auth(&mut sock, auth).await?;
 
     let request = match read_socks5_request(&mut sock).await {
         Ok(request) => request,
@@ -497,6 +497,7 @@ async fn handle_socks5(
                 runtime,
                 request.address,
                 request.port,
+                inbound_user,
             )
             .await
         }
@@ -510,6 +511,7 @@ async fn handle_socks5(
                 request.port,
                 UdpRelayLimits::default(),
                 udp_session_permits,
+                inbound_user,
             )
             .await
         }
@@ -543,7 +545,7 @@ async fn handle_socks5(
 async fn negotiate_socks5_auth<S>(
     sock: &mut S,
     auth: Option<&[core_config::runtime_plan::UserPass]>,
-) -> io::Result<()>
+) -> io::Result<String>
 where
     S: AsyncRead + AsyncWrite + Unpin + ?Sized,
 {
@@ -602,22 +604,23 @@ where
         }
         let mut pwd = vec![0u8; plen[0] as usize];
         read_control(sock, &mut pwd).await?;
-        let ok = auth
-            .map(|v| {
-                v.iter()
-                    .any(|entry| entry.user.as_bytes() == user && entry.pass.as_bytes() == pwd)
-            })
-            .unwrap_or(false);
-        if !ok {
+        let matched_user = auth.and_then(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry.user.as_bytes() == user && entry.pass.as_bytes() == pwd)
+                .map(|entry| entry.user.clone())
+        });
+        let Some(matched_user) = matched_user else {
             write_control(sock, &[0x01, 0x01]).await?;
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "SOCKS5 authentication failed",
             ));
-        }
+        };
         write_control(sock, &[0x01, 0x00]).await?;
-    }
-    Ok(())
+        return Ok(matched_user);
+    };
+    Ok(String::new())
 }
 
 async fn read_socks5_request<S>(sock: &mut S) -> Result<SocksRequest, SocksRequestError>
@@ -693,10 +696,12 @@ async fn handle_socks5_connect(
     runtime: Arc<Runtime>,
     address: SocksAddress,
     port: u16,
+    inbound_user: String,
 ) -> io::Result<()> {
     let handler = ListenerHandler::new(runtime);
     let metadata =
-        InboundMetadata::tcp("socks5", "Socks5", peer, inbound_addr, address.host(), port);
+        InboundMetadata::tcp("socks5", "Socks5", peer, inbound_addr, address.host(), port)
+            .with_inbound_user(inbound_user);
     match handler.prepare_tcp(metadata).await {
         Ok(prepared) => {
             // The stream abstraction does not expose the outbound socket's local
@@ -1133,6 +1138,7 @@ async fn handle_socks5_udp_associate(
     client_port: u16,
     limits: UdpRelayLimits,
     udp_session_permits: Arc<Semaphore>,
+    inbound_user: String,
 ) -> io::Result<()> {
     let mut client_pin = match client_pin_from_request(&client_address, client_port, peer).await {
         Ok(pin) => pin,
@@ -1257,6 +1263,7 @@ async fn handle_socks5_udp_associate(
                                     done_tx.clone(),
                                     limits,
                                     udp_session_permits.clone(),
+                                    inbound_user.clone(),
                                 );
                                 if let Some(entry) = entry {
                                     sessions.insert(target, entry);
@@ -1280,6 +1287,7 @@ async fn handle_socks5_udp_associate(
                         done_tx.clone(),
                         limits,
                         udp_session_permits.clone(),
+                        inbound_user.clone(),
                     );
                     if let Some(entry) = entry {
                         sessions.insert(target, entry);
@@ -1347,6 +1355,7 @@ fn spawn_udp_target_session(
     done: mpsc::UnboundedSender<UdpTargetDone>,
     limits: UdpRelayLimits,
     session_permits: Arc<Semaphore>,
+    inbound_user: String,
 ) -> Option<UdpTargetSession> {
     let permit = match session_permits.try_acquire_owned() {
         Ok(permit) => permit,
@@ -1375,6 +1384,7 @@ fn spawn_udp_target_session(
             shutdown,
             done,
             limits,
+            inbound_user,
         )
         .await;
     });
@@ -1393,6 +1403,7 @@ async fn run_udp_target_session(
     mut shutdown: watch::Receiver<bool>,
     done: mpsc::UnboundedSender<UdpTargetDone>,
     limits: UdpRelayLimits,
+    inbound_user: String,
 ) {
     let _done = UdpTargetDoneGuard {
         id,
@@ -1410,7 +1421,8 @@ async fn run_udp_target_session(
         Some(relay_local),
         target.host(),
         target.port,
-    );
+    )
+    .with_inbound_user(inbound_user);
     let prepared = tokio::select! {
         _ = shutdown.changed() => return,
         result = timeout(SOCKS_UDP_DIAL_TIMEOUT, handler.new_packet(metadata)) => {
@@ -1428,10 +1440,12 @@ async fn run_udp_target_session(
         }
     };
 
+    let connection_cancel = prepared.guard.cancel_token();
     let mut recv_buf = vec![0u8; limits.max_datagram.saturating_add(1)];
     let mut idle: std::pin::Pin<Box<Sleep>> = Box::pin(tokio::time::sleep(limits.session_idle));
     loop {
         tokio::select! {
+            () = connection_cancel.cancelled() => break,
             _ = shutdown.changed() => break,
             packet = packets.recv() => {
                 let Some(packet) = packet else {
@@ -1558,7 +1572,7 @@ async fn handle_http(
             return Err(error);
         }
     };
-    if !http_proxy_authenticated(&request, auth) {
+    let Some(inbound_user) = http_proxy_authenticated_user(&request, auth) else {
         let _ = write_http_control(
             &mut sock,
             b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"RPKernel\"\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
@@ -1568,7 +1582,7 @@ async fn handle_http(
             io::ErrorKind::PermissionDenied,
             "HTTP proxy authentication failed",
         ));
-    }
+    };
     let route = match parse_http_route(&request) {
         Ok(route) => route,
         Err(error) => {
@@ -1592,7 +1606,8 @@ async fn handle_http(
                 inbound_addr,
                 authority.host,
                 authority.port,
-            );
+            )
+            .with_inbound_user(inbound_user.clone());
             match handler.prepare_tcp(metadata).await {
                 Ok(mut prepared) => {
                     write_http_control(&mut sock, b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -1644,7 +1659,8 @@ async fn handle_http(
                 inbound_addr,
                 target.authority.host.clone(),
                 target.authority.port,
-            );
+            )
+            .with_inbound_user(inbound_user);
             match handler.prepare_tcp(metadata).await {
                 Ok(mut prepared) => {
                     if let Err(error) = prepared.result.stream.write_all(&forwarded_head).await {
@@ -2208,35 +2224,38 @@ fn normalize_http_domain(host: &str) -> io::Result<String> {
     Ok(host.to_ascii_lowercase())
 }
 
-fn http_proxy_authenticated(
+fn http_proxy_authenticated_user(
     request: &HttpRequestHead,
     auth: Option<&[core_config::runtime_plan::UserPass]>,
-) -> bool {
+) -> Option<String> {
     let Some(auth) = auth.filter(|entries| !entries.is_empty()) else {
-        return true;
+        return Some(String::new());
     };
     let Some(value) = request.header("proxy-authorization") else {
-        return false;
+        return None;
     };
     let Ok(value) = std::str::from_utf8(value) else {
-        return false;
+        return None;
     };
     let mut parts = value.split_ascii_whitespace();
     let (Some(scheme), Some(credentials), None) = (parts.next(), parts.next(), parts.next()) else {
-        return false;
+        return None;
     };
     if !scheme.eq_ignore_ascii_case("basic") {
-        return false;
+        return None;
     }
     let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(credentials) else {
-        return false;
+        return None;
     };
     let Some(colon) = decoded.iter().position(|byte| *byte == b':') else {
-        return false;
+        return None;
     };
-    auth.iter().any(|entry| {
-        entry.user.as_bytes() == &decoded[..colon] && entry.pass.as_bytes() == &decoded[colon + 1..]
-    })
+    auth.iter()
+        .find(|entry| {
+            entry.user.as_bytes() == &decoded[..colon]
+                && entry.pass.as_bytes() == &decoded[colon + 1..]
+        })
+        .map(|entry| entry.user.clone())
 }
 
 fn build_forward_head(request: &HttpRequestHead, target: &ForwardTarget) -> Vec<u8> {
@@ -3099,16 +3118,22 @@ route:
             user: "user".into(),
             pass: "pass".into(),
         }];
-        assert!(http_proxy_authenticated(&request, Some(&auth)));
-        assert!(!http_proxy_authenticated(
-            &parse_http_request_head(
-                b"CONNECT example.com:443 HTTP/1.1\r\n\
+        assert_eq!(
+            http_proxy_authenticated_user(&request, Some(&auth)).as_deref(),
+            Some("user")
+        );
+        assert!(
+            http_proxy_authenticated_user(
+                &parse_http_request_head(
+                    b"CONNECT example.com:443 HTTP/1.1\r\n\
                   Host: example.com:443\r\n\
                   Proxy-Authorization: Basic dXNlcjp3cm9uZw==\r\n\r\n",
+                )
+                .unwrap(),
+                Some(&auth),
             )
-            .unwrap(),
-            Some(&auth),
-        ));
+            .is_none()
+        );
     }
 
     #[test]

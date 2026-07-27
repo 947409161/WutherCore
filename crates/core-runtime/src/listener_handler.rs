@@ -12,6 +12,7 @@ use std::{
 };
 
 use compact_str::ToCompactString;
+use core_config::runtime_plan::RouteMatcher;
 use core_observe::{ConnectionGuard, ConnectionMeta, copy_bidirectional_tracked};
 use core_route::{FlowContext, FlowRulesetMetadata, L7Proto, NetworkKind};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -46,6 +47,8 @@ pub struct InboundMetadata {
     pub sniff_host: String,
     pub process: Option<String>,
     pub process_path: Option<String>,
+    pub uid: u32,
+    pub inbound_user: String,
     pub protocol: Option<L7Proto>,
     pub force_direct: bool,
     pub force_direct_reason: String,
@@ -119,6 +122,8 @@ impl InboundMetadata {
             sniff_host: String::new(),
             process: None,
             process_path: None,
+            uid: 0,
+            inbound_user: String::new(),
             protocol: None,
             force_direct: false,
             force_direct_reason: String::new(),
@@ -149,6 +154,11 @@ impl InboundMetadata {
     pub fn with_process(mut self, process: Option<String>, process_path: Option<String>) -> Self {
         self.process = process;
         self.process_path = process_path;
+        self
+    }
+
+    pub fn with_inbound_user(mut self, user: impl Into<String>) -> Self {
+        self.inbound_user = user.into();
         self
     }
 
@@ -427,6 +437,9 @@ impl ListenerHandler {
         if metadata.is_inner {
             return metadata;
         }
+        if !should_lookup_process(&self.runtime) {
+            return metadata;
+        }
         let finder = match self.runtime.process_finder.as_ref() {
             Some(f) => f.clone(),
             None => return metadata,
@@ -469,6 +482,7 @@ impl ListenerHandler {
         if let Some(info) = info {
             metadata.process = Some(info.name);
             metadata.process_path = Some(info.path);
+            metadata.uid = info.uid;
         }
         metadata
     }
@@ -537,6 +551,29 @@ impl ListenerHandler {
     }
 }
 
+fn should_lookup_process(runtime: &Runtime) -> bool {
+    match runtime.plan.find_process_mode {
+        core_config::model::FindProcessMode::Off => false,
+        core_config::model::FindProcessMode::Always => true,
+        core_config::model::FindProcessMode::Strict => runtime
+            .plan
+            .route
+            .steps
+            .iter()
+            .any(|step| matcher_needs_process(&step.matcher)),
+    }
+}
+
+fn matcher_needs_process(matcher: &RouteMatcher) -> bool {
+    match matcher {
+        RouteMatcher::Process(_) | RouteMatcher::Set(_) => true,
+        RouteMatcher::And(parts) | RouteMatcher::Or(parts) => {
+            parts.iter().any(matcher_needs_process)
+        }
+        _ => false,
+    }
+}
+
 fn tcp_connection_meta(metadata: &InboundMetadata, result: &DialResult) -> ConnectionMeta {
     let (inbound_ip, inbound_port) = inbound_parts(metadata.inbound);
     ConnectionMeta {
@@ -549,10 +586,12 @@ fn tcp_connection_meta(metadata: &InboundMetadata, result: &DialResult) -> Conne
         inbound_ip,
         inbound_port,
         inbound_name: metadata.inbound_name.as_str().into(),
+        inbound_user: metadata.inbound_user.as_str().into(),
         host: metadata.target_host().into(),
         dns_mode: metadata.dns_mode.as_str().into(),
         process: metadata.process.as_deref().unwrap_or_default().into(),
         process_path: metadata.process_path.as_deref().unwrap_or_default().into(),
+        uid: metadata.uid,
         sniff_host: metadata.sniff_host.as_str().into(),
         remote_destination: result.remote_destination.as_str().into(),
         smart_target: result.smart_target.as_str().into(),
@@ -576,10 +615,12 @@ fn udp_connection_meta(metadata: &InboundMetadata, result: &UdpDialResult) -> Co
         inbound_ip,
         inbound_port,
         inbound_name: metadata.inbound_name.as_str().into(),
+        inbound_user: metadata.inbound_user.as_str().into(),
         host: metadata.target_host().into(),
         dns_mode: metadata.dns_mode.as_str().into(),
         process: metadata.process.as_deref().unwrap_or_default().into(),
         process_path: metadata.process_path.as_deref().unwrap_or_default().into(),
+        uid: metadata.uid,
         sniff_host: metadata.sniff_host.as_str().into(),
         remote_destination: result.remote_destination.as_str().into(),
         smart_target: result.smart_target.as_str().into(),
