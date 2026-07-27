@@ -156,7 +156,6 @@ jobs:
           fi
 
   macos:
-    name: macOS (${{ matrix.platform.name }})
     if: github.event_name != 'workflow_call' || inputs.validate-macos
     needs: prepare
     runs-on: ${{ matrix.platform.runner }}

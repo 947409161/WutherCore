@@ -106,7 +106,6 @@ jobs:
             --features "$WUTHER_BUILD_TAGS" --all-targets --locked
 
   tests:
-    name: Test (${{ matrix.test.name }})
     needs: prepare
     runs-on: ubuntu-24.04
     timeout-minutes: 45

@@ -111,7 +111,6 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   linux:
-    name: Linux (${{ matrix.platform.name }})
     if: needs.prepare.outputs.platforms == 'all' || needs.prepare.outputs.platforms == 'linux'
     needs: prepare
     runs-on: ${{ matrix.platform.runner }}
@@ -269,7 +268,6 @@ jobs:
           retention-days: ${{ needs.prepare.outputs.retention-days }}
 
   android:
-    name: Android (${{ matrix.platform.name }})
     if: needs.prepare.outputs.platforms == 'all' || needs.prepare.outputs.platforms == 'android'
     needs: prepare
     runs-on: ubuntu-24.04
@@ -369,7 +367,6 @@ jobs:
           retention-days: ${{ needs.prepare.outputs.retention-days }}
 
   windows:
-    name: Windows (${{ matrix.platform.name }})
     if: needs.prepare.outputs.platforms == 'all' || needs.prepare.outputs.platforms == 'windows'
     needs: prepare
     runs-on: ${{ matrix.platform.runner }}
@@ -453,7 +450,6 @@ jobs:
           retention-days: ${{ needs.prepare.outputs.retention-days }}
 
   macos:
-    name: macOS (${{ matrix.platform.name }})
     if: needs.prepare.outputs.platforms == 'all' || needs.prepare.outputs.platforms == 'macos'
     needs: prepare
     runs-on: ${{ matrix.platform.runner }}
