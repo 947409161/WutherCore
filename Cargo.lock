@@ -1026,6 +1026,7 @@ dependencies = [
  "core-mesh",
  "core-observe",
  "core-route",
+ "core-ruleset",
  "core-runtime",
  "core-smart",
  "core-store",

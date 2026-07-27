@@ -532,6 +532,97 @@ async fn rules_disable_changes_route_engine_state() {
 }
 
 #[tokio::test]
+async fn rule_provider_and_geo_endpoints_hot_refresh_runtime_manager() {
+    let cfg = r#"
+version: 1
+profile: desktop
+listen:
+  local: 7890
+groups:
+  main:
+    choose: manual
+nodes: []
+route:
+  sets:
+    hot:
+      type: domain
+      payload:
+        - "+.hot.example"
+"#;
+    let plan = load_from_str(cfg).unwrap();
+    let index = core_ruleset::RulesetIndex::new();
+    let runtime =
+        Arc::new(Runtime::build_with(plan, None, Some(index.clone())).expect("runtime with rules"));
+    let mut sets = std::collections::BTreeMap::new();
+    sets.insert(
+        "hot".into(),
+        core_ruleset::RulesetSpec {
+            url: None,
+            path: None,
+            payload: vec!["+.hot.example".into()],
+            r#type: core_ruleset::RulesetType::Domain,
+            format: None,
+            every: Duration::from_secs(3600),
+            via: "direct".into(),
+        },
+    );
+    let manager = core_ruleset::RulesetManager::new(sets, None, index);
+    runtime.set_ruleset_manager(manager);
+    let state = NativeState::for_tests(runtime.clone(), UrlTester::new(Default::default()), None);
+    let app = core_api::compat::router(state);
+
+    let refresh = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/providers/rules/hot")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refresh.status(), StatusCode::NO_CONTENT);
+    assert!(
+        runtime
+            .route
+            .rulesets()
+            .unwrap()
+            .get("hot")
+            .unwrap()
+            .matches("www.hot.example", None, None, None)
+    );
+
+    let provider = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/providers/rules/hot")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(provider.status(), StatusCode::OK);
+    let provider = body_json(provider).await;
+    assert_eq!(provider["ruleCount"], 1);
+    assert!(provider["updatedAt"].is_string());
+    assert_eq!(provider["refreshing"], false);
+
+    let refresh_all = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/configs/geo")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refresh_all.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
 async fn connections_close_all_returns_no_content() {
     let app = core_api::compat::router(build_state());
     let resp = app

@@ -32,7 +32,7 @@
 //!   GET    /configs                         当前 mode / log-level / port 等
 //!   PUT    /configs                         完整配置重载（运行时不支持时明确报错）
 //!   PATCH  /configs                         热改可变运行时字段
-//!   POST   /configs/geo                     Geo 更新（未配置 updater 时明确报错）
+//!   POST   /configs/geo                     并行热更新全部规则集
 //!   GET    /dns/query?name=&type=           DoH 风格上游解析
 //!   POST   /cache/fakeip/flush              清空 fake-ip 池
 //!   POST   /cache/dns/flush                 清空 DNS 缓存
@@ -1452,18 +1452,27 @@ async fn provider_rule_refresh(
     State(s): State<NativeState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    if !s.runtime.plan.route.sets.contains_key(&name) {
+    let Some(manager) = s.runtime.ruleset_manager() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"message": "ruleset manager is not running"})),
+        )
+            .into_response();
+    };
+    if !manager.contains(&name) {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({"message": "ruleset not found"})),
         )
             .into_response();
     }
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({"message": "ruleset refresh is not available at runtime"})),
-    )
-        .into_response()
+    match manager.refresh(&name).await {
+        Ok(_) => {
+            s.caches.invalidate_rule_state();
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(error) => (StatusCode::BAD_GATEWAY, Json(json!({"message": error}))).into_response(),
+    }
 }
 
 fn rule_provider_json(
@@ -1501,7 +1510,7 @@ fn rule_provider_json(
                 + stats.ports
         })
         .unwrap_or(set.payload.len());
-    json!({
+    let mut provider = json!({
         "name": name,
         "type": "Rule",
         "vehicleType": vehicle_type,
@@ -1512,7 +1521,24 @@ fn rule_provider_json(
             _ => "YamlRule",
         },
         "ruleCount": rule_count,
-    })
+    });
+    if let Some(status) = runtime
+        .ruleset_manager()
+        .and_then(|manager| manager.status(name))
+    {
+        let object = provider.as_object_mut().expect("rule provider object");
+        object.insert("refreshing".into(), Value::Bool(status.refreshing));
+        if let Some(updated_at) = status.updated_at_unix_ms {
+            object.insert(
+                "updatedAt".into(),
+                Value::String(iso8601(updated_at / 1000)),
+            );
+        }
+        if let Some(error) = status.last_error {
+            object.insert("lastError".into(), Value::String(error));
+        }
+    }
+    provider
 }
 
 /* ====================== rules ====================== */
@@ -1849,12 +1875,31 @@ async fn configs_put(
     (StatusCode::NO_CONTENT, Json(json!({}))).into_response()
 }
 
-async fn configs_geo(State(_s): State<NativeState>) -> impl IntoResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({"message": "Geo database update is not configured"})),
-    )
-        .into_response()
+async fn configs_geo(State(s): State<NativeState>) -> impl IntoResponse {
+    let Some(manager) = s.runtime.ruleset_manager() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"message": "ruleset manager is not running"})),
+        )
+            .into_response();
+    };
+    let report = manager.refresh_all().await;
+    s.caches.invalidate_rule_state();
+    if report.failed.is_empty() {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "message": "one or more rulesets failed to refresh; last-known-good copies remain active",
+                "updated": report.updated.iter().map(|update| &update.name).collect::<Vec<_>>(),
+                "failed": report.failed.into_iter().map(|(name, error)| {
+                    json!({"name": name, "error": error})
+                }).collect::<Vec<_>>(),
+            })),
+        )
+            .into_response()
+    }
 }
 
 /* ====================== DNS / cache ====================== */

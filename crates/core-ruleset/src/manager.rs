@@ -30,6 +30,21 @@ pub struct RulesetUpdate {
     pub from_cache: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct RulesetStatus {
+    pub size: Option<usize>,
+    pub updated_at_unix_ms: Option<u64>,
+    pub from_cache: bool,
+    pub refreshing: bool,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RulesetRefreshReport {
+    pub updated: Vec<RulesetUpdate>,
+    pub failed: Vec<(String, String)>,
+}
+
 pub trait RulesetSink: Send + Sync {
     fn on_update(&self, update: RulesetUpdate);
 }
@@ -39,6 +54,8 @@ pub struct RulesetManager {
     cache_dir: Option<PathBuf>,
     index: Arc<RulesetIndex>,
     sink: RwLock<Option<Arc<dyn RulesetSink>>>,
+    status: RwLock<BTreeMap<String, RulesetStatus>>,
+    refresh_locks: BTreeMap<String, Arc<tokio::sync::Mutex<()>>>,
     handles: parking_lot::Mutex<Vec<JoinHandle<()>>>,
 }
 
@@ -52,11 +69,23 @@ impl RulesetManager {
             let _ = std::fs::create_dir_all(d);
         }
         index.declare(sets.keys().cloned());
+        let status = sets
+            .keys()
+            .cloned()
+            .map(|name| (name, RulesetStatus::default()))
+            .collect();
+        let refresh_locks = sets
+            .keys()
+            .cloned()
+            .map(|name| (name, Arc::new(tokio::sync::Mutex::new(()))))
+            .collect();
         Arc::new(Self {
             sets,
             cache_dir,
             index,
             sink: RwLock::new(None),
+            status: RwLock::new(status),
+            refresh_locks,
             handles: parking_lot::Mutex::new(Vec::new()),
         })
     }
@@ -67,6 +96,18 @@ impl RulesetManager {
 
     pub fn index(&self) -> Arc<RulesetIndex> {
         self.index.clone()
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.sets.contains_key(name)
+    }
+
+    pub fn status(&self, name: &str) -> Option<RulesetStatus> {
+        self.status.read().get(name).cloned()
+    }
+
+    pub fn statuses(&self) -> BTreeMap<String, RulesetStatus> {
+        self.status.read().clone()
     }
 
     /// 启动：每个规则集独立后台协程，立刻拉一次 + 按 `every` 周期刷新。
@@ -94,17 +135,16 @@ impl RulesetManager {
                 match self.compile_inline(name, spec) {
                     Ok((matcher, size)) => {
                         self.index.insert(matcher);
-                        if let Some(sink) = self.sink.read().clone() {
-                            sink.on_update(RulesetUpdate {
-                                name: name.clone(),
-                                size,
-                                from_cache: false,
-                            });
-                        }
+                        self.publish_success(RulesetUpdate {
+                            name: name.clone(),
+                            size,
+                            from_cache: false,
+                        });
                         info!(target: "ruleset", name, source = "inline", size, "compiled");
                     }
                     Err(error) => {
                         self.index.mark_unavailable(name.clone());
+                        self.publish_failure(name, &error);
                         warn!(
                             target: "ruleset",
                             name,
@@ -133,9 +173,7 @@ impl RulesetManager {
                         size,
                         from_cache: true,
                     };
-                    if let Some(sink) = self.sink.read().clone() {
-                        sink.on_update(update);
-                    }
+                    self.publish_success(update);
                     info!(
                         target: "ruleset",
                         name = %name,
@@ -181,19 +219,100 @@ impl RulesetManager {
 
     async fn run_one(self: Arc<Self>, name: String, spec: RulesetSpec) {
         loop {
-            match self.refresh_once(&name, &spec).await {
-                Ok(update) => {
-                    info!(target: "ruleset", name = %name, size = update.size, from_cache = update.from_cache, "compiled");
-                    if let Some(sink) = self.sink.read().clone() {
-                        sink.on_update(update);
-                    }
-                }
-                Err(e) => {
-                    self.index.mark_unavailable(name.clone());
-                    warn!(target: "ruleset", name = %name, error = %e, "refresh failed");
-                }
-            }
+            let _ = self.refresh(&name).await;
             tokio::time::sleep(clamp_interval(spec.every)).await;
+        }
+    }
+
+    /// 按配置名称触发一次可等待的热更新。相同 provider 的周期刷新与 API
+    /// 刷新共用一把异步锁，避免重复下载、缓存写入竞争和旧结果覆盖新结果。
+    pub async fn refresh(&self, name: &str) -> Result<RulesetUpdate, String> {
+        let spec = self
+            .sets
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("ruleset `{name}` is not configured"))?;
+        let lock = self
+            .refresh_locks
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("ruleset `{name}` has no refresh lock"))?;
+        let _guard = lock.lock().await;
+        if let Some(status) = self.status.write().get_mut(name) {
+            status.refreshing = true;
+        }
+        match self.refresh_once(name, &spec).await {
+            Ok(update) => {
+                info!(
+                    target: "ruleset",
+                    name,
+                    size = update.size,
+                    from_cache = update.from_cache,
+                    "hot refresh completed"
+                );
+                self.publish_success(update.clone());
+                Ok(update)
+            }
+            Err(error) => {
+                self.index.mark_unavailable(name.to_string());
+                self.publish_failure(name, &error);
+                warn!(target: "ruleset", name, error = %error, "hot refresh failed");
+                Err(error)
+            }
+        }
+    }
+
+    /// 并发刷新全部配置规则集。每个 provider 内仍保持串行，provider 之间并行，
+    /// 因此 `/configs/geo` 不会被一个慢源拖成逐个等待。
+    pub async fn refresh_all(self: &Arc<Self>) -> RulesetRefreshReport {
+        let mut tasks = tokio::task::JoinSet::new();
+        // 限制同时进行的网络/磁盘刷新，避免超大 provider 配置在移动端造成
+        // fd、内存和带宽尖峰。
+        let permits = Arc::new(tokio::sync::Semaphore::new(8));
+        for name in self.sets.keys().cloned() {
+            let manager = self.clone();
+            let permits = permits.clone();
+            tasks.spawn(async move {
+                let _permit = permits
+                    .acquire_owned()
+                    .await
+                    .expect("ruleset refresh semaphore cannot close");
+                let result = manager.refresh(&name).await;
+                (name, result)
+            });
+        }
+        let mut report = RulesetRefreshReport::default();
+        while let Some(result) = tasks.join_next().await {
+            match result {
+                Ok((_name, Ok(update))) => report.updated.push(update),
+                Ok((name, Err(error))) => report.failed.push((name, error)),
+                Err(error) => report
+                    .failed
+                    .push(("<task>".to_string(), error.to_string())),
+            }
+        }
+        report.updated.sort_by(|a, b| a.name.cmp(&b.name));
+        report.failed.sort_by(|a, b| a.0.cmp(&b.0));
+        report
+    }
+
+    fn publish_success(&self, update: RulesetUpdate) {
+        if let Some(status) = self.status.write().get_mut(&update.name) {
+            status.size = Some(update.size);
+            status.updated_at_unix_ms = Some(unix_time_ms());
+            status.from_cache = update.from_cache;
+            status.refreshing = false;
+            status.last_error = None;
+        }
+        if let Some(sink) = self.sink.read().clone() {
+            sink.on_update(update);
+        }
+    }
+
+    fn publish_failure(&self, name: &str, error: &str) {
+        if let Some(status) = self.status.write().get_mut(name) {
+            status.refreshing = false;
+            status.last_error = Some(error.to_string());
         }
     }
 
@@ -413,6 +532,15 @@ impl RulesetManager {
     }
 }
 
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
 fn clamp_interval(d: Duration) -> Duration {
     let min = Duration::from_secs(5 * 60);
     let max = Duration::from_secs(30 * 24 * 3600);
@@ -624,6 +752,88 @@ mod tests {
         let m = idx.get("rs1").unwrap();
         assert!(m.matches("a.test.com", None, None, None));
         assert!(m.matches("", "192.168.5.10".parse().ok(), None, None));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn configured_hot_refresh_replaces_matcher_and_updates_status() {
+        let dir = temp_test_dir("configured-hot-refresh");
+        let source = dir.join("provider.yaml");
+        std::fs::write(&source, b"payload:\n  - DOMAIN-SUFFIX,before.example\n").unwrap();
+        let mut sets = BTreeMap::new();
+        sets.insert(
+            "hot".into(),
+            RulesetSpec {
+                url: None,
+                path: Some(source.display().to_string()),
+                payload: vec![],
+                r#type: crate::spec::RulesetType::Mixed,
+                format: Some("yaml".into()),
+                every: Duration::from_secs(3600),
+                via: "direct".into(),
+            },
+        );
+        let idx = RulesetIndex::new();
+        let mgr = RulesetManager::new(sets, Some(dir.clone()), idx.clone());
+
+        mgr.refresh("hot").await.unwrap();
+        assert!(
+            idx.get("hot")
+                .unwrap()
+                .matches("www.before.example", None, None, None)
+        );
+
+        std::fs::write(&source, b"payload:\n  - DOMAIN-SUFFIX,after.example\n").unwrap();
+        let update = mgr.refresh("hot").await.unwrap();
+        assert_eq!(update.name, "hot");
+        let matcher = idx.get("hot").unwrap();
+        assert!(matcher.matches("www.after.example", None, None, None));
+        assert!(!matcher.matches("www.before.example", None, None, None));
+        let status = mgr.status("hot").unwrap();
+        assert_eq!(status.size, Some(1));
+        assert!(status.updated_at_unix_ms.is_some());
+        assert!(!status.refreshing);
+        assert!(status.last_error.is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn refresh_all_reports_partial_failure_without_losing_last_good() {
+        let dir = temp_test_dir("refresh-all-partial");
+        let good_source = dir.join("good.yaml");
+        let bad_source = dir.join("bad.yaml");
+        std::fs::write(&good_source, b"payload:\n  - DOMAIN-SUFFIX,good.example\n").unwrap();
+        std::fs::write(&bad_source, b"payload:\n  - DOMAIN-SUFFIX,old.example\n").unwrap();
+        let spec = |path: &Path| RulesetSpec {
+            url: None,
+            path: Some(path.display().to_string()),
+            payload: vec![],
+            r#type: crate::spec::RulesetType::Mixed,
+            format: Some("yaml".into()),
+            every: Duration::from_secs(3600),
+            via: "direct".into(),
+        };
+        let mut sets = BTreeMap::new();
+        sets.insert("good".into(), spec(&good_source));
+        sets.insert("bad".into(), spec(&bad_source));
+        let idx = RulesetIndex::new();
+        let mgr = RulesetManager::new(sets, Some(dir.join("cache")), idx.clone());
+        mgr.refresh("bad").await.unwrap();
+        std::fs::write(&bad_source, b"payload: [").unwrap();
+
+        let report = mgr.refresh_all().await;
+        assert_eq!(report.updated.len(), 1);
+        assert_eq!(report.updated[0].name, "good");
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].0, "bad");
+        assert!(
+            idx.get("bad")
+                .unwrap()
+                .matches("www.old.example", None, None, None)
+        );
+        assert!(mgr.status("bad").unwrap().last_error.is_some());
+
         let _ = std::fs::remove_dir_all(dir);
     }
 

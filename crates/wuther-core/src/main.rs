@@ -883,6 +883,7 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
         let count = specs.len();
         let cache_dir = std::path::PathBuf::from("data/ruleset");
         let mgr = RulesetManager::new(specs, Some(cache_dir.clone()), ruleset_index.clone());
+        runtime.set_ruleset_manager(mgr.clone());
         mgr.clone().start();
         if count == 0 {
             info!(target: "ruleset", "no route.sets configured; manager idle");
@@ -1269,6 +1270,7 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
         warn!(target: "mesh", error = %error, "mesh supervisor stop failed");
     }
     feed_mgr_handle.stop();
+    _ruleset_mgr_handle.stop();
     for listener in &mut shadowsocks_listener_handles {
         if let Err(error) = listener.shutdown().await {
             warn!(

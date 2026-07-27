@@ -30,4 +30,5 @@ dashmap      = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
+core-ruleset = { workspace = true }
 http-body-util = "0.1"

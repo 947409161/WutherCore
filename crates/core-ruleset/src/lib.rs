@@ -47,7 +47,9 @@ pub use ir::{
     PortRange, RulesetExpr, RulesetInterfaceAddress, RulesetMatchContext, RulesetPredicate,
     RulesetProgram,
 };
-pub use manager::{RulesetManager, RulesetSink, RulesetUpdate};
+pub use manager::{
+    RulesetManager, RulesetRefreshReport, RulesetSink, RulesetStatus, RulesetUpdate,
+};
 pub use matcher::{
     ClassicalEntry, RulesetDestinationPrefixes, RulesetIndex, RulesetIpPrefixSemantics,
     RulesetIpPrefixSet, RulesetIpPrefixSnapshot, RulesetIpPrefixStatus, RulesetMatcher,

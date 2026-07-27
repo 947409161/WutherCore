@@ -65,6 +65,8 @@ pub struct Runtime {
     /// URLTest 实例 —— main.rs 在创建后通过 `set_urltest` 注入。
     /// `pick_in_group` 把它传给 `GroupSelector::pick` 让 URLTest/Fallback/LB 走死节点感知。
     pub urltest: parking_lot::RwLock<Option<Arc<crate::health::UrlTester>>>,
+    /// 规则集管理器 —— 周期任务、Clash API 手动刷新和路由数据面共享同一实例。
+    pub ruleset_manager: parking_lot::RwLock<Option<Arc<core_ruleset::RulesetManager>>>,
     /// 进程反查 —— 与 mihomo `find-process-mode` 1:1。
     /// `None` 表示 mode=off（默认）；`Some(finder)` 表示 strict 或 always。
     /// strict 模式下调用方判定路由用到 process 字段才查；always 则每条都查。
@@ -239,6 +241,7 @@ impl Runtime {
             logs: Arc::new(core_observe::LogBus::new(512)),
             mutable: parking_lot::RwLock::new(mutable),
             urltest: parking_lot::RwLock::new(None),
+            ruleset_manager: parking_lot::RwLock::new(None),
             process_finder,
         })
     }
@@ -255,6 +258,14 @@ impl Runtime {
     /// 能拿到 alive_for_url / pick_fast。
     pub fn set_urltest(&self, t: Arc<crate::health::UrlTester>) {
         *self.urltest.write() = Some(t);
+    }
+
+    pub fn set_ruleset_manager(&self, manager: Arc<core_ruleset::RulesetManager>) {
+        *self.ruleset_manager.write() = Some(manager);
+    }
+
+    pub fn ruleset_manager(&self) -> Option<Arc<core_ruleset::RulesetManager>> {
+        self.ruleset_manager.read().clone()
     }
 
     /// 周期性把连接表聚合摘要打到日志（target="conntable", level=info）。
