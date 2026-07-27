@@ -11,16 +11,6 @@ on:
       - "crates/core-feeds/**"
       - "crates/core-outbound/**"
       - "crates/wuther-core/**"
-  push:
-    branches: ["main"]
-    paths:
-      - ".github/workflows/naive.yml"
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "crates/core-config/**"
-      - "crates/core-feeds/**"
-      - "crates/core-outbound/**"
-      - "crates/wuther-core/**"
   workflow_dispatch:
 
 permissions:

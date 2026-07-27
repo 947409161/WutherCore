@@ -32,11 +32,6 @@ jobs:
     name: Required CI
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    env:
-      # Rust stable defaults to bundled lld on x86_64 Linux. GNU ld is required
-      # while the statically linked NSS and BoringSSL archives export overlapping
-      # legacy crypto symbols.
-      RUSTFLAGS: -C linker-features=-lld
 
     steps:
       - name: Checkout
@@ -78,7 +73,7 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
-      # A single all-targets test build covers libraries, binaries, integration
-      # tests and examples without compiling the workspace repeatedly.
+      # Tests compile the workspace libraries and integration targets. Release
+      # workflows own full CLI linking and cross-platform artifact validation.
       - name: Test workspace
-        run: cargo test --workspace --all-targets --locked
+        run: cargo test --workspace --locked
