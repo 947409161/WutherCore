@@ -14,7 +14,7 @@ on:
         type: string
         default: ""
       tags:
-        description: Exact comma-separated component tags; empty uses the standard build.
+        description: Exact comma-separated component tags; empty uses each target's supported default.
         required: false
         type: string
         default: ""
@@ -31,7 +31,7 @@ on:
   workflow_dispatch:
     inputs:
       tags:
-        description: Exact component tags, for example with_quic,with_vless,with_grpc. Empty uses standard.
+        description: Exact component tags, for example with_quic,with_vless,with_grpc. Empty uses target defaults.
         required: false
         type: string
         default: ""
@@ -152,17 +152,21 @@ jobs:
         shell: bash
         env:
           DEFAULT_TAGS: ${{ matrix.platform.default-tags }}
+          REQUESTED_KEY: ${{ needs.prepare.outputs.tag-key }}
           REQUESTED_TAGS: ${{ needs.prepare.outputs.tags }}
           REQUESTED_LABEL: ${{ needs.prepare.outputs.tag-label }}
         run: |
           tags="$REQUESTED_TAGS"
           label="$REQUESTED_LABEL"
+          key="$REQUESTED_KEY"
           if [ -z "$tags" ] && [ "$DEFAULT_TAGS" = "portable" ]; then
             tags="portable"
             label="portable (platform default)"
+            key="$(printf '%s' "$tags" | sha256sum | cut -c1-16)"
           fi
           echo "tags=$tags" >> "$GITHUB_OUTPUT"
           echo "label=$label" >> "$GITHUB_OUTPUT"
+          echo "key=$key" >> "$GITHUB_OUTPUT"
 
       - name: Install target system toolchain
         if: matrix.platform.packages != ''
@@ -186,7 +190,7 @@ jobs:
       - name: Setup cached Rust
         uses: ./.github/actions/setup-rust
         with:
-          cache-key: build-${{ matrix.platform.target }}-${{ needs.prepare.outputs.tag-key }}
+          cache-key: build-${{ matrix.platform.target }}-${{ steps.components.outputs.key }}
           targets: ${{ matrix.platform.target }}
           cache-targets: true
 
@@ -280,22 +284,26 @@ jobs:
         id: components
         shell: bash
         env:
+          REQUESTED_KEY: ${{ needs.prepare.outputs.tag-key }}
           REQUESTED_TAGS: ${{ needs.prepare.outputs.tags }}
           REQUESTED_LABEL: ${{ needs.prepare.outputs.tag-label }}
         run: |
           tags="$REQUESTED_TAGS"
           label="$REQUESTED_LABEL"
+          key="$REQUESTED_KEY"
           if [ -z "$tags" ]; then
             tags="portable"
             label="portable (platform default)"
+            key="$(printf '%s' "$tags" | sha256sum | cut -c1-16)"
           fi
           echo "tags=$tags" >> "$GITHUB_OUTPUT"
           echo "label=$label" >> "$GITHUB_OUTPUT"
+          echo "key=$key" >> "$GITHUB_OUTPUT"
 
       - name: Setup cached Rust
         uses: ./.github/actions/setup-rust
         with:
-          cache-key: build-${{ matrix.platform.target }}-${{ needs.prepare.outputs.tag-key }}
+          cache-key: build-${{ matrix.platform.target }}-${{ steps.components.outputs.key }}
           targets: ${{ matrix.platform.target }}
           cache-targets: true
 
@@ -364,9 +372,11 @@ jobs:
           - target: x86_64-pc-windows-msvc
             name: windows-amd64-msvc
             runner: windows-2025
+            default-tags: standard
           - target: aarch64-pc-windows-msvc
             name: windows-arm64-msvc
             runner: windows-11-arm
+            default-tags: portable
 
     steps:
       - name: Checkout
@@ -375,16 +385,37 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
 
+      - name: Resolve target components
+        id: components
+        shell: bash
+        env:
+          DEFAULT_TAGS: ${{ matrix.platform.default-tags }}
+          REQUESTED_KEY: ${{ needs.prepare.outputs.tag-key }}
+          REQUESTED_TAGS: ${{ needs.prepare.outputs.tags }}
+          REQUESTED_LABEL: ${{ needs.prepare.outputs.tag-label }}
+        run: |
+          tags="$REQUESTED_TAGS"
+          label="$REQUESTED_LABEL"
+          key="$REQUESTED_KEY"
+          if [ -z "$tags" ] && [ "$DEFAULT_TAGS" = "portable" ]; then
+            tags="portable"
+            label="portable (platform default)"
+            key="$(printf '%s' "$tags" | sha256sum | cut -c1-16)"
+          fi
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "label=$label" >> "$GITHUB_OUTPUT"
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+
       - name: Setup cached Rust
         uses: ./.github/actions/setup-rust
         with:
-          cache-key: build-${{ matrix.platform.target }}-${{ needs.prepare.outputs.tag-key }}
+          cache-key: build-${{ matrix.platform.target }}-${{ steps.components.outputs.key }}
           targets: ${{ matrix.platform.target }}
           cache-targets: true
 
       - name: Ensure Firefox Neqo build tools
         if: >-
-          needs.prepare.outputs.tags == '' ||
+          (needs.prepare.outputs.tags == '' && matrix.platform.default-tags == 'standard') ||
           contains(format(',{0},', needs.prepare.outputs.tags), ',with_young,') ||
           contains(format(',{0},', needs.prepare.outputs.tags), ',standard,') ||
           contains(format(',{0},', needs.prepare.outputs.tags), ',all_components,')
@@ -394,7 +425,7 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.platform.target }}
-          WUTHER_BUILD_TAGS: ${{ needs.prepare.outputs.tags }}
+          WUTHER_BUILD_TAGS: ${{ steps.components.outputs.tags }}
         run: |
           set -euo pipefail
           if [ -n "$WUTHER_BUILD_TAGS" ]; then
@@ -417,7 +448,7 @@ jobs:
           TARGET: ${{ matrix.platform.target }}
           PLATFORM_NAME: ${{ matrix.platform.name }}
           RELEASE_VERSION: ${{ inputs.version }}
-          WUTHER_BUILD_TAG_LABEL: ${{ needs.prepare.outputs.tag-label }}
+          WUTHER_BUILD_TAG_LABEL: ${{ steps.components.outputs.label }}
         run: |
           python scripts/package-artifact.py `
             --target "$env:TARGET" `

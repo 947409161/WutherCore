@@ -86,11 +86,11 @@ git push origin v0.4.0
 - `BUILD-COMPONENTS.txt` 版本、Rust target 与实际组件预设；
 - `licenses/xray-transport-MPL-2.0.txt` 第三方许可证。
 
-宿主架构的 Linux GNU、Windows 与 macOS 默认归档使用 `standard`；不支持嵌入
-Mozilla NSS 的交叉编译、musl 及 Android 归档使用 `portable`。`portable`
-同时避开上游无法覆盖所有 musl/交叉架构的 BoringSSL；可用目标仍能显式选择
-`portable_boringssl` 或具体的 `with_grpc`、`with_utls`、`with_xhttp`。预设都会在
-`BUILD-COMPONENTS.txt` 中明确记录，显式传入 `tags` 时则完全采用请求的组件集。
+Linux GNU、Windows AMD64 与 macOS 默认归档使用 `standard`；Linux musl、
+Android 与 Windows ARM64 使用 `portable`。后者避开上游尚未覆盖这些目标的
+Mozilla NSS/BoringSSL 构建链；可用目标仍能显式选择 `portable_boringssl` 或具体的
+`with_grpc`、`with_utls`、`with_xhttp`。预设都会在 `BUILD-COMPONENTS.txt`
+中明确记录，显式传入 `tags` 时则完全采用请求的组件集。
 
 ## 校验下载
 
@@ -116,7 +116,7 @@ gh attestation verify .\wuther-core-0.4.0-windows-amd64-msvc.zip --repo MiChongs
 
 需要验证裁剪构建时，在 `CI` 或 `Build Matrix` 工作流中选择 `Run workflow`，
 并在 `tags` 中填写逗号分隔的组件标签，例如
-`with_quic,with_vless,with_grpc,with_utls`。留空执行标准组件集。标签含义、
+`with_quic,with_vless,with_grpc,with_utls`。留空执行各目标支持的默认组件集。标签含义、
 本地等价命令和许可边界见[构建脚本](../scripts/README.md#按组件标签编译)。
 Build Matrix 的 `platforms` 可只重跑一个平台组；`macos` 会同时覆盖 Intel
 和 Apple Silicon。
