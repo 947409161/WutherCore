@@ -13,14 +13,13 @@ categories = ["command-line-utilities", "network-programming"]
 
 [features]
 default = ["standard"]
-# Portable is the complete component set supported by cross-compiled and
-# Android targets. Young embeds Mozilla NSS and therefore remains a native
-# desktop/server component.
+# Portable is the component set supported across every release target. The
+# BoringSSL-backed transports are split out because upstream does not support
+# every musl/cross architecture. Young embeds Mozilla NSS and remains native.
 portable = [
     "with_api",
     "with_tun",
     "with_anytls",
-    "with_grpc",
     "with_hysteria",
     "with_hysteria2",
     "with_http",
@@ -37,17 +36,16 @@ portable = [
     "with_trojan",
     "with_trusttunnel",
     "with_tuic",
-    "with_utls",
     "with_vless",
     "with_vmess",
     "with_wireguard",
     "with_ws",
-    "with_xhttp",
 ]
+portable_boringssl = ["portable", "with_grpc", "with_utls", "with_xhttp"]
 # Standard keeps the pre-feature native behavior (everything except
 # GPL-linked Naive/Cronet). Passing --no-default-features plus explicit
 # `with_*` tags produces an exact component build.
-standard = ["portable", "with_young"]
+standard = ["portable_boringssl", "with_young"]
 all_components = ["standard", "with_naive"]
 
 # Runtime components.

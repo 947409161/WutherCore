@@ -6,11 +6,10 @@ license.workspace = true
 
 [features]
 default = ["standard"]
-# Cross-compiled and Android builds cannot embed Mozilla NSS, so they use this
-# complete portable set. Native builds add Young through `standard`.
+# BoringSSL and Mozilla NSS do not support every release architecture, so the
+# universally portable preset keeps both native stacks opt-in.
 portable = [
     "with_anytls",
-    "with_grpc",
     "with_hysteria",
     "with_hysteria2",
     "with_http",
@@ -27,14 +26,13 @@ portable = [
     "with_trojan",
     "with_trusttunnel",
     "with_tuic",
-    "with_utls",
     "with_vless",
     "with_vmess",
     "with_wireguard",
     "with_ws",
-    "with_xhttp",
 ]
-standard = ["portable", "with_young"]
+portable_boringssl = ["portable", "with_grpc", "with_utls", "with_xhttp"]
+standard = ["portable_boringssl", "with_young"]
 all_components = ["standard", "with_naive"]
 
 # Transport/capability tags.

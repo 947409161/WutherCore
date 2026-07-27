@@ -30,7 +30,9 @@ pwsh -File scripts/build-all.ps1 -Backend cross    -Targets "aarch64-linux-andro
 WutherCore 使用 Cargo features 提供与 Go `-tags` 等价的编译期组件裁剪。未指定
 `--tags` 时，本机脚本使用 `standard`，行为与引入组件标签前一致（除需单独许可
 的 Naive 外全部启用）。CI 中无法嵌入 Mozilla NSS 的交叉编译和 Android 目标使用
-`portable`，原生 Linux、Windows 和 macOS 仍使用 `standard`。一旦指定 `--tags`，
+`portable`，原生 Linux、Windows 和 macOS 仍使用 `standard`。`portable` 不包含
+上游无法覆盖全部 musl/交叉架构的 BoringSSL 传输；支持 BoringSSL 的目标可选择
+`portable_boringssl`，或显式加入对应标签。一旦指定 `--tags`，
 脚本和 CI 都会自动添加 `--no-default-features`，只有列出的标签及其依赖会进入构建。
 
 ```cmd
@@ -63,7 +65,8 @@ wuther-core components --json
 
 | 类别 | 标签 | 能力 |
 |---|---|---|
-| 预设 | `portable` | 除 Young/Naive 外的完整跨平台组件集 |
+| 预设 | `portable` | 所有发布架构通用，不含 BoringSSL/Young/Naive |
+| 预设 | `portable_boringssl` | `portable` 加 gRPC、uTLS 与 XHTTP |
 | 预设 | `standard` | 默认标准组件集，不含 Naive/Cronet |
 | 预设 | `all_components` | `standard` 加 `with_naive` |
 | 运行组件 | `with_api` | 管理 API 与面板服务 |
@@ -93,7 +96,7 @@ GitHub Actions 的 **Build Matrix** 和 **CI** 手动运行入口也提供 `tags
 显式填写时语义与本地 `--tags` 完全相同。Build Matrix 留空时会按目标选择上述
 `standard` 或 `portable` 预设，并把最终选择写进归档。它还可用 `platforms`
 只运行 `linux`、`android`、`windows` 或 `macos` 子矩阵；`all` 会并行构建
-12 个目标。macOS 使用 GitHub 原生 Intel 与 Apple Silicon runner，分别产出
+10 个目标。macOS 使用 GitHub 原生 Intel 与 Apple Silicon runner，分别产出
 `x86_64-apple-darwin` 和 `aarch64-apple-darwin`，不依赖不完整的 Darwin
 交叉编译环境。
 

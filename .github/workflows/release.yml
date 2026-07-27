@@ -148,8 +148,8 @@ jobs:
           shopt -s nullglob
 
           archives=(dist/wuther-core-"$RELEASE_VERSION"-*.zip)
-          if [ "${#archives[@]}" -ne 12 ]; then
-            echo "::error::Expected 12 release archives, found ${#archives[@]}."
+          if [ "${#archives[@]}" -ne 10 ]; then
+            echo "::error::Expected 10 release archives, found ${#archives[@]}."
             printf 'Found: %s\n' "${archives[@]:-none}"
             exit 1
           fi

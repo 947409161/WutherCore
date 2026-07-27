@@ -122,38 +122,22 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             name: linux-amd64
             runner: ubuntu-24.04
-            builder: cargo
             packages: ""
             default-tags: standard
           - target: aarch64-unknown-linux-gnu
             name: linux-arm64
             runner: ubuntu-24.04-arm
-            builder: cargo
             packages: ""
             default-tags: standard
           - target: x86_64-unknown-linux-musl
             name: linux-amd64-musl
             runner: ubuntu-24.04
-            builder: cargo
             packages: musl-tools
             default-tags: portable
           - target: aarch64-unknown-linux-musl
             name: linux-arm64-musl
             runner: ubuntu-24.04-arm
-            builder: cargo
             packages: musl-tools
-            default-tags: portable
-          - target: i686-unknown-linux-gnu
-            name: linux-i686
-            runner: ubuntu-24.04
-            builder: cargo
-            packages: gcc-multilib g++-multilib
-            default-tags: portable
-          - target: s390x-unknown-linux-gnu
-            name: linux-s390x
-            runner: ubuntu-24.04
-            builder: cross
-            packages: ""
             default-tags: portable
 
     steps:
@@ -205,16 +189,8 @@ jobs:
           cache-key: build-${{ matrix.platform.target }}-${{ needs.prepare.outputs.tag-key }}
           targets: ${{ matrix.platform.target }}
           cache-targets: true
-          enable-sccache: ${{ matrix.platform.builder != 'cross' }}
 
-      - name: Install Cross
-        if: matrix.platform.builder == 'cross'
-        uses: taiki-e/install-action@v2.85.2
-        with:
-          tool: cross@0.2.5
-
-      - name: Build Linux binary with Cargo
-        if: matrix.platform.builder == 'cargo'
+      - name: Build Linux binary
         shell: bash
         env:
           TARGET: ${{ matrix.platform.target }}
@@ -228,24 +204,8 @@ jobs:
             cargo build --release --locked --target "$TARGET" -p wuther-core
           fi
 
-      - name: Build Linux binary with Cross
-        if: matrix.platform.builder == 'cross'
-        shell: bash
-        env:
-          TARGET: ${{ matrix.platform.target }}
-          WUTHER_BUILD_TAGS: ${{ steps.components.outputs.tags }}
-        run: |
-          set -euo pipefail
-          if [ -n "$WUTHER_BUILD_TAGS" ]; then
-            cross build --release --locked --target "$TARGET" \
-              -p wuther-core --no-default-features --features "$WUTHER_BUILD_TAGS"
-          else
-            cross build --release --locked --target "$TARGET" -p wuther-core
-          fi
-
       - name: Stage Linux runtime libraries
         if: >-
-          matrix.platform.builder == 'cargo' &&
           ((needs.prepare.outputs.tags == '' && matrix.platform.default-tags == 'standard') ||
           contains(format(',{0},', needs.prepare.outputs.tags), ',with_young,') ||
           contains(format(',{0},', needs.prepare.outputs.tags), ',standard,') ||
@@ -260,7 +220,6 @@ jobs:
 
       - name: Smoke-test native Linux binary
         if: >-
-          matrix.platform.builder == 'cargo' &&
           ((needs.prepare.outputs.tags == '' && matrix.platform.default-tags == 'standard') ||
           contains(format(',{0},', needs.prepare.outputs.tags), ',with_young,') ||
           contains(format(',{0},', needs.prepare.outputs.tags), ',standard,') ||

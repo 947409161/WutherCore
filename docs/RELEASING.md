@@ -58,9 +58,9 @@ git push origin v0.4.0
 1. 校验标签格式、版本通道与 workspace 版本；
 2. 确认正式版提交属于 `main`；
 3. 在标签对应源码上运行格式、仓库完整性与 Linux workspace 校验；
-4. 调用统一的 Build Matrix，并行构建全部 12 个目标；Windows 和 macOS
+4. 调用统一的 Build Matrix，并行构建全部 10 个目标；Windows 和 macOS
    产物会在对应架构的原生 runner 上执行冒烟验证；
-5. 将每个平台 ZIP 作为非嵌套 artifact 上传，再按 `wuther-core-$VERSION-*` 前缀收集全部 12 个产物；
+5. 将每个平台 ZIP 作为非嵌套 artifact 上传，再按 `wuther-core-$VERSION-*` 前缀收集全部 10 个产物；
 6. 生成 `SHA256SUMS`，再汇总为零压缩的 `release-assets` artifact；
 7. 下载并解包汇总产物，生成 GitHub Artifact Attestation；
 8. 使用 `.github/release.yml` 自动分类 Release Notes；
@@ -72,7 +72,7 @@ git push origin v0.4.0
 
 | 系统 | 架构 / ABI |
 | --- | --- |
-| Linux GNU | AMD64、ARM64、i686、s390x |
+| Linux GNU | AMD64、ARM64 |
 | Linux musl | AMD64、ARM64 |
 | Android | ARM64、ARMv7 |
 | Windows MSVC | AMD64、ARM64 |
@@ -87,7 +87,9 @@ git push origin v0.4.0
 - `licenses/xray-transport-MPL-2.0.txt` 第三方许可证。
 
 宿主架构的 Linux GNU、Windows 与 macOS 默认归档使用 `standard`；不支持嵌入
-Mozilla NSS 的交叉编译、musl 及 Android 归档使用 `portable`。两者都会在
+Mozilla NSS 的交叉编译、musl 及 Android 归档使用 `portable`。`portable`
+同时避开上游无法覆盖所有 musl/交叉架构的 BoringSSL；可用目标仍能显式选择
+`portable_boringssl` 或具体的 `with_grpc`、`with_utls`、`with_xhttp`。预设都会在
 `BUILD-COMPONENTS.txt` 中明确记录，显式传入 `tags` 时则完全采用请求的组件集。
 
 ## 校验下载
