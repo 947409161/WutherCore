@@ -7,7 +7,6 @@
 pub mod config;
 mod device;
 mod dns;
-mod fragment;
 mod netstack;
 mod server;
 

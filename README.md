@@ -191,6 +191,11 @@ capture:
     udp-timeout: 5m
 ```
 
+TUN MTU 必须在 `576..=65535`，启用 IPv6 时不得低于 `1280`。配置值会直接
+应用到 Linux、Windows、macOS 和 Android 的实际设备，并约束用户态写包；
+超长 IPv4/IPv6 包会按协议分片，DF 包会明确报错。`0`、截断值以及在
+TPROXY/REDIRECT 模式中填写 MTU 都不会被静默接受。
+
 ### Linux
 
 * 支持 TUN、TPROXY 和 REDIRECT。

@@ -7,9 +7,12 @@
 //!    `OwnedFd` + `AsyncFd`，无需 root。
 //! 3. 都不可用：返回 `Unsupported`。
 
-#[cfg(target_os = "android")]
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
+#[cfg(target_os = "android")]
+use std::{
+    num::NonZeroU16,
+    os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
+};
 
 #[cfg(target_os = "android")]
 use parking_lot::Mutex;
@@ -22,25 +25,49 @@ use crate::{
 };
 
 #[cfg(target_os = "android")]
-static INJECTED_FD: Mutex<Option<OwnedFd>> = Mutex::new(None);
+struct InjectedVpnFd {
+    fd: OwnedFd,
+    /// MTU actually passed to `VpnService.Builder.setMtu`.
+    applied_mtu: Option<NonZeroU16>,
+}
+
+#[cfg(target_os = "android")]
+static INJECTED_FD: Mutex<Option<InjectedVpnFd>> = Mutex::new(None);
 
 /// 由 JNI 调用：注入 VpnService 创建的 fd（dup 后所有权交本进程）。
 /// 多次调用以最后一次为准；尚未消费的旧 fd 会立即关闭，避免 VPN 重建泄漏。
 #[cfg(target_os = "android")]
 pub fn set_vpn_fd(fd: RawFd) {
+    set_vpn_fd_inner(fd, None);
+}
+
+/// 注入 VpnService fd，并携带宿主实际传给 Builder.setMtu 的值。
+#[cfg(target_os = "android")]
+pub fn set_vpn_fd_with_mtu(fd: RawFd, mtu: u16) {
+    set_vpn_fd_inner(fd, NonZeroU16::new(mtu));
+}
+
+#[cfg(target_os = "android")]
+fn set_vpn_fd_inner(fd: RawFd, applied_mtu: Option<NonZeroU16>) {
     if fd < 0 {
         return;
     }
     let mut pending = INJECTED_FD.lock();
-    if pending
-        .as_ref()
-        .is_some_and(|current| current.as_raw_fd() == fd)
+    if let Some(current) = pending
+        .as_mut()
+        .filter(|current| current.fd.as_raw_fd() == fd)
     {
+        if applied_mtu.is_some() {
+            current.applied_mtu = applied_mtu;
+        }
         return;
     }
     // SAFETY: the JNI contract transfers ownership of detachFd() to native.
     // OwnedFd closes the replaced descriptor automatically.
-    *pending = Some(unsafe { OwnedFd::from_raw_fd(fd) });
+    *pending = Some(InjectedVpnFd {
+        fd: unsafe { OwnedFd::from_raw_fd(fd) },
+        applied_mtu,
+    });
 }
 
 /// 丢弃尚未被 native TUN 消费的 VpnService fd。
@@ -57,7 +84,11 @@ pub fn open(plan: &CapturePlan) -> Result<Arc<dyn TunIo>, TunIoError> {
     // 1. root /dev/net/tun 优先。即使宿主曾注入 VpnService fd，root virtual_nic
     // 也不应被 fd 抢入口，否则 native 会拿到一张 Android framework 已配置过的
     // 网卡并继续执行 Linux route/rule，造成互相覆盖。
-    match LinuxTunIo::open(&plan.interface_name, plan.mtu, plan.offload) {
+    match LinuxTunIo::open(
+        &plan.interface_name,
+        u32::from(plan.mtu.get()),
+        plan.offload,
+    ) {
         Ok(dev) => {
             info!(
                 target: "capture::android",
@@ -79,7 +110,20 @@ pub fn open(plan: &CapturePlan) -> Result<Arc<dyn TunIo>, TunIoError> {
     }
 
     // 2. 非 root / root TUN 不可用时，才使用 VpnService fd。
-    if let Some(fd) = INJECTED_FD.lock().take() {
+    if let Some(injected) = INJECTED_FD.lock().take() {
+        let Some(applied_mtu) = injected.applied_mtu else {
+            return Err(TunIoError::Open(
+                "VpnService fd 未携带实际 MTU；请使用 setVpnFdWithMtu(fd, mtu)，并把同一 mtu 传给 VpnService.Builder.setMtu"
+                    .into(),
+            ));
+        };
+        if applied_mtu != plan.mtu {
+            return Err(TunIoError::Open(format!(
+                "VpnService MTU 与配置不一致：Builder.setMtu({})，capture.mtu={}",
+                applied_mtu, plan.mtu
+            )));
+        }
+        let fd = injected.fd;
         let raw_fd = fd.as_raw_fd();
         info!(
             target: "capture::android",
@@ -97,7 +141,7 @@ pub fn open(plan: &CapturePlan) -> Result<Arc<dyn TunIo>, TunIoError> {
         let dev = crate::platform::vpnservice_tun_io::VpnServiceTunIo::from_raw_fd(
             fd.into_raw_fd(),
             plan.interface_name.clone(),
-            plan.mtu,
+            u32::from(plan.mtu.get()),
         )?;
         return Ok(Arc::new(dev));
     }

@@ -81,7 +81,7 @@ pub fn open(plan: &CapturePlan) -> Result<Arc<WindowsTunIo>, TunIoError> {
 
     Ok(Arc::new(WindowsTunIo {
         name: plan.interface_name.clone(),
-        mtu: plan.mtu,
+        mtu: u32::from(plan.mtu.get()),
         session,
         rx: Mutex::new(rx),
     }))

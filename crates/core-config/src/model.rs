@@ -4672,7 +4672,7 @@ pub struct Capture {
     #[serde(default = "default_capture_stack")]
     pub stack: CaptureStack,
     #[serde(default)]
-    pub mtu: Option<u32>,
+    pub mtu: Option<std::num::NonZeroU16>,
     #[serde(default = "default_true")]
     pub offload: bool,
     #[serde(default)]
@@ -4702,7 +4702,7 @@ impl Default for Capture {
 #[serde(rename_all = "lowercase")]
 pub enum CaptureMethod {
     Auto,
-    #[serde(rename = "virtual_nic")]
+    #[serde(rename = "virtual_nic", alias = "tun")]
     VirtualNic,
     Tproxy,
     Redirect,
@@ -5401,6 +5401,15 @@ fn default_tailscale_mode() -> TailscaleMode {
 #[cfg(test)]
 mod xhttp_config_tests {
     use super::*;
+
+    #[test]
+    fn capture_mtu_is_non_zero_and_bounded_by_platform_width() {
+        let valid: Capture = serde_yaml::from_str("method: tun\nmtu: 1500\n").unwrap();
+        assert_eq!(valid.method, CaptureMethod::VirtualNic);
+        assert_eq!(valid.mtu.unwrap().get(), 1500);
+        assert!(serde_yaml::from_str::<Capture>("mtu: 0\n").is_err());
+        assert!(serde_yaml::from_str::<Capture>("mtu: 65536\n").is_err());
+    }
 
     #[test]
     fn tun_accepts_mihomo_kebab_case_nat_fields() {

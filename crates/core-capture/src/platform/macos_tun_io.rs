@@ -50,11 +50,15 @@ pub struct MacUtunIo {
 pub fn open(plan: &CapturePlan) -> Result<Arc<MacUtunIo>, TunIoError> {
     // 1. 优先：iOS NEPacketTunnelProvider 注入的 fd（需要 entitlement）。
     if let Some(fd) = crate::platform::ios_bridge::take_injected_fd() {
-        let dev = MacUtunIo::from_injected_fd(fd, plan.interface_name.clone(), plan.mtu)?;
+        let dev = MacUtunIo::from_injected_fd(
+            fd,
+            plan.interface_name.clone(),
+            u32::from(plan.mtu.get()),
+        )?;
         return Ok(Arc::new(dev));
     }
     // 2. 默认：自己 socket(PF_SYSTEM, SYSPROTO_CONTROL) 打开 utun。
-    let dev = MacUtunIo::open(&plan.interface_name, plan.mtu)?;
+    let dev = MacUtunIo::open(&plan.interface_name, u32::from(plan.mtu.get()))?;
     Ok(Arc::new(dev))
 }
 

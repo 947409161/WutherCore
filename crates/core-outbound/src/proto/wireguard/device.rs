@@ -16,10 +16,10 @@ use crate::adapter::{create_outbound_udp_socket, resolve_host};
 
 use super::{
     config::{WireGuardConfig, WireGuardPeerConfig},
-    fragment::fragment_ip_packet,
     io_err,
     netstack::StackShared,
 };
+use crate::ip_fragment::fragment_ip_packet;
 
 const NETWORK_BUFFER_SIZE: usize = 65_535 + 256;
 const MAX_DRAIN_RESULTS: usize = 512;

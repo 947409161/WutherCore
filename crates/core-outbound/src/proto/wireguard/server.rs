@@ -23,9 +23,9 @@ use tokio_util::sync::CancellationToken;
 use super::{
     config::{DEFAULT_MTU, DEFAULT_PACKET_QUEUE, MAX_MTU, MAX_PEERS, WireGuardPeerConfig},
     device::{PeerCrypto, normalize_incoming_reserved},
-    fragment::fragment_ip_packet,
     io_err,
 };
+use crate::ip_fragment::fragment_ip_packet;
 
 const NETWORK_BUFFER_SIZE: usize = 65_535 + 256;
 const DEFAULT_HANDSHAKE_RATE_LIMIT: u64 = 100;

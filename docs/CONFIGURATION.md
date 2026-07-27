@@ -188,6 +188,13 @@ capture:
   mtu: 1500
 ```
 
+`mtu` 只用于会创建设备的 TUN 接管。取值范围为 `576..=65535`，启用
+`capture.tun.inet6` 时下限为 `1280`；`0`、超出范围的值以及在
+TPROXY/REDIRECT 模式中设置 MTU 都会直接拒绝配置。Linux、Windows 和 macOS
+由 `tun-rs` 在创建设备时应用该值；Android VpnService 宿主必须把导出 JSON
+中的 `mtu` 传给 `VpnService.Builder.setMtu`，并使用
+`setVpnFdWithMtu(fd, mtu)` 注入设备，native 会在启动前核对两边的值。
+
 建议顺序：
 
 1. `capture.on: false` 验证 HTTP/SOCKS5。

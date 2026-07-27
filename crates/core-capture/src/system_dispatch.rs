@@ -184,7 +184,7 @@ impl SystemDispatcher {
         handler: Arc<ListenerHandler>,
         mut stop_rx: oneshot::Receiver<()>,
     ) {
-        let mtu = self.plan.mtu as usize;
+        let mtu = usize::from(self.plan.mtu.get());
         let buf_cap = mtu + 64;
         // 预分配 PUMP_BATCH_N 个固定容量 buffer；read_batch 内填充实际字节，
         // sizes[i] 记录 IP 包长度。drain-on-ready 后端一次 wakeup 可消费多包。

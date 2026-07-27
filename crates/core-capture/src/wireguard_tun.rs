@@ -151,7 +151,7 @@ route: {preset: direct}
         .unwrap();
         let runtime = Arc::new(core_runtime::Runtime::build(plan.clone()).unwrap());
         let mut capture_plan = CapturePlan::from_config(&plan.capture).unwrap();
-        capture_plan.mtu = 1_420;
+        capture_plan.mtu = std::num::NonZeroU16::new(1_420).unwrap();
         capture_plan.allow_loopback_destination = true;
         let dispatcher = Arc::new(NetstackDispatcher::new(
             capture_plan.clone(),

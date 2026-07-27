@@ -1265,7 +1265,7 @@ fn smol_now() -> Instant {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::wireguard::{config::WireGuardPeerConfig, fragment::fragment_ip_packet};
+    use crate::{ip_fragment::fragment_ip_packet, proto::wireguard::config::WireGuardPeerConfig};
 
     fn config() -> WireGuardConfig {
         let mut config = WireGuardConfig::new(

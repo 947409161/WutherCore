@@ -2,6 +2,7 @@
 
 use std::{
     net::{IpAddr, SocketAddr},
+    num::NonZeroU16,
     sync::Arc,
     time::Duration,
 };
@@ -81,7 +82,9 @@ pub struct CapturePlan {
     pub kind: EngineKind,
     pub stack: CaptureStack,
     pub traffic: CaptureTraffic,
-    pub mtu: u32,
+    /// 已校验的 TUN 三层 MTU。使用非零类型保证设备、缓冲区、用户态协议栈
+    /// 和 Android 宿主配置不可能观察到 `0` 或被截断后的数值。
+    pub mtu: NonZeroU16,
     pub offload: bool,
     pub hijack_dns: bool,
     pub exclude_cidrs: Vec<ipnet::IpNet>,
@@ -163,6 +166,28 @@ impl CapturePlan {
             tun_v4.unwrap_or_else(|| "198.18.0.0/15".parse().expect("static IPv4 TUN CIDR"));
         let tun_v6 = tun_v6.unwrap_or_else(|| "fc00:1::/64".parse().expect("static IPv6 TUN CIDR"));
         let tun_v6: Option<ipnet::Ipv6Net> = if c.tun.inet6 { Some(tun_v6) } else { None };
+        let mtu = match c.mtu {
+            Some(mtu) if mtu.get() < MIN_TUN_MTU => {
+                return Err(CaptureError::DeviceFailed(format!(
+                    "capture.mtu 必须在 {MIN_TUN_MTU}..={MAX_TUN_MTU}，收到 {}",
+                    mtu.get()
+                )));
+            }
+            Some(mtu) => mtu,
+            None => default_mtu(kind),
+        };
+        if kind == EngineKind::Tun && tun_v6.is_some() && mtu.get() < MIN_IPV6_TUN_MTU {
+            return Err(CaptureError::DeviceFailed(format!(
+                "capture.tun.inet6=true 时 capture.mtu 至少为 {MIN_IPV6_TUN_MTU}，收到 {}",
+                mtu.get()
+            )));
+        }
+        if kind != EngineKind::Tun && c.mtu.is_some() {
+            return Err(CaptureError::DeviceFailed(
+                "capture.mtu 只适用于 virtual_nic/TUN；TPROXY、REDIRECT 和关闭状态不创建 TUN 设备"
+                    .into(),
+            ));
+        }
 
         let interface_name = c
             .tun
@@ -274,8 +299,7 @@ impl CapturePlan {
             kind,
             stack: c.stack,
             traffic: c.traffic,
-            // mihomo `server.go::192-195`：MTU 为 0 视为未设置，回退到默认值。
-            mtu: nonzero_or(c.mtu, default_mtu(kind)),
+            mtu,
             offload: c.offload,
             hijack_dns: matches!(c.resolver, core_config::model::CaptureResolver::Hijack),
             exclude_cidrs: excludes,
@@ -415,12 +439,18 @@ fn parse_uid_ranges(
         .collect()
 }
 
-fn default_mtu(kind: EngineKind) -> u32 {
+pub const MIN_TUN_MTU: u16 = 576;
+pub const MIN_IPV6_TUN_MTU: u16 = 1_280;
+pub const MAX_TUN_MTU: u16 = u16::MAX;
+pub const DEFAULT_TUN_MTU: NonZeroU16 = NonZeroU16::new(9_000).unwrap();
+pub const DEFAULT_NON_TUN_MTU: NonZeroU16 = NonZeroU16::new(1_500).unwrap();
+
+fn default_mtu(kind: EngineKind) -> NonZeroU16 {
     // mihomo (`sing-tun server.go::194`) 默认 9000 —— TUN 链路 jumbo frame
     // 显著提升 TCP 吞吐。TPROXY/Redirect 不经 TUN，沿用网卡 MTU 1500。
     match kind {
-        EngineKind::Tun => 9000,
-        _ => 1500,
+        EngineKind::Tun => DEFAULT_TUN_MTU,
+        _ => DEFAULT_NON_TUN_MTU,
     }
 }
 
@@ -618,7 +648,7 @@ mod tests {
             traffic: CaptureTraffic::System,
             resolver: CaptureResolver::Hijack,
             stack: CaptureStack::System,
-            mtu: Some(9000),
+            mtu: Some(NonZeroU16::new(9000).unwrap()),
             offload: true,
             exclude: CaptureExclude::default(),
             tun: TunInboundOptions {
@@ -696,7 +726,7 @@ mod tests {
 
         let plan = CapturePlan::from_config(&c).unwrap();
         assert_eq!(plan.interface_name, "tun0");
-        assert_eq!(plan.mtu, 9000);
+        assert_eq!(plan.mtu.get(), 9000);
         // ipnet 解析时保留 host bits；Display 显示 host/prefix。
         assert_eq!(plan.tun_v4_cidr.to_string(), "172.18.0.1/30");
         assert_eq!(
@@ -733,6 +763,32 @@ mod tests {
 
         assert_eq!(plan.tun_v4_addr_cidr(), "172.19.0.1/30");
         assert_eq!(plan.tun_v6_addr_cidr().unwrap(), "fdfe:dcba:9876::1/126");
+    }
+
+    #[test]
+    fn tun_mtu_enforces_ip_protocol_minimums() {
+        let mut ipv4 = base();
+        ipv4.tun.inet6 = false;
+        ipv4.mtu = NonZeroU16::new(MIN_TUN_MTU - 1);
+        assert!(CapturePlan::from_config(&ipv4).is_err());
+
+        let mut ipv6 = base();
+        ipv6.mtu = NonZeroU16::new(MIN_IPV6_TUN_MTU - 1);
+        assert!(CapturePlan::from_config(&ipv6).is_err());
+
+        ipv6.mtu = NonZeroU16::new(MIN_IPV6_TUN_MTU);
+        assert_eq!(
+            CapturePlan::from_config(&ipv6).unwrap().mtu.get(),
+            MIN_IPV6_TUN_MTU
+        );
+    }
+
+    #[test]
+    fn mtu_is_rejected_when_no_tun_device_is_created() {
+        let mut capture = base();
+        capture.method = CaptureMethod::Tproxy;
+        let error = CapturePlan::from_config(&capture).unwrap_err();
+        assert!(error.to_string().contains("只适用于 virtual_nic/TUN"));
     }
 
     #[test]

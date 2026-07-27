@@ -69,7 +69,7 @@ impl NetstackDispatcher {
         device: Arc<dyn TunIo>,
         runtime: Arc<Runtime>,
     ) -> NetstackDispatcherHandles {
-        let mtu = self.plan.mtu as usize;
+        let mtu = usize::from(self.plan.mtu.get());
         let handler = Arc::new(ListenerHandler::new(runtime.clone()));
 
         // 构建 netstack-smoltcp 栈
@@ -176,7 +176,7 @@ impl NetstackDispatcher {
         >,
         mut stop_rx: oneshot::Receiver<()>,
     ) {
-        let mtu = self.plan.mtu as usize;
+        let mtu = usize::from(self.plan.mtu.get());
         let buf_cap = mtu + 64;
         let mut storage: Vec<Vec<u8>> = (0..PUMP_BATCH_N).map(|_| vec![0u8; buf_cap]).collect();
         let mut sizes = [0usize; PUMP_BATCH_N];

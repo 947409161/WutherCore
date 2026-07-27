@@ -3,7 +3,7 @@
 //!
 //! 设计要点（§8.2 TUN / virtual_nic）：
 //! * 读 / 写都基于 IP 包（不是 ethernet frame）；
-//! * MTU 由 `TunConfig` 控制，read buffer 自动按 MTU + 16B 余量分配；
+//! * MTU 由已校验的 `CapturePlan` 控制，read buffer 自动按 MTU + 16B 余量分配；
 //! * 平台后端在 `open` 中完成"创建设备 + 配置地址 + 绑定 fd"原子动作；
 //! * Drop 时自动 stop & cleanup。
 //!
@@ -17,7 +17,7 @@
 //! | iOS        | NEPacketTunnelProvider FFI                    | 桥接占位    |
 //! | Windows    | `Wintun.dll` 动态加载                          | M4-Phase2   |
 
-use std::sync::Arc;
+use std::{num::NonZeroU16, sync::Arc};
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -129,12 +129,14 @@ pub fn open_tun_device(plan: &CapturePlan) -> Result<Arc<dyn TunIo>, TunIoError>
         target_os = "ios",
     ))]
     {
-        return crate::platform::tunrs_io::open(plan).map(|d| d as Arc<dyn TunIo>);
+        return crate::platform::tunrs_io::open(plan)
+            .map(|d| Arc::new(MtuTunIo::new(d as Arc<dyn TunIo>, plan.mtu)) as Arc<dyn TunIo>);
     }
     // Android: DeviceBuilder 不可用，走 android_tun_io（内部处理 root/VpnService）。
     #[cfg(target_os = "android")]
     {
-        return crate::platform::android_tun_io::open(plan);
+        return crate::platform::android_tun_io::open(plan)
+            .map(|d| Arc::new(MtuTunIo::new(d, plan.mtu)) as Arc<dyn TunIo>);
     }
     #[cfg(not(any(
         target_os = "linux",
@@ -146,6 +148,97 @@ pub fn open_tun_device(plan: &CapturePlan) -> Result<Arc<dyn TunIo>, TunIoError>
     {
         let _ = plan;
         Err(TunIoError::Unsupported(std::env::consts::OS.into()))
+    }
+}
+
+/// Enforces the configured MTU at the common packet boundary used by every
+/// platform backend. Device setup controls the kernel MTU; this layer also
+/// prevents a userspace UDP/TCP response from bypassing it.
+struct MtuTunIo {
+    inner: Arc<dyn TunIo>,
+    mtu: NonZeroU16,
+}
+
+impl MtuTunIo {
+    fn new(inner: Arc<dyn TunIo>, mtu: NonZeroU16) -> Self {
+        Self { inner, mtu }
+    }
+
+    fn validate_read_size(&self, size: usize) -> Result<(), TunIoError> {
+        let mtu = usize::from(self.mtu.get());
+        if size <= mtu {
+            return Ok(());
+        }
+        Err(TunIoError::Read(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("TUN packet length {size} exceeds configured MTU {mtu}"),
+        )))
+    }
+
+    fn fragment(&self, packet: &[u8]) -> Result<Vec<Vec<u8>>, TunIoError> {
+        core_outbound::ip_fragment::fragment_ip_packet(packet, usize::from(self.mtu.get()))
+            .map_err(TunIoError::Write)
+    }
+}
+
+#[async_trait]
+impl TunIo for MtuTunIo {
+    async fn read_packet(&self, buf: &mut [u8]) -> Result<usize, TunIoError> {
+        let size = self.inner.read_packet(buf).await?;
+        self.validate_read_size(size)?;
+        Ok(size)
+    }
+
+    async fn write_packet(&self, packet: &[u8]) -> Result<usize, TunIoError> {
+        if packet.len() <= usize::from(self.mtu.get()) {
+            return self.inner.write_packet(packet).await;
+        }
+        for fragment in self.fragment(packet)? {
+            self.inner.write_packet(&fragment).await?;
+        }
+        Ok(packet.len())
+    }
+
+    async fn read_batch(
+        &self,
+        bufs: &mut [&mut [u8]],
+        sizes: &mut [usize],
+    ) -> Result<usize, TunIoError> {
+        let count = self.inner.read_batch(bufs, sizes).await?;
+        for &size in sizes.iter().take(count) {
+            self.validate_read_size(size)?;
+        }
+        Ok(count)
+    }
+
+    async fn write_batch(&self, packets: Vec<Vec<u8>>) -> Result<usize, TunIoError> {
+        let logical_count = packets.len();
+        let mut fragments = Vec::with_capacity(logical_count);
+        for packet in packets {
+            if packet.len() <= usize::from(self.mtu.get()) {
+                fragments.push(packet);
+            } else {
+                fragments.extend(self.fragment(&packet)?);
+            }
+        }
+        self.inner.write_batch(fragments).await?;
+        Ok(logical_count)
+    }
+
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn mtu(&self) -> u32 {
+        u32::from(self.mtu.get())
+    }
+
+    fn is_preconfigured(&self) -> bool {
+        self.inner.is_preconfigured()
+    }
+
+    async fn close(&self) -> Result<(), TunIoError> {
+        self.inner.close().await
     }
 }
 
@@ -281,5 +374,54 @@ mod tests {
             .await
             .expect("ok");
         assert_eq!(n, 0, "empty bufs ⇒ Ok(0), not error");
+    }
+
+    struct RecordingTun {
+        writes: Mutex<Vec<Vec<u8>>>,
+    }
+
+    #[async_trait]
+    impl TunIo for RecordingTun {
+        async fn read_packet(&self, _buf: &mut [u8]) -> Result<usize, TunIoError> {
+            Err(TunIoError::Closed)
+        }
+
+        async fn write_packet(&self, packet: &[u8]) -> Result<usize, TunIoError> {
+            self.writes.lock().push(packet.to_vec());
+            Ok(packet.len())
+        }
+
+        fn name(&self) -> &str {
+            "recording"
+        }
+
+        fn mtu(&self) -> u32 {
+            1_280
+        }
+
+        async fn close(&self) -> Result<(), TunIoError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn mtu_wrapper_fragments_oversized_ipv4_writes() {
+        let recorder = Arc::new(RecordingTun {
+            writes: Mutex::new(Vec::new()),
+        });
+        let tun = MtuTunIo::new(
+            recorder.clone() as Arc<dyn TunIo>,
+            NonZeroU16::new(1_280).unwrap(),
+        );
+        let mut packet = vec![0u8; 3_020];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&(3_020u16).to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 17;
+
+        assert_eq!(tun.write_packet(&packet).await.unwrap(), packet.len());
+        let writes = recorder.writes.lock();
+        assert!(writes.len() > 1);
+        assert!(writes.iter().all(|fragment| fragment.len() <= 1_280));
     }
 }

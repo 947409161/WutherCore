@@ -25,7 +25,7 @@ pub fn root_tun_summary(plan: &CapturePlan) -> RootTunLogSummary {
     RootTunLogSummary {
         interface_name: plan.interface_name.clone(),
         stack: format!("{:?}", plan.stack),
-        mtu: plan.mtu,
+        mtu: u32::from(plan.mtu.get()),
         tun_v4: plan.tun_v4_addr_cidr(),
         tun_v6: plan.tun_v6_addr_cidr().unwrap_or_default(),
         auto_route: plan.auto_route,

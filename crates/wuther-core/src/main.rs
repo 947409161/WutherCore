@@ -1065,8 +1065,10 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
             }
         };
         let mut dispatcher_plan = capture_plan.clone();
-        dispatcher_plan.mtu =
-            u32::try_from(listener.mtu).expect("validated WireGuard MTU always fits into u32");
+        dispatcher_plan.mtu = std::num::NonZeroU16::new(
+            u16::try_from(listener.mtu).expect("validated WireGuard MTU always fits into u16"),
+        )
+        .expect("validated WireGuard MTU is non-zero");
         dispatcher_plan.ipv6_enabled = plan.resolver.ipv6;
         dispatcher_plan.allow_loopback_destination = true;
         let fake_pool = runtime
@@ -1084,7 +1086,7 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
         let device = Arc::new(core_capture::WireGuardTunIo::new(
             server.clone(),
             format!("wireguard-inbound-{index}"),
-            dispatcher_plan.mtu,
+            u32::from(dispatcher_plan.mtu.get()),
         ));
         let dispatcher_handles = dispatcher.start(device, runtime.clone());
         info!(

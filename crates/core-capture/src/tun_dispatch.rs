@@ -72,7 +72,7 @@ impl TunDispatcher {
             .tun_v6_cidr
             .map(|c| smoltcp::wire::Ipv6Address::from(c.addr().octets()));
         let stack = Arc::new(Mutex::new(UserSpaceStack::new(
-            plan.mtu as usize,
+            usize::from(plan.mtu.get()),
             smoltcp::wire::Ipv4Address::from(plan.tun_v4_cidr.addr().octets()),
             v6_addr,
         )));
@@ -204,7 +204,7 @@ impl TunDispatcher {
         tcp_in_tx: mpsc::Sender<(Vec<u8>, u16)>,
         mut stop_rx: oneshot::Receiver<()>,
     ) {
-        let mtu = self.plan.mtu as usize;
+        let mtu = usize::from(self.plan.mtu.get());
         let buf_cap = mtu + 64;
         let mut storage: Vec<Vec<u8>> = (0..PUMP_BATCH_N).map(|_| vec![0u8; buf_cap]).collect();
         let mut sizes = [0usize; PUMP_BATCH_N];

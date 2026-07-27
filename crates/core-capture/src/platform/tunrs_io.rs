@@ -248,14 +248,11 @@ impl TunIo for TunRsDevice {
 ))]
 pub fn open(plan: &CapturePlan) -> Result<Arc<TunRsDevice>, TunIoError> {
     let mut builder = tun_rs::DeviceBuilder::new();
-    builder = builder
-        .name(&plan.interface_name)
-        .mtu(plan.mtu as u16)
-        .ipv4(
-            plan.tun_v4_cidr.addr().to_string(),
-            plan.tun_v4_cidr.prefix_len(),
-            None,
-        );
+    builder = builder.name(&plan.interface_name).mtu(plan.mtu.get()).ipv4(
+        plan.tun_v4_cidr.addr().to_string(),
+        plan.tun_v4_cidr.prefix_len(),
+        None,
+    );
 
     if let Some(v6) = plan.tun_v6_cidr {
         builder = builder.ipv6(v6.addr().to_string(), v6.prefix_len());
@@ -267,8 +264,32 @@ pub fn open(plan: &CapturePlan) -> Result<Arc<TunRsDevice>, TunIoError> {
     }
 
     let device = builder.build_async().map_err(TunIoError::Read)?;
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    {
+        let applied = device
+            .mtu()
+            .map_err(|error| TunIoError::Open(format!("read back TUN MTU: {error}")))?;
+        if applied != plan.mtu.get() {
+            return Err(TunIoError::Open(format!(
+                "TUN MTU readback mismatch: configured {}, applied {applied}",
+                plan.mtu
+            )));
+        }
+    }
+    #[cfg(target_os = "windows")]
+    if plan.tun_v6_cidr.is_some() {
+        let applied_v6 = device
+            .mtu_v6()
+            .map_err(|error| TunIoError::Open(format!("read back IPv6 TUN MTU: {error}")))?;
+        if applied_v6 != plan.mtu.get() {
+            return Err(TunIoError::Open(format!(
+                "IPv6 TUN MTU readback mismatch: configured {}, applied {applied_v6}",
+                plan.mtu
+            )));
+        }
+    }
     let name = plan.interface_name.clone();
-    let mtu = plan.mtu;
+    let mtu = u32::from(plan.mtu.get());
 
     let offload_str = if plan.offload { "on" } else { "off" };
     let v6_str = plan

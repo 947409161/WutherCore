@@ -21,6 +21,7 @@ pub mod block;
 pub mod direct;
 pub mod dns_hijack;
 pub mod http;
+pub mod ip_fragment;
 pub mod socks5;
 pub mod stub;
 

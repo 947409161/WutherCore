@@ -710,7 +710,7 @@ impl CaptureEngine for LinuxTun {
         let (stop_tx, stop_rx) = oneshot::channel();
         if !dispatcher_owns_tun {
             let dev_for_loop = device.clone();
-            let mtu = self.plan.mtu as usize;
+            let mtu = usize::from(self.plan.mtu.get());
             let handle = tokio::spawn(async move {
                 packet_loop(dev_for_loop, mtu, events, stop_rx).await;
             });

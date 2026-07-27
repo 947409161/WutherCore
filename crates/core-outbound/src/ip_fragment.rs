@@ -1,6 +1,8 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use super::io_err;
+fn io_err(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message.into())
+}
 
 const IPV4_MIN_HEADER: usize = 20;
 const IPV6_HEADER: usize = 40;
@@ -12,43 +14,37 @@ const IPV6_DESTINATION_OPTIONS: u8 = 60;
 
 static IPV6_FRAGMENT_ID: AtomicU32 = AtomicU32::new(1);
 
-pub(super) fn fragment_ip_packet(packet: &[u8], mtu: usize) -> std::io::Result<Vec<Vec<u8>>> {
+pub fn fragment_ip_packet(packet: &[u8], mtu: usize) -> std::io::Result<Vec<Vec<u8>>> {
     if packet.len() <= mtu {
         return Ok(vec![packet.to_vec()]);
     }
     match packet.first().map(|byte| byte >> 4) {
         Some(4) => fragment_ipv4(packet, mtu),
         Some(6) => fragment_ipv6(packet, mtu),
-        _ => Err(io_err(
-            "wireguard plaintext is not a valid IPv4/IPv6 packet",
-        )),
+        _ => Err(io_err("packet is not valid IPv4 or IPv6")),
     }
 }
 
 fn fragment_ipv4(packet: &[u8], mtu: usize) -> std::io::Result<Vec<Vec<u8>>> {
     if packet.len() < IPV4_MIN_HEADER {
-        return Err(io_err(
-            "wireguard IPv4 packet is shorter than its base header",
-        ));
+        return Err(io_err("IPv4 packet is shorter than its base header"));
     }
     let header_len = usize::from(packet[0] & 0x0f) * 4;
     let total_len = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
     if header_len < IPV4_MIN_HEADER || header_len > packet.len() || total_len != packet.len() {
-        return Err(io_err(
-            "wireguard IPv4 packet has an invalid header/total length",
-        ));
+        return Err(io_err("IPv4 packet has an invalid header or total length"));
     }
     let flags_offset = u16::from_be_bytes([packet[6], packet[7]]);
     if flags_offset & 0x3fff != 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "wireguard cannot re-fragment an existing IPv4 fragment",
+            "cannot re-fragment an existing IPv4 fragment",
         ));
     }
     if flags_offset & 0x4000 != 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "wireguard IPv4 packet exceeds mtu while Don't Fragment is set",
+            "IPv4 packet exceeds MTU while Don't Fragment is set",
         ));
     }
     let copied_options = copied_ipv4_options(&packet[IPV4_MIN_HEADER..header_len])?;
@@ -64,7 +60,7 @@ fn fragment_ipv4(packet: &[u8], mtu: usize) -> std::io::Result<Vec<Vec<u8>>> {
         let fragment_header_len = IPV4_MIN_HEADER + options.len();
         let capacity = mtu
             .checked_sub(fragment_header_len)
-            .ok_or_else(|| io_err("wireguard mtu is too small for the IPv4 header and options"))?;
+            .ok_or_else(|| io_err("MTU is too small for the IPv4 header and options"))?;
         let remaining = payload.len() - offset;
         let take = if remaining > capacity {
             capacity & !7
@@ -72,9 +68,7 @@ fn fragment_ipv4(packet: &[u8], mtu: usize) -> std::io::Result<Vec<Vec<u8>>> {
             remaining
         };
         if take == 0 {
-            return Err(io_err(
-                "wireguard mtu leaves no aligned IPv4 fragment payload",
-            ));
+            return Err(io_err("MTU leaves no aligned IPv4 fragment payload"));
         }
         let more = offset + take < payload.len();
         let mut fragment = vec![0; fragment_header_len + take];
@@ -82,12 +76,12 @@ fn fragment_ipv4(packet: &[u8], mtu: usize) -> std::io::Result<Vec<Vec<u8>>> {
         fragment[IPV4_MIN_HEADER..fragment_header_len].copy_from_slice(options);
         fragment[0] = 0x40
             | u8::try_from(fragment_header_len / 4)
-                .map_err(|_| io_err("wireguard IPv4 header is too long"))?;
-        let fragment_len = u16::try_from(fragment.len())
-            .map_err(|_| io_err("wireguard IPv4 fragment length overflow"))?;
+                .map_err(|_| io_err("IPv4 header is too long"))?;
+        let fragment_len =
+            u16::try_from(fragment.len()).map_err(|_| io_err("IPv4 fragment length overflow"))?;
         fragment[2..4].copy_from_slice(&fragment_len.to_be_bytes());
-        let fragment_offset = u16::try_from(offset / 8)
-            .map_err(|_| io_err("wireguard IPv4 fragment offset overflow"))?;
+        let fragment_offset =
+            u16::try_from(offset / 8).map_err(|_| io_err("IPv4 fragment offset overflow"))?;
         let fragment_flags =
             (flags_offset & 0x8000) | if more { 0x2000 } else { 0 } | fragment_offset;
         fragment[6..8].copy_from_slice(&fragment_flags.to_be_bytes());
@@ -114,9 +108,9 @@ fn copied_ipv4_options(options: &[u8]) -> std::io::Result<Vec<u8>> {
                     .get(cursor + 1)
                     .copied()
                     .map(usize::from)
-                    .ok_or_else(|| io_err("wireguard IPv4 option is missing its length"))?;
+                    .ok_or_else(|| io_err("IPv4 option is missing its length"))?;
                 if length < 2 || cursor + length > options.len() {
-                    return Err(io_err("wireguard IPv4 option has an invalid length"));
+                    return Err(io_err("IPv4 option has an invalid length"));
                 }
                 if kind & 0x80 != 0 {
                     copied.extend_from_slice(&options[cursor..cursor + length]);
@@ -149,14 +143,12 @@ fn ipv4_checksum(header: &[u8]) -> u16 {
 
 fn fragment_ipv6(packet: &[u8], mtu: usize) -> std::io::Result<Vec<Vec<u8>>> {
     if packet.len() < IPV6_HEADER {
-        return Err(io_err(
-            "wireguard IPv6 packet is shorter than its base header",
-        ));
+        return Err(io_err("IPv6 packet is shorter than its base header"));
     }
     let payload_len = usize::from(u16::from_be_bytes([packet[4], packet[5]]));
     if payload_len == 0 || payload_len + IPV6_HEADER != packet.len() {
         return Err(io_err(
-            "wireguard IPv6 packet has an invalid payload length or unsupported jumbogram",
+            "IPv6 packet has an invalid payload length or unsupported jumbogram",
         ));
     }
     let (unfragmentable_end, next_header_field, fragment_next) =
@@ -164,12 +156,10 @@ fn fragment_ipv6(packet: &[u8], mtu: usize) -> std::io::Result<Vec<Vec<u8>>> {
     let fragmentable = &packet[unfragmentable_end..];
     let capacity = mtu
         .checked_sub(unfragmentable_end + IPV6_FRAGMENT_HEADER)
-        .ok_or_else(|| io_err("wireguard mtu is too small for IPv6 fragmentation headers"))?;
+        .ok_or_else(|| io_err("MTU is too small for IPv6 fragmentation headers"))?;
     let aligned_capacity = capacity & !7;
     if aligned_capacity == 0 {
-        return Err(io_err(
-            "wireguard mtu leaves no aligned IPv6 fragment payload",
-        ));
+        return Err(io_err("MTU leaves no aligned IPv6 fragment payload"));
     }
     let identification = IPV6_FRAGMENT_ID.fetch_add(1, Ordering::Relaxed);
     let mut offset = 0usize;
@@ -187,9 +177,8 @@ fn fragment_ipv6(packet: &[u8], mtu: usize) -> std::io::Result<Vec<Vec<u8>>> {
         fragment[next_header_field] = IPV6_FRAGMENT;
         fragment.push(fragment_next);
         fragment.push(0);
-        let mut offset_flags = u16::try_from(offset)
-            .map_err(|_| io_err("wireguard IPv6 fragment offset overflow"))?
-            & 0xfff8;
+        let mut offset_flags =
+            u16::try_from(offset).map_err(|_| io_err("IPv6 fragment offset overflow"))? & 0xfff8;
         if more {
             offset_flags |= 1;
         }
@@ -199,7 +188,7 @@ fn fragment_ipv6(packet: &[u8], mtu: usize) -> std::io::Result<Vec<Vec<u8>>> {
         let new_payload_len = fragment.len() - IPV6_HEADER;
         fragment[4..6].copy_from_slice(
             &u16::try_from(new_payload_len)
-                .map_err(|_| io_err("wireguard IPv6 fragment length overflow"))?
+                .map_err(|_| io_err("IPv6 fragment length overflow"))?
                 .to_be_bytes(),
         );
         fragments.push(fragment);
@@ -225,11 +214,11 @@ fn ipv6_fragment_insertion_point(packet: &[u8]) -> std::io::Result<(usize, usize
         IPV6_HOP_BY_HOP | IPV6_ROUTING | IPV6_DESTINATION_OPTIONS
     ) {
         if cursor + 2 > packet.len() {
-            return Err(io_err("wireguard IPv6 extension header is truncated"));
+            return Err(io_err("IPv6 extension header is truncated"));
         }
         let length = (usize::from(packet[cursor + 1]) + 1) * 8;
         if cursor + length > packet.len() {
-            return Err(io_err("wireguard IPv6 extension header length is invalid"));
+            return Err(io_err("IPv6 extension header length is invalid"));
         }
         let next = packet[cursor];
         extensions.push(Extension {
@@ -244,7 +233,7 @@ fn ipv6_fragment_insertion_point(packet: &[u8]) -> std::io::Result<(usize, usize
     if kind == IPV6_FRAGMENT {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "wireguard cannot re-fragment an existing IPv6 fragment",
+            "cannot re-fragment an existing IPv6 fragment",
         ));
     }
     let mut insertion = IPV6_HEADER;

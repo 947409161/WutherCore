@@ -17,7 +17,7 @@ pub struct AndroidIpPrefix {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AndroidVpnServiceConfig {
     pub interface_name: String,
-    pub mtu: u32,
+    pub mtu: u16,
     pub addresses: Vec<AndroidIpPrefix>,
     pub routes: Vec<AndroidIpPrefix>,
     pub dns_servers: Vec<IpAddr>,
@@ -106,7 +106,7 @@ pub fn build_vpn_service_config(plan: &CapturePlan) -> AndroidVpnServiceConfig {
 
     AndroidVpnServiceConfig {
         interface_name: plan.interface_name.clone(),
-        mtu: plan.mtu,
+        mtu: plan.mtu.get(),
         addresses,
         routes,
         dns_servers,
@@ -317,6 +317,7 @@ mod tests {
         let cfg = build_vpn_service_config(&plan(capture));
 
         assert_eq!(cfg.interface_name, "rpktun0");
+        assert_eq!(cfg.mtu, 9_000);
         assert_eq!(cfg.addresses.len(), 2);
         assert!(cfg.addresses.contains(&AndroidIpPrefix {
             address: "172.19.0.1".parse().unwrap(),

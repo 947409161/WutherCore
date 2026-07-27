@@ -101,7 +101,11 @@ pub struct LinuxTunIo {
 }
 
 pub fn open(plan: &CapturePlan) -> Result<Arc<LinuxTunIo>, TunIoError> {
-    let dev = LinuxTunIo::open(&plan.interface_name, plan.mtu, plan.offload)?;
+    let dev = LinuxTunIo::open(
+        &plan.interface_name,
+        u32::from(plan.mtu.get()),
+        plan.offload,
+    )?;
     Ok(Arc::new(dev))
 }
 
@@ -179,17 +183,7 @@ impl LinuxTunIo {
             return Err(TunIoError::Open(format!("set O_NONBLOCK: {e}")));
         }
 
-        // 4. 直接 ioctl(SIOCSIFMTU) 设 MTU —— 不依赖 `ip link set`，
-        //    与 mihomo 一致。失败仅 warn，让 supervisor 在外层 fallback `ip link set`。
-        if let Err(e) = unsafe_set_mtu(&bound_name, mtu) {
-            tracing::warn!(
-                target: "capture::linux::tun",
-                iface = %bound_name, mtu, error = %e,
-                "ioctl SIOCSIFMTU failed; supervisor 将尝试 `ip link set` 兜底"
-            );
-        }
-
-        // 5. offload 启用 —— `IFF_VNET_HDR` 已加上，再调 TUNSETOFFLOAD 让 kernel
+        // 4. offload 启用 —— `IFF_VNET_HDR` 已加上，再调 TUNSETOFFLOAD 让 kernel
         //    投递 TSO/USO 大段。与 sing-tun `enableGSO` 行为对齐：
         //    - TCP offload 失败 → drop fd 后重新 try_attach(vnet_hdr=false)，
         //      彻底放弃 IFF_VNET_HDR（避免内核仍发 10B 零头但读路径不剥造成坏帧）；
@@ -220,6 +214,15 @@ impl LinuxTunIo {
         } else {
             (owned, bound_name, false, false)
         };
+
+        // 5. 对最终 fd 绑定的接口设置 MTU。offload 失败时上面会重新创建 TUN，
+        //    因此必须在 fallback 完成之后设置；失败必须终止启动，不能让配置值
+        //    与内核真实 MTU 分离。
+        unsafe_set_mtu(&final_name, mtu).map_err(|e| {
+            TunIoError::Open(format!(
+                "ioctl SIOCSIFMTU failed for {final_name} (mtu={mtu}): {e}"
+            ))
+        })?;
 
         // 6. 包装成 AsyncFd
         let final_raw = final_owned.as_raw_fd();

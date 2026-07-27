@@ -19,7 +19,7 @@ fn capture() -> Capture {
         traffic: CaptureTraffic::System,
         resolver: CaptureResolver::Off,
         stack: CaptureStack::Smoltcp,
-        mtu: Some(1500),
+        mtu: Some(std::num::NonZeroU16::new(1500).unwrap()),
         offload: true,
         exclude: CaptureExclude::default(),
         tun: TunInboundOptions {

@@ -6,7 +6,7 @@
 //! public class VpnBridge {
 //!     static { System.loadLibrary("wuthercore"); }
 //!     // 把 ParcelFileDescriptor.detachFd() 得到的 fd 交给 native。
-//!     public static native void setVpnFd(int fd);
+//!     public static native void setVpnFdWithMtu(int fd, int mtu);
 //!     // 把 VpnService 实例交给 native；native 出站 socket 会同步调用 service.protect(fd)。
 //!     public static native void setVpnService(android.net.VpnService service);
 //!     // 读取同一份 YAML，导出 VpnService.Builder 需要的 address/route/dns/app 配置 JSON。
@@ -90,7 +90,8 @@ impl core_outbound::SocketProtector for AndroidVpnServiceProtector {
     }
 }
 
-/// `void setVpnFd(int fd)` —— 把 ParcelFileDescriptor.detachFd() 的 fd 交给本进程。
+/// 旧版入口不携带实际设备 MTU，仅为 ABI 兼容保留。新宿主必须调用
+/// [`Java_org_wuthercore_VpnBridge_setVpnFdWithMtu`]。
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_wuthercore_VpnBridge_setVpnFd(
     _env: *mut core::ffi::c_void,
@@ -101,6 +102,29 @@ pub extern "system" fn Java_org_wuthercore_VpnBridge_setVpnFd(
         return;
     }
     crate::platform::android_tun_io::set_vpn_fd(fd as RawFd);
+}
+
+/// `void setVpnFdWithMtu(int fd, int mtu)` —— 注入 fd，并证明宿主已将相同的
+/// 非零 MTU 传给 `VpnService.Builder.setMtu`。native 启动时会与 YAML 配置逐值核对。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_wuthercore_VpnBridge_setVpnFdWithMtu(
+    _env: *mut core::ffi::c_void,
+    _class: *mut core::ffi::c_void,
+    fd: i32,
+    mtu: i32,
+) {
+    if fd < 0 {
+        return;
+    }
+    let Ok(mtu) = u16::try_from(mtu) else {
+        crate::platform::android_tun_io::set_vpn_fd(fd as RawFd);
+        return;
+    };
+    if mtu == 0 {
+        crate::platform::android_tun_io::set_vpn_fd(fd as RawFd);
+        return;
+    }
+    crate::platform::android_tun_io::set_vpn_fd_with_mtu(fd as RawFd, mtu);
 }
 
 /// `void setVpnService(VpnService service)` —— 注册真实 socket protect 回调。
@@ -143,7 +167,8 @@ pub extern "system" fn Java_org_wuthercore_VpnBridge_setVpnService(
 ///
 /// Android VpnService 不是 bridge；宿主 App 必须把这里返回的 `addresses`,
 /// `routes`, `dns_servers`, `allowed_applications` / `disallowed_applications`
-/// 逐项写入 Builder，随后 `establish()` 并通过 `setVpnFd(fd)` 交给 native。
+/// 逐项写入 Builder（包括 `setMtu(mtu)`），随后 `establish()` 并通过
+/// `setVpnFdWithMtu(fd, mtu)` 交给 native。
 /// 如果没有这些 Builder 路由，native 侧即使拿到 fd 也不会有真实应用流量进入。
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_wuthercore_VpnBridge_vpnServiceConfigJson(
