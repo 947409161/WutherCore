@@ -30,6 +30,13 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
+        if ! command -v gyp >/dev/null 2>&1; then
+          gyp_venv="$RUNNER_TEMP/gyp-next"
+          python3 -m venv "$gyp_venv"
+          "$gyp_venv/bin/python" -m pip install \
+            --disable-pip-version-check --no-input "gyp-next==0.22.2"
+          echo "$gyp_venv/bin" >> "$GITHUB_PATH"
+        fi
         if ! command -v hg >/dev/null 2>&1; then
           brew install mercurial
         fi
@@ -42,6 +49,14 @@ runs:
       shell: pwsh
       run: |
         $ErrorActionPreference = 'Stop'
+        if (-not (Get-Command gyp -ErrorAction SilentlyContinue)) {
+          $gypVenv = Join-Path $env:RUNNER_TEMP 'gyp-next'
+          python -m venv $gypVenv
+          & "$gypVenv\Scripts\python.exe" -m pip install `
+            --disable-pip-version-check --no-input 'gyp-next==0.22.2'
+          (Join-Path $gypVenv 'Scripts') |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        }
         if (-not (Get-Command hg -ErrorAction SilentlyContinue)) {
           choco install mercurial --yes --no-progress
         }
