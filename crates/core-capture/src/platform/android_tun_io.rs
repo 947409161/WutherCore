@@ -7,6 +7,8 @@
 //!    `OwnedFd` + `AsyncFd`，无需 root。
 //! 3. 都不可用：返回 `Unsupported`。
 
+#![allow(unsafe_code)]
+
 use std::sync::Arc;
 #[cfg(target_os = "android")]
 use std::{

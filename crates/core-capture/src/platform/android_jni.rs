@@ -159,7 +159,9 @@ pub extern "system" fn Java_org_wuthercore_VpnBridge_setVpnService(
             core_outbound::set_socket_protector(Some(protector));
             Ok(())
         })
-        .resolve::<jni::errors::LogContextErrorAndDefault>();
+        .resolve_with::<jni::errors::LogContextErrorAndDefault, _>(|| {
+            "VpnBridge.setVpnService".to_owned()
+        });
 }
 
 /// `String vpnServiceConfigJson(String configPath)` —— 从 YAML 导出 Android
@@ -184,7 +186,9 @@ pub extern "system" fn Java_org_wuthercore_VpnBridge_vpnServiceConfigJson(
             };
             Ok(new_jstring(env, json))
         })
-        .resolve::<jni::errors::LogContextErrorAndDefault>()
+        .resolve_with::<jni::errors::LogContextErrorAndDefault, _>(|| {
+            "VpnBridge.vpnServiceConfigJson".to_owned()
+        })
 }
 
 fn vpn_service_config_json_from_path(
@@ -271,7 +275,9 @@ pub extern "system" fn Java_org_wuthercore_VpnBridge_notifyNetworkChanged(
             crate::net_monitor::notify_network_changed(iface);
             Ok(())
         })
-        .resolve::<jni::errors::LogContextErrorAndDefault>();
+        .resolve_with::<jni::errors::LogContextErrorAndDefault, _>(|| {
+            "VpnBridge.notifyNetworkChanged".to_owned()
+        });
 }
 
 /// `void setDefaultInterface(String interfaceName)` —— 设置出站绑定的物理接口名。
@@ -294,7 +300,9 @@ pub extern "system" fn Java_org_wuthercore_VpnBridge_setDefaultInterface(
             core_outbound::set_outbound_interface(iface);
             Ok(())
         })
-        .resolve::<jni::errors::LogContextErrorAndDefault>();
+        .resolve_with::<jni::errors::LogContextErrorAndDefault, _>(|| {
+            "VpnBridge.setDefaultInterface".to_owned()
+        });
 }
 
 pub fn is_started() -> bool {
