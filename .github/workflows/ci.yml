@@ -13,6 +13,11 @@ on:
         required: false
         type: string
         default: ""
+      validate-macos:
+        description: Build and smoke-test both macOS architectures.
+        required: false
+        type: boolean
+        default: true
   pull_request:
     branches: ["main"]
   push:
@@ -24,6 +29,11 @@ on:
         required: false
         type: string
         default: ""
+      validate-macos:
+        description: Build and smoke-test Intel and Apple Silicon.
+        required: true
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -36,13 +46,54 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
   RUST_BACKTRACE: 1
 
 jobs:
-  required-ci:
-    name: Required CI
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
+  prepare:
+    name: Resolve inputs
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    outputs:
+      tags: ${{ steps.tags.outputs.tags }}
+      tag-label: ${{ steps.tags.outputs.label }}
+      tag-key: ${{ steps.tags.outputs.key }}
+
+    steps:
+      - name: Validate component tags
+        id: tags
+        shell: bash
+        env:
+          REQUESTED_TAGS: ${{ inputs.tags }}
+        run: |
+          set -euo pipefail
+          normalized="$(tr ' ;' ',,' <<< "$REQUESTED_TAGS" | sed -E 's/,+/,/g; s/^,//; s/,$//')"
+          if [ -n "$normalized" ] && [[ ! "$normalized" =~ ^[A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*$ ]]; then
+            echo "::error::Component tags must be a comma/space-separated list of Cargo feature names."
+            exit 1
+          fi
+
+          label="${normalized:-standard (default)}"
+          key="standard"
+          if [ -n "$normalized" ]; then
+            key="$(printf '%s' "$normalized" | sha256sum | cut -c1-16)"
+          fi
+
+          echo "tags=$normalized" >> "$GITHUB_OUTPUT"
+          echo "label=$label" >> "$GITHUB_OUTPUT"
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+          {
+            echo "## CI configuration"
+            echo
+            echo "- Components: \`$label\`"
+            echo "- Ref: \`${GITHUB_REF_NAME:-requested ref}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  quality:
+    name: Formatting and repository checks
+    needs: prepare
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
 
     steps:
       - name: Checkout
@@ -54,58 +105,160 @@ jobs:
       - name: Check repository presentation
         run: python scripts/check-repository.py
 
-      - name: Install Rust
+      - name: Install rustfmt
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
           components: rustfmt
 
-      - name: Install Firefox Neqo source build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y \
-            clang \
-            gyp \
-            mercurial \
-            ninja-build \
-            pkg-config
-
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2.9.1
-        with:
-          prefix-key: v1-wuther-core
-          shared-key: required-ci
-          workspaces: |
-            . -> target
-          cache-bin: false
-          cache-on-failure: true
-          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-
       - name: Check formatting
         run: cargo fmt --all --check
 
-      - name: Resolve component tags
+  linux:
+    name: Linux workspace
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
+      - name: Ensure Firefox Neqo build tools
         shell: bash
-        env:
-          REQUESTED_TAGS: ${{ inputs.tags }}
         run: |
           set -euo pipefail
-          normalized="$(tr ' ;' ',,' <<< "$REQUESTED_TAGS" | sed -E 's/,+/,/g; s/^,//; s/,$//')"
-          if [ -n "$normalized" ] && [[ ! "$normalized" =~ ^[A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*$ ]]; then
-            echo "::error::Component tags must be a comma/space-separated list of Cargo feature names."
-            exit 1
+          declare -A packages=(
+            [clang]=clang
+            [gyp]=gyp
+            [hg]=mercurial
+            [ninja]=ninja-build
+            [pkg-config]=pkg-config
+          )
+          missing=()
+          for command in "${!packages[@]}"; do
+            command -v "$command" >/dev/null 2>&1 || missing+=("${packages[$command]}")
+          done
+          if ((${#missing[@]})); then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends -y "${missing[@]}"
           fi
-          echo "WUTHER_BUILD_TAGS=$normalized" >> "$GITHUB_ENV"
 
-      # Validate every Rust target without repeatedly linking the full workspace.
-      # Feature-specific linking and artifact validation belong to their dedicated
-      # workflows.
+      - name: Setup cached Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          cache-key: ci-linux-${{ needs.prepare.outputs.tag-key }}
+          cache-targets: false
+          save-cache: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+
       - name: Check workspace
         shell: bash
+        env:
+          WUTHER_BUILD_TAGS: ${{ needs.prepare.outputs.tags }}
         run: |
+          set -euo pipefail
           if [ -n "$WUTHER_BUILD_TAGS" ]; then
             cargo check -p wuther-core --all-targets --locked \
               --no-default-features --features "$WUTHER_BUILD_TAGS"
           else
             cargo check --workspace --all-targets --locked
+          fi
+
+  macos:
+    name: macOS (${{ matrix.platform.name }})
+    if: github.event_name != 'workflow_call' || inputs.validate-macos
+    needs: prepare
+    runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: Intel
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - name: Apple Silicon
+            runner: macos-15
+            target: aarch64-apple-darwin
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
+      - name: Setup cached Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          cache-key: ci-macos-${{ matrix.platform.target }}-${{ needs.prepare.outputs.tag-key }}
+          targets: ${{ matrix.platform.target }}
+          cache-targets: true
+          save-cache: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+
+      - name: Build macOS binary
+        shell: bash
+        env:
+          TARGET: ${{ matrix.platform.target }}
+          WUTHER_BUILD_TAGS: ${{ needs.prepare.outputs.tags }}
+        run: |
+          set -euo pipefail
+          feature_args=()
+          if [ -n "$WUTHER_BUILD_TAGS" ]; then
+            feature_args=(--no-default-features --features "$WUTHER_BUILD_TAGS")
+          fi
+          cargo build --profile release-fast --locked --target "$TARGET" \
+            -p wuther-core "${feature_args[@]}"
+
+      - name: Smoke-test macOS binary
+        shell: bash
+        env:
+          TARGET: ${{ matrix.platform.target }}
+        run: "./target/$TARGET/release-fast/wuther-core --version"
+
+  required:
+    name: Required CI
+    if: always()
+    needs:
+      - prepare
+      - quality
+      - linux
+      - macos
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+
+    steps:
+      - name: Verify required jobs
+        shell: bash
+        env:
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          LINUX_RESULT: ${{ needs.linux.result }}
+          MACOS_RESULT: ${{ needs.macos.result }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Required CI"
+            echo
+            echo "| Job | Result |"
+            echo "| --- | --- |"
+            echo "| Resolve inputs | $PREPARE_RESULT |"
+            echo "| Formatting and repository checks | $QUALITY_RESULT |"
+            echo "| Linux workspace | $LINUX_RESULT |"
+            echo "| macOS matrix | $MACOS_RESULT |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          for result in "$PREPARE_RESULT" "$QUALITY_RESULT" "$LINUX_RESULT"; do
+            if [ "$result" != "success" ]; then
+              echo "::error::A required CI job did not succeed."
+              exit 1
+            fi
+          done
+
+          if [ "$MACOS_RESULT" != "success" ] && [ "$MACOS_RESULT" != "skipped" ]; then
+            echo "::error::The macOS matrix did not succeed."
+            exit 1
           fi

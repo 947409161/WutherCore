@@ -6,10 +6,9 @@ license.workspace = true
 
 [features]
 default = ["standard"]
-# Compile-time component tags. `standard` preserves the historical default
-# binary while individual `with_*` tags allow consumers to build a smaller,
-# purpose-specific core.
-standard = [
+# Cross-compiled and Android builds cannot embed Mozilla NSS, so they use this
+# complete portable set. Native builds add Young through `standard`.
+portable = [
     "with_anytls",
     "with_grpc",
     "with_hysteria",
@@ -34,8 +33,8 @@ standard = [
     "with_wireguard",
     "with_ws",
     "with_xhttp",
-    "with_young",
 ]
+standard = ["portable", "with_young"]
 all_components = ["standard", "with_naive"]
 
 # Transport/capability tags.

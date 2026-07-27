@@ -4,6 +4,18 @@ on:
   pull_request:
     branches: ["main"]
     paths:
+      - ".github/actions/**"
+      - ".github/workflows/naive.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/core-config/**"
+      - "crates/core-feeds/**"
+      - "crates/core-outbound/**"
+      - "crates/wuther-core/**"
+  push:
+    branches: ["main"]
+    paths:
+      - ".github/actions/**"
       - ".github/workflows/naive.yml"
       - "Cargo.lock"
       - "Cargo.toml"
@@ -23,48 +35,29 @@ permissions:
   contents: read
 
 concurrency:
-  group: naive-${{ github.event.pull_request.number || github.ref }}
+  group: naive-${{ github.event.pull_request.number || github.ref }}-${{ inputs.tags || 'naive' }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
   RUST_BACKTRACE: 1
 
 jobs:
-  naive:
-    name: Naive / Cronet
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+  prepare:
+    name: Resolve inputs
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    outputs:
+      tags: ${{ steps.tags.outputs.tags }}
+      tag-label: ${{ steps.tags.outputs.label }}
+      tag-key: ${{ steps.tags.outputs.key }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2.9.1
-        with:
-          prefix-key: v1-wuther-core
-          shared-key: naive
-          workspaces: |
-            . -> target
-          cache-bin: false
-
-      - name: Fetch verified Cronet SDK
-        shell: bash
-        run: |
-          git clone --branch v0.2.0 --depth 1 https://github.com/MiChongs/cronet-rs.git "$RUNNER_TEMP/cronet-rs"
-          "$RUNNER_TEMP/cronet-rs/scripts/fetch-native.sh" amd64 "$RUNNER_TEMP/cronet-sdk"
-          echo "CRONET_LIB_DIR=$RUNNER_TEMP/cronet-sdk/lib" >> "$GITHUB_ENV"
-          echo "CRONET_LIB_NAME=cronet" >> "$GITHUB_ENV"
-          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/cronet-sdk/lib" >> "$GITHUB_ENV"
-
-      - name: Check Naive feature
+      - name: Validate Naive component tags
+        id: tags
         shell: bash
         env:
           EXTRA_TAGS: ${{ inputs.tags }}
@@ -75,10 +68,117 @@ jobs:
             echo "::error::Component tags must be a comma/space-separated list of Cargo feature names."
             exit 1
           fi
-          tags="with_naive${normalized:+,$normalized}"
-          cargo check -p wuther-core --no-default-features --features "$tags" --all-targets --locked
 
-      - name: Test Naive URI and native tunnel
+          tags="with_naive${normalized:+,$normalized}"
+          key="$(printf '%s' "$tags" | sha256sum | cut -c1-16)"
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "label=$tags" >> "$GITHUB_OUTPUT"
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+
+  check:
+    name: Naive feature check
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup cached Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          cache-key: naive-check-${{ needs.prepare.outputs.tag-key }}
+          cache-targets: false
+          save-cache: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+
+      - name: Setup cached Cronet SDK
+        uses: ./.github/actions/setup-cronet
+
+      - name: Check Naive feature
+        shell: bash
+        env:
+          WUTHER_BUILD_TAGS: ${{ needs.prepare.outputs.tags }}
         run: |
-          cargo test -p core-config parse_naive_h2_and_quic_links --locked
-          cargo test -p core-outbound --no-default-features --features with_naive naive --locked
+          cargo check -p wuther-core --no-default-features \
+            --features "$WUTHER_BUILD_TAGS" --all-targets --locked
+
+  tests:
+    name: Test (${{ matrix.test.name }})
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - name: URI parsing
+            id: config
+            cronet: false
+          - name: native tunnel
+            id: outbound
+            cronet: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup cached Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          cache-key: naive-test-${{ matrix.test.id }}-${{ needs.prepare.outputs.tag-key }}
+          cache-targets: false
+          save-cache: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+
+      - name: Setup cached Cronet SDK
+        if: matrix.test.cronet
+        uses: ./.github/actions/setup-cronet
+
+      - name: Test Naive URI parsing
+        if: matrix.test.id == 'config'
+        run: cargo test -p core-config parse_naive_h2_and_quic_links --locked
+
+      - name: Test Naive native tunnel
+        if: matrix.test.id == 'outbound'
+        run: |
+          cargo test -p core-outbound --no-default-features \
+            --features with_naive naive --locked
+
+  required:
+    name: Naive / Cronet
+    if: always()
+    needs:
+      - prepare
+      - check
+      - tests
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+
+    steps:
+      - name: Verify Naive jobs
+        shell: bash
+        env:
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          CHECK_RESULT: ${{ needs.check.result }}
+          TEST_RESULT: ${{ needs.tests.result }}
+          TAGS: ${{ needs.prepare.outputs.tag-label }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Naive / Cronet"
+            echo
+            echo "- Components: \`$TAGS\`"
+            echo "- Feature check: $CHECK_RESULT"
+            echo "- Parallel tests: $TEST_RESULT"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          for result in "$PREPARE_RESULT" "$CHECK_RESULT" "$TEST_RESULT"; do
+            if [ "$result" != "success" ]; then
+              echo "::error::A required Naive job did not succeed."
+              exit 1
+            fi
+          done

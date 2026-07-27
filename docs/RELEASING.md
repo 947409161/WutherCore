@@ -57,8 +57,9 @@ git push origin v0.4.0
 
 1. 校验标签格式、版本通道与 workspace 版本；
 2. 确认正式版提交属于 `main`；
-3. 在标签对应源码上运行完整 `Required CI`；
-4. 构建并冒烟验证所有原生平台产物；
+3. 在标签对应源码上运行格式、仓库完整性与 Linux workspace 校验；
+4. 调用统一的 Build Matrix，并行构建全部 12 个目标；Windows 和 macOS
+   产物会在对应架构的原生 runner 上执行冒烟验证；
 5. 将每个平台 ZIP 作为非嵌套 artifact 上传，再按 `wuther-core-$VERSION-*` 前缀收集全部 12 个产物；
 6. 生成 `SHA256SUMS`，再汇总为零压缩的 `release-assets` artifact；
 7. 下载并解包汇总产物，生成 GitHub Artifact Attestation；
@@ -82,7 +83,12 @@ git push origin v0.4.0
 - `wuther-core` 或 `wuther-core.exe`；
 - `README.md` 与 MIT `LICENSE`；
 - `examples/` 示例配置；
+- `BUILD-COMPONENTS.txt` 版本、Rust target 与实际组件预设；
 - `licenses/xray-transport-MPL-2.0.txt` 第三方许可证。
+
+宿主架构的 Linux GNU、Windows 与 macOS 默认归档使用 `standard`；不支持嵌入
+Mozilla NSS 的交叉编译、musl 及 Android 归档使用 `portable`。两者都会在
+`BUILD-COMPONENTS.txt` 中明确记录，显式传入 `tags` 时则完全采用请求的组件集。
 
 ## 校验下载
 
@@ -110,3 +116,5 @@ gh attestation verify .\wuther-core-0.4.0-windows-amd64-msvc.zip --repo MiChongs
 并在 `tags` 中填写逗号分隔的组件标签，例如
 `with_quic,with_vless,with_grpc,with_utls`。留空执行标准组件集。标签含义、
 本地等价命令和许可边界见[构建脚本](../scripts/README.md#按组件标签编译)。
+Build Matrix 的 `platforms` 可只重跑一个平台组；`macos` 会同时覆盖 Intel
+和 Apple Silicon。

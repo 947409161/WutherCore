@@ -26,6 +26,8 @@ dist/
 
 # 工具/脚本缓存
 scripts/.cache/
+__pycache__/
+*.py[cod]
 
 # 杂项
 sonobat.db

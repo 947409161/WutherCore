@@ -28,9 +28,10 @@ pwsh -File scripts/build-all.ps1 -Backend cross    -Targets "aarch64-linux-andro
 ## 按组件标签编译
 
 WutherCore 使用 Cargo features 提供与 Go `-tags` 等价的编译期组件裁剪。未指定
-`--tags` 时使用 `standard`，行为与引入组件标签前一致（除需单独许可的 Naive
-外全部启用）。一旦指定 `--tags`，脚本会自动添加 `--no-default-features`，只有
-列出的标签及其依赖会进入构建。
+`--tags` 时，本机脚本使用 `standard`，行为与引入组件标签前一致（除需单独许可
+的 Naive 外全部启用）。CI 中无法嵌入 Mozilla NSS 的交叉编译和 Android 目标使用
+`portable`，原生 Linux、Windows 和 macOS 仍使用 `standard`。一旦指定 `--tags`，
+脚本和 CI 都会自动添加 `--no-default-features`，只有列出的标签及其依赖会进入构建。
 
 ```cmd
 :: VLESS + gRPC + uTLS，只构建 Windows x64
@@ -62,6 +63,7 @@ wuther-core components --json
 
 | 类别 | 标签 | 能力 |
 |---|---|---|
+| 预设 | `portable` | 除 Young/Naive 外的完整跨平台组件集 |
 | 预设 | `standard` | 默认标准组件集，不含 Naive/Cronet |
 | 预设 | `all_components` | `standard` 加 `with_naive` |
 | 运行组件 | `with_api` | 管理 API 与面板服务 |
@@ -88,7 +90,12 @@ wuther-core components --json
 静默注册占位实现。每个本地和 CI 归档都包含 `BUILD-COMPONENTS.txt`。
 
 GitHub Actions 的 **Build Matrix** 和 **CI** 手动运行入口也提供 `tags` 输入，
-语义与本地 `--tags` 完全相同；留空使用 `standard`。
+显式填写时语义与本地 `--tags` 完全相同。Build Matrix 留空时会按目标选择上述
+`standard` 或 `portable` 预设，并把最终选择写进归档。它还可用 `platforms`
+只运行 `linux`、`android`、`windows` 或 `macos` 子矩阵；`all` 会并行构建
+12 个目标。macOS 使用 GitHub 原生 Intel 与 Apple Silicon runner，分别产出
+`x86_64-apple-darwin` 和 `aarch64-apple-darwin`，不依赖不完整的 Darwin
+交叉编译环境。
 
 ## 短别名
 
@@ -197,5 +204,7 @@ type    dist\wuther-core-0.3.0-x86_64-pc-windows-msvc.zip.sha256
 - **`Android NDK 未检测到`**：从 https://developer.android.com/ndk/downloads 下载 r26+，
   解压后 `setx ANDROID_NDK_HOME C:\path\to\android-ndk-r26d`，重开终端。
 - **`Compress-Archive` 限制 2GB**：debug 构建产物可能过大，请使用 release profile（默认）。
-- **macOS 构建**：在 macOS 主机直接 `cargo build --release --target aarch64-apple-darwin`，
-  或在 GitHub Actions `macos-latest` runner 跑。
+- **macOS 构建**：在对应架构的 macOS 主机直接运行
+  `cargo build --release --target aarch64-apple-darwin` 或
+  `cargo build --release --target x86_64-apple-darwin`；CI 分别使用
+  `macos-15`（Apple Silicon）和 `macos-15-intel`（Intel）原生构建并冒烟测试。

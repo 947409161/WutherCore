@@ -109,9 +109,10 @@ jobs:
     uses: ./.github/workflows/ci.yml
     with:
       ref: ${{ needs.prepare.outputs.tag }}
+      validate-macos: false
 
-  build-cross:
-    name: Build cross-platform artifacts
+  build:
+    name: Build release artifacts
     needs:
       - prepare
       - quality
@@ -119,140 +120,14 @@ jobs:
     with:
       ref: ${{ needs.prepare.outputs.tag }}
       version: ${{ needs.prepare.outputs.version }}
+      platforms: all
       retention-days: 14
-
-  build-native:
-    name: Build (${{ matrix.platform.name }})
-    needs:
-      - prepare
-      - quality
-    runs-on: ${{ matrix.platform.runner }}
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        platform:
-          - target: x86_64-pc-windows-msvc
-            name: windows-amd64-msvc
-            runner: windows-latest
-            executable: wuther-core.exe
-          - target: aarch64-pc-windows-msvc
-            name: windows-arm64-msvc
-            runner: windows-11-arm
-            executable: wuther-core.exe
-          - target: x86_64-apple-darwin
-            name: macos-amd64
-            runner: macos-15-intel
-            executable: wuther-core
-          - target: aarch64-apple-darwin
-            name: macos-arm64
-            runner: macos-15
-            executable: wuther-core
-
-    steps:
-      - name: Checkout release tag
-        uses: actions/checkout@v7.0.1
-        with:
-          ref: ${{ needs.prepare.outputs.tag }}
-          persist-credentials: false
-
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-          targets: ${{ matrix.platform.target }}
-
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2.9.1
-        with:
-          prefix-key: v1-wuther-core
-          shared-key: release-native
-          key: ${{ matrix.platform.target }}
-          workspaces: |
-            . -> target
-          cache-bin: false
-          cache-on-failure: true
-
-      - name: Build release binary
-        run: cargo build --release --locked --target ${{ matrix.platform.target }} -p wuther-core
-
-      - name: Smoke test macOS binary
-        if: runner.os != 'Windows'
-        run: ./target/${{ matrix.platform.target }}/release/${{ matrix.platform.executable }} --version
-
-      - name: Smoke test Windows binary
-        if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          TARGET: ${{ matrix.platform.target }}
-        run: '& "target/$env:TARGET/release/wuther-core.exe" --version'
-
-      - name: Package Unix artifact
-        if: runner.os != 'Windows'
-        env:
-          PLATFORM_NAME: ${{ matrix.platform.name }}
-          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
-          TARGET: ${{ matrix.platform.target }}
-        run: |
-          set -euo pipefail
-          package_dir="pkg"
-          archive="wuther-core-${RELEASE_VERSION}-${PLATFORM_NAME}.zip"
-
-          mkdir -p "dist" "$package_dir/licenses"
-          cp "target/${TARGET}/release/wuther-core" "$package_dir/"
-          cp README.md LICENSE "$package_dir/"
-          cp third_party/xray-transport/LICENSE-MPL-2.0 "$package_dir/licenses/xray-transport-MPL-2.0.txt"
-          cp -R examples "$package_dir/"
-          {
-            echo "version=$RELEASE_VERSION"
-            echo "target=$TARGET"
-            echo "tags=standard (default)"
-          } > "$package_dir/BUILD-COMPONENTS.txt"
-
-          cd "$package_dir"
-          zip -X -r "../dist/$archive" .
-
-      - name: Package Windows artifact
-        if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          PLATFORM_NAME: ${{ matrix.platform.name }}
-          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
-          TARGET: ${{ matrix.platform.target }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $packageDir = Join-Path $PWD 'pkg'
-          $licenseDir = Join-Path $packageDir 'licenses'
-          $distDir = Join-Path $PWD 'dist'
-          $archive = Join-Path $distDir "wuther-core-$env:RELEASE_VERSION-$env:PLATFORM_NAME.zip"
-
-          New-Item -ItemType Directory -Force -Path $packageDir, $licenseDir, $distDir | Out-Null
-          Copy-Item "target/$env:TARGET/release/wuther-core.exe" $packageDir
-          Copy-Item README.md, LICENSE $packageDir
-          Copy-Item examples (Join-Path $packageDir 'examples') -Recurse
-          Copy-Item third_party/xray-transport/LICENSE-MPL-2.0 (Join-Path $licenseDir 'xray-transport-MPL-2.0.txt')
-          @(
-            "version=$env:RELEASE_VERSION"
-            "target=$env:TARGET"
-            "tags=standard (default)"
-          ) | Set-Content -Path (Join-Path $packageDir 'BUILD-COMPONENTS.txt') -Encoding UTF8
-          Compress-Archive -Path (Join-Path $packageDir '*') -DestinationPath $archive -CompressionLevel Optimal
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7.0.1
-        with:
-          path: dist/*.zip
-          if-no-files-found: error
-          archive: false
-          overwrite: true
-          retention-days: 14
 
   collect:
     name: Collect release assets
     needs:
       - prepare
-      - build-cross
-      - build-native
+      - build
     runs-on: ubuntu-latest
     timeout-minutes: 10
 

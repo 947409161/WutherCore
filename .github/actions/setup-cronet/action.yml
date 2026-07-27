@@ -1,0 +1,43 @@
+name: Setup cached Cronet
+description: Restore or fetch the verified Cronet native SDK used by the Naive feature.
+
+inputs:
+  version:
+    description: cronet-rs release tag.
+    required: false
+    default: v0.2.0
+  architecture:
+    description: Cronet SDK architecture.
+    required: false
+    default: amd64
+
+runs:
+  using: composite
+  steps:
+    - name: Restore Cronet SDK
+      id: cache
+      uses: actions/cache@v6.1.0
+      with:
+        path: ${{ runner.temp }}/cronet-sdk
+        key: cronet-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}-${{ inputs.architecture }}
+
+    - name: Fetch verified Cronet SDK
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        CRONET_VERSION: ${{ inputs.version }}
+        CRONET_ARCH: ${{ inputs.architecture }}
+      run: |
+        set -euo pipefail
+        rm -rf "$RUNNER_TEMP/cronet-rs"
+        git clone --branch "$CRONET_VERSION" --depth 1 \
+          https://github.com/MiChongs/cronet-rs.git "$RUNNER_TEMP/cronet-rs"
+        "$RUNNER_TEMP/cronet-rs/scripts/fetch-native.sh" \
+          "$CRONET_ARCH" "$RUNNER_TEMP/cronet-sdk"
+
+    - name: Export Cronet environment
+      shell: bash
+      run: |
+        echo "CRONET_LIB_DIR=$RUNNER_TEMP/cronet-sdk/lib" >> "$GITHUB_ENV"
+        echo "CRONET_LIB_NAME=cronet" >> "$GITHUB_ENV"
+        echo "LD_LIBRARY_PATH=$RUNNER_TEMP/cronet-sdk/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"

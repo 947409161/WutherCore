@@ -1,0 +1,65 @@
+name: Setup cached Rust
+description: Install the pinned Rust toolchain and restore layered Cargo/compiler caches.
+
+inputs:
+  cache-key:
+    description: Stable cache partition for this job and target.
+    required: true
+  targets:
+    description: Comma-separated rustup targets.
+    required: false
+    default: ""
+  components:
+    description: Comma-separated rustup components.
+    required: false
+    default: ""
+  cache-targets:
+    description: Cache Cargo target directories in addition to dependencies.
+    required: false
+    default: "false"
+  enable-sccache:
+    description: Enable the GitHub Actions sccache backend.
+    required: false
+    default: "true"
+  save-cache:
+    description: Allow this run to save a new Cargo cache.
+    required: false
+    default: "true"
+  workspaces:
+    description: Swatinem/rust-cache workspace mapping.
+    required: false
+    default: ". -> target"
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: stable
+        targets: ${{ inputs.targets }}
+        components: ${{ inputs.components }}
+
+    - name: Install sccache
+      if: inputs.enable-sccache == 'true'
+      uses: mozilla-actions/sccache-action@v0.0.10
+
+    - name: Enable compiler cache
+      if: inputs.enable-sccache == 'true'
+      shell: bash
+      run: |
+        echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+        echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+        echo "SCCACHE_IDLE_TIMEOUT=0" >> "$GITHUB_ENV"
+
+    - name: Restore Cargo cache
+      uses: Swatinem/rust-cache@v2.9.1
+      with:
+        prefix-key: v2-wuther-core
+        shared-key: ${{ inputs.cache-key }}
+        workspaces: ${{ inputs.workspaces }}
+        cache-all-crates: true
+        cache-bin: true
+        cache-on-failure: true
+        cache-targets: ${{ inputs.cache-targets }}
+        save-if: ${{ inputs.save-cache }}
