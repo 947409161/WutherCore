@@ -646,7 +646,12 @@ fn apply_inbound_tcp_platform_options(
         )?;
     }
     if !cfg.tcp_congestion.is_empty() {
-        socket.set_tcp_congestion(cfg.tcp_congestion.as_bytes())?;
+        raw_setsockopt_string(
+            socket,
+            libc::IPPROTO_TCP,
+            libc::TCP_CONGESTION,
+            &cfg.tcp_congestion,
+        )?;
     }
     if cfg.tcp_window_clamp > 0 {
         raw_setsockopt_int(
@@ -944,7 +949,12 @@ fn apply_tcp_platform_options(sock: &Socket, cfg: &OutboundSocketConfig) -> std:
         )?;
     }
     if !cfg.tcp_congestion.is_empty() {
-        sock.set_tcp_congestion(cfg.tcp_congestion.as_bytes())?;
+        raw_setsockopt_string(
+            sock,
+            libc::IPPROTO_TCP,
+            libc::TCP_CONGESTION,
+            &cfg.tcp_congestion,
+        )?;
     }
     if cfg.tcp_window_clamp > 0 {
         raw_setsockopt_int(
