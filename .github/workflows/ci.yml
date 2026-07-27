@@ -73,7 +73,8 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
-      # Tests compile the workspace libraries and integration targets. Release
-      # workflows own full CLI linking and cross-platform artifact validation.
-      - name: Test workspace
-        run: cargo test --workspace --locked
+      # Validate every Rust target without repeatedly linking the full workspace.
+      # Feature-specific linking and artifact validation belong to their dedicated
+      # workflows.
+      - name: Check workspace
+        run: cargo check --workspace --all-targets --locked
