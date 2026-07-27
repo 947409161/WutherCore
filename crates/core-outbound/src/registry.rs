@@ -2220,6 +2220,18 @@ fn build_anytls(node: &ParsedNode) -> Result<SharedOutbound, String> {
         .filter(|password| !password.is_empty())
         .ok_or_else(|| "AnyTLS password must not be empty".to_string())?;
     let mut ob = AnyTlsOutbound::new(&node.name, &node.host, node.port, pwd);
+    if let Some(client_id) = first_param(
+        node,
+        &[
+            "clientId",
+            "client-id",
+            "client_id",
+            "anytls-client-id",
+            "anytls_client_id",
+        ],
+    ) {
+        ob.set_client_id(client_id.to_owned())?;
+    }
     let disable_sni = node
         .params
         .get("disable-sni")
@@ -4241,6 +4253,9 @@ mod tests {
             .params
             .insert("idle-session-timeout".into(), "45s".into());
         anytls.params.insert("min_idle_session".into(), "2".into());
+        anytls
+            .params
+            .insert("clientId".into(), "sing-anytls/0.0.11".into());
         let outbound = build_outbound(&anytls).unwrap();
         assert_eq!(outbound.protocol(), "anytls");
         assert!(outbound.capabilities().tcp);
@@ -4251,6 +4266,12 @@ mod tests {
             .params
             .insert("disable-reuse".into(), "sometimes".into());
         assert!(build_error(&anytls).contains("invalid boolean"));
+
+        anytls.params.insert("disable-reuse".into(), "false".into());
+        anytls
+            .params
+            .insert("clientId".into(), "injected\npadding-md5=bad".into());
+        assert!(build_error(&anytls).contains("must not contain"));
     }
 
     #[test]

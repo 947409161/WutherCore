@@ -57,6 +57,64 @@ nodes:
     }
 
     #[test]
+    fn feed_accepts_anytls_client_id_override() {
+        let yaml = r#"
+version: 1
+profile: desktop
+feeds:
+  airport:
+    url: "https://example.com/sub"
+    override:
+      clientId: "sing-anytls/0.0.11"
+"#;
+        let plan = load_from_str(yaml).unwrap();
+        assert_eq!(
+            plan.feeds["airport"].overrides.client_id.as_deref(),
+            Some("sing-anytls/0.0.11")
+        );
+
+        let mut nodes = vec![
+            crate::node_uri::ParsedNode::new(
+                "AnyTLS",
+                crate::node_uri::NodeProtocol::AnyTls,
+                "proxy.example.com",
+                443,
+            ),
+            crate::node_uri::ParsedNode::new(
+                "Trojan",
+                crate::node_uri::NodeProtocol::Trojan,
+                "proxy.example.com",
+                443,
+            ),
+        ];
+        nodes[0]
+            .params
+            .insert("clientId".into(), "upstream-client/1.0".into());
+        plan.feeds["airport"].apply_overrides(&mut nodes);
+        assert_eq!(
+            nodes[0].params.get("clientId").map(String::as_str),
+            Some("sing-anytls/0.0.11")
+        );
+        assert!(!nodes[1].params.contains_key("clientId"));
+    }
+
+    #[test]
+    fn feed_rejects_invalid_anytls_client_id_override() {
+        let yaml = r#"
+version: 1
+profile: desktop
+feeds:
+  airport:
+    url: "https://example.com/sub"
+    override:
+      clientId: ""
+"#;
+        let error = load_from_str(yaml).unwrap_err().to_string();
+        assert!(error.contains("feeds.airport.override.clientId"), "{error}");
+        assert!(error.contains("不能为空"), "{error}");
+    }
+
+    #[test]
     fn unknown_group_use_yields_friendly_error() {
         let yaml = r#"
 version: 1

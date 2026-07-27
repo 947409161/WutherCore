@@ -44,26 +44,47 @@ pub fn migrate_mihomo(text: &str) -> ConfigResult<String> {
     }
 
     // feeds 来自 proxy-providers
-    let mut feeds = BTreeMap::new();
+    let mut feeds: BTreeMap<String, Value> = BTreeMap::new();
     if let Some(providers) = m
         .get(&Value::String("proxy-providers".into()))
         .and_then(Value::as_mapping)
     {
         for (k, v) in providers {
-            if let (Some(name), Some(url)) = (
-                k.as_str(),
-                v.as_mapping()
-                    .and_then(|m| m.get(&Value::String("url".into())))
-                    .and_then(Value::as_str),
-            ) {
-                feeds.insert(name.to_string(), url.to_string());
+            let Some(name) = k.as_str() else { continue };
+            let Some(provider) = v.as_mapping() else {
+                continue;
+            };
+            let Some(url) = provider
+                .get(&Value::String("url".into()))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            let client_id = provider
+                .get(&Value::String("override".into()))
+                .and_then(Value::as_mapping)
+                .and_then(|overrides| {
+                    ["clientId", "client-id", "client_id"]
+                        .iter()
+                        .find_map(|key| overrides.get(Value::String((*key).into())))
+                })
+                .and_then(Value::as_str);
+            if let Some(client_id) = client_id {
+                let mut overrides = serde_yaml::Mapping::new();
+                overrides.insert("clientId".into(), client_id.into());
+                let mut detail = serde_yaml::Mapping::new();
+                detail.insert("url".into(), url.into());
+                detail.insert("override".into(), Value::Mapping(overrides));
+                feeds.insert(name.to_string(), Value::Mapping(detail));
+            } else {
+                feeds.insert(name.to_string(), Value::String(url.to_string()));
             }
         }
     }
     if !feeds.is_empty() {
         let mut map = serde_yaml::Mapping::new();
         for (k, v) in feeds {
-            map.insert(Value::String(k), Value::String(v));
+            map.insert(Value::String(k), v);
         }
         friendly.insert("feeds".into(), Value::Mapping(map));
     }
@@ -157,6 +178,24 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn migration_preserves_anytls_provider_client_id_override() {
+        let input = r#"
+proxy-providers:
+  airport:
+    type: http
+    url: "https://example.com/sub"
+    override:
+      clientId: "sing-anytls/0.0.11"
+"#;
+        let migrated = migrate_mihomo(input).unwrap();
+        let plan = crate::loader::load_from_str(&migrated).unwrap();
+        assert_eq!(
+            plan.feeds["airport"].overrides.client_id.as_deref(),
+            Some("sing-anytls/0.0.11")
+        );
+    }
 
     #[test]
     fn migrates_mihomo_rule_providers_into_native_route_sets() {

@@ -1237,6 +1237,40 @@ pub struct FeedDetail {
     pub drop: FeedFilter,
     #[serde(default)]
     pub rename: FeedRename,
+    /// Provider 级节点覆写。用于订阅源无法提供客户端所需字段，或机场按
+    /// AnyTLS `cmdSettings.client` 识别客户端实现的场景。
+    #[serde(default, rename = "override", alias = "overrides")]
+    pub overrides: FeedOverride,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct FeedOverride {
+    /// 覆写该 provider 内全部 AnyTLS 节点上报的 `cmdSettings.client`。
+    #[serde(
+        default,
+        rename = "clientId",
+        alias = "client-id",
+        alias = "client_id",
+        alias = "anytls-client-id",
+        alias = "anytls_client_id"
+    )]
+    pub client_id: Option<String>,
+}
+
+impl FeedDetail {
+    /// Apply provider-owned values after parsing so they take precedence over
+    /// fields supplied by an airport subscription.
+    pub fn apply_overrides(&self, nodes: &mut [crate::node_uri::ParsedNode]) {
+        let Some(client_id) = self.overrides.client_id.as_ref() else {
+            return;
+        };
+        for node in nodes {
+            if node.protocol == crate::node_uri::NodeProtocol::AnyTls {
+                node.params.insert("clientId".into(), client_id.clone());
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

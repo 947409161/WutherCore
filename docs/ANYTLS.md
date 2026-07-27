@@ -38,6 +38,7 @@ nodes:
 | 字段 | 默认值 | 行为 |
 | --- | --- | --- |
 | `password` | 必填 | UTF-8 字节先做 SHA-256，再用于认证 |
+| `clientId` / `client-id` / `client_id` | `WutherCore/<version>` | `cmdSettings` 中的 `client=` 标识 |
 | `sni` | `server` | TLS 证书名称；IP 地址按 IP 身份校验且不会发送 DNS SNI |
 | `insecure` / `allowInsecure` | `false` | 关闭 TLS 证书验证；只建议用于测试 |
 | `alpn` | 空 | AnyTLS 不需要应用层 ALPN，不再默认伪造 `h2,http/1.1` |
@@ -51,6 +52,20 @@ nodes:
 
 下划线、短横线和官方 camelCase 形式的会话参数均可解析。密码为空、布尔值非法、duration 非法或 `minIdleSession` 不是非负整数时，节点注册直接失败，不会静默退化。
 
+订阅机场需要指定客户端标识时，可以在 provider 下统一覆写。覆写只作用于这个
+provider 解析出的 AnyTLS 节点，不会给其他协议注入无关参数：
+
+```yaml
+feeds:
+  airport:
+    url: https://example.com/subscription
+    override:
+      clientId: sing-anytls/0.0.11
+```
+
+provider 的 `override.clientId` 优先于订阅节点原有的 `clientId`。空值以及包含
+CR、LF 或 NUL 的值会在配置加载或节点注册时被拒绝，避免破坏 Settings 的逐行格式。
+
 ## 认证与首包
 
 TLS 握手后客户端一次写出：
@@ -62,7 +77,7 @@ SHA256(password)[32] || padding0_length_be16 || zero_padding[padding0_length]
 `padding0` 来自当前 scheme 的 `0=` 项，只取第一个尺寸且不分包。认证后首个 Session 写入严格保持以下次序，并作为 padding 计数器的 packet 1：
 
 ```text
-cmdSettings(sid=0, "v=2\nclient=WutherCore/<version>\npadding-md5=<md5>")
+cmdSettings(sid=0, "v=2\nclient=<clientId>\npadding-md5=<md5>")
 cmdSYN(sid=1, empty)
 cmdPSH(sid=1, SOCKS5 address of target)
 ```

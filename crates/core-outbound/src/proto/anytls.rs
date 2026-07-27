@@ -38,6 +38,8 @@ use crate::{
 const PROTOCOL_VERSION: u8 = 2;
 const MAX_FRAME_DATA_LEN: usize = u16::MAX as usize;
 const MAX_PADDING_SCHEME_LEN: usize = u16::MAX as usize;
+const SETTINGS_FIXED_LEN: usize = "v=2\nclient=\npadding-md5=".len() + 32;
+const MAX_CLIENT_ID_LEN: usize = MAX_FRAME_DATA_LEN - SETTINGS_FIXED_LEN;
 const STREAM_BUFFER_SIZE: usize = 64 * 1024;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const SYN_ACK_TIMEOUT: Duration = Duration::from_secs(3);
@@ -72,6 +74,8 @@ pub struct AnyTlsOutbound {
     pub host: String,
     pub port: u16,
     pub password: String,
+    /// Value reported as `client=` in the initial AnyTLS `cmdSettings`.
+    pub client_id: String,
     pub sni: Option<String>,
     pub insecure: bool,
     /// AnyTLS itself does not negotiate an application protocol. Empty is the
@@ -95,6 +99,7 @@ impl AnyTlsOutbound {
             host: host.into(),
             port,
             password: password.into(),
+            client_id: default_client_id(),
             sni: None,
             insecure: false,
             alpn: Vec::new(),
@@ -108,10 +113,18 @@ impl AnyTlsOutbound {
         }
     }
 
+    pub fn set_client_id(&mut self, client_id: impl Into<String>) -> Result<(), String> {
+        let client_id = client_id.into();
+        validate_client_id(&client_id)?;
+        self.client_id = client_id;
+        Ok(())
+    }
+
     async fn client(&self) -> io::Result<Arc<AnyTlsClient>> {
         if self.password.is_empty() {
             return Err(invalid_input("AnyTLS password must not be empty"));
         }
+        validate_client_id(&self.client_id).map_err(invalid_input)?;
         let mut slot = self.client.lock().await;
         if let Some(client) = slot.as_ref() {
             return Ok(client.clone());
@@ -120,6 +133,7 @@ impl AnyTlsOutbound {
             host: self.host.clone(),
             port: self.port,
             password_sha256: Sha256::digest(self.password.as_bytes()).into(),
+            client_id: self.client_id.clone(),
             tls: TlsOptions {
                 enabled: true,
                 sni: self.sni.clone(),
@@ -191,6 +205,7 @@ struct AnyTlsRuntimeConfig {
     host: String,
     port: u16,
     password_sha256: [u8; 32],
+    client_id: String,
     tls: TlsOptions,
     options: AnyTlsClientOptions,
 }
@@ -310,7 +325,13 @@ impl AnyTlsClient {
 
         let seq = self.next_session.fetch_add(1, Ordering::Relaxed) + 1;
         let (reader, writer) = tokio::io::split(connection);
-        let session = AnyTlsSession::new(seq, writer, self.padding.clone(), Arc::downgrade(self));
+        let session = AnyTlsSession::new(
+            seq,
+            writer,
+            self.padding.clone(),
+            Arc::<str>::from(self.config.client_id.clone()),
+            Arc::downgrade(self),
+        );
         self.state
             .lock()
             .await
@@ -387,6 +408,7 @@ struct AnyTlsSession {
     seq: u64,
     writer: Mutex<SessionWriter<WriteHalf<BoxedStream>>>,
     padding: Arc<RwLock<PaddingFactory>>,
+    client_id: Arc<str>,
     client: Weak<AnyTlsClient>,
     streams: SyncMutex<HashMap<u32, mpsc::UnboundedSender<InboundEvent>>>,
     syn_acks: SyncMutex<HashMap<u32, oneshot::Sender<SynAck>>>,
@@ -401,12 +423,14 @@ impl AnyTlsSession {
         seq: u64,
         writer: WriteHalf<BoxedStream>,
         padding: Arc<RwLock<PaddingFactory>>,
+        client_id: Arc<str>,
         client: Weak<AnyTlsClient>,
     ) -> Arc<Self> {
         Arc::new(Self {
             seq,
             writer: Mutex::new(SessionWriter::new(writer, padding.clone())),
             padding,
+            client_id,
             client,
             streams: SyncMutex::new(HashMap::new()),
             syn_acks: SyncMutex::new(HashMap::new()),
@@ -468,8 +492,8 @@ impl AnyTlsSession {
         let write_result = if fresh {
             let padding_md5 = self.padding.read().await.md5().to_owned();
             let settings = format!(
-                "v={PROTOCOL_VERSION}\nclient=WutherCore/{}\npadding-md5={padding_md5}",
-                env!("CARGO_PKG_VERSION")
+                "v={PROTOCOL_VERSION}\nclient={}\npadding-md5={padding_md5}",
+                self.client_id
             );
             let mut packet = Vec::new();
             append_frame(&mut packet, Command::Settings, 0, settings.as_bytes())?;
@@ -1061,6 +1085,29 @@ fn normalize_host(host: &str) -> String {
         .to_ascii_lowercase()
 }
 
+fn default_client_id() -> String {
+    format!("WutherCore/{}", env!("CARGO_PKG_VERSION"))
+}
+
+fn validate_client_id(client_id: &str) -> Result<(), String> {
+    if client_id.trim().is_empty() {
+        return Err("AnyTLS clientId must not be empty".into());
+    }
+    if client_id
+        .as_bytes()
+        .iter()
+        .any(|byte| matches!(byte, b'\r' | b'\n' | b'\0'))
+    {
+        return Err("AnyTLS clientId must not contain CR, LF, or NUL".into());
+    }
+    if client_id.len() > MAX_CLIENT_ID_LEN {
+        return Err(format!(
+            "AnyTLS clientId exceeds {MAX_CLIENT_ID_LEN} UTF-8 bytes"
+        ));
+    }
+    Ok(())
+}
+
 fn invalid_input(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
@@ -1185,7 +1232,13 @@ mod tests {
         let (client_side, mut server_side) = tokio::io::duplex(2048);
         let client_side: BoxedStream = Box::pin(client_side);
         let (reader, writer) = tokio::io::split(client_side);
-        let session = AnyTlsSession::new(1, writer, padding, Weak::new());
+        let session = AnyTlsSession::new(
+            1,
+            writer,
+            padding,
+            Arc::<str>::from("sing-anytls/0.0.11"),
+            Weak::new(),
+        );
         AnyTlsSession::spawn_reader(&session, reader);
 
         let target = encode_socks_address("example.com", 443).unwrap();
@@ -1199,6 +1252,12 @@ mod tests {
         assert_eq!(
             parse_settings(&settings.data).get("v").map(String::as_str),
             Some("2")
+        );
+        assert_eq!(
+            parse_settings(&settings.data)
+                .get("client")
+                .map(String::as_str),
+            Some("sing-anytls/0.0.11")
         );
         assert_eq!(syn.cmd, Command::Syn);
         assert_eq!(syn.sid, 1);
@@ -1250,7 +1309,13 @@ mod tests {
         let (client_side, mut server_side) = tokio::io::duplex(1024);
         let client_side: BoxedStream = Box::pin(client_side);
         let (reader, writer) = tokio::io::split(client_side);
-        let session = AnyTlsSession::new(1, writer, padding, Weak::new());
+        let session = AnyTlsSession::new(
+            1,
+            writer,
+            padding,
+            Arc::<str>::from(default_client_id()),
+            Weak::new(),
+        );
         session
             .peer_version
             .store(PROTOCOL_VERSION, Ordering::Release);

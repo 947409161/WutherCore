@@ -350,7 +350,7 @@ pub enum RouteAction {
 /// 用户配置 -> RuntimePlan。要求 [`crate::profile::apply_defaults`] 已执行。
 pub fn compile(mut cfg: UserConfig) -> ConfigResult<RuntimePlan> {
     let listen = compile_listen(&cfg)?;
-    let feeds = compile_feeds(&cfg.feeds);
+    let feeds = compile_feeds(&cfg.feeds)?;
     let nodes = compile_nodes(&cfg.nodes)?;
     let groups = compile_groups(&cfg, &nodes)?;
     let mut cfg_route = cfg.route.take().unwrap_or_default();
@@ -1746,7 +1746,7 @@ fn compile_xhttp_listeners(
     Ok(plans)
 }
 
-fn compile_feeds(feeds: &BTreeMap<String, FeedSpec>) -> BTreeMap<String, FeedDetail> {
+fn compile_feeds(feeds: &BTreeMap<String, FeedSpec>) -> ConfigResult<BTreeMap<String, FeedDetail>> {
     feeds
         .iter()
         .map(|(k, v)| {
@@ -1758,12 +1758,35 @@ fn compile_feeds(feeds: &BTreeMap<String, FeedSpec>) -> BTreeMap<String, FeedDet
                     keep: Default::default(),
                     drop: Default::default(),
                     rename: Default::default(),
+                    overrides: Default::default(),
                 },
                 FeedSpec::Detail(d) => d.clone(),
             };
-            (k.clone(), detail)
+            if let Some(client_id) = detail.overrides.client_id.as_deref() {
+                validate_anytls_client_id(client_id, &format!("feeds.{k}.override.clientId"))?;
+            }
+            Ok((k.clone(), detail))
         })
         .collect()
+}
+
+fn validate_anytls_client_id(value: &str, location: &str) -> ConfigResult<()> {
+    const SETTINGS_FIXED_LEN: usize = "v=2\nclient=\npadding-md5=".len() + 32;
+    const MAX_CLIENT_ID_LEN: usize = u16::MAX as usize - SETTINGS_FIXED_LEN;
+
+    if value.trim().is_empty() {
+        return Err(ConfigError::invalid("AnyTLS clientId 不能为空").at(location));
+    }
+    if value.contains(['\r', '\n', '\0']) {
+        return Err(ConfigError::invalid("AnyTLS clientId 不能包含换行符或 NUL").at(location));
+    }
+    if value.len() > MAX_CLIENT_ID_LEN {
+        return Err(ConfigError::invalid(format!(
+            "AnyTLS clientId 不能超过 {MAX_CLIENT_ID_LEN} 个 UTF-8 字节"
+        ))
+        .at(location));
+    }
+    Ok(())
 }
 
 fn compile_nodes(specs: &[NodeSpec]) -> ConfigResult<Vec<ParsedNode>> {

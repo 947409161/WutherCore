@@ -459,6 +459,7 @@ mod tests {
             keep: FeedFilter::default(),
             drop: FeedFilter::default(),
             rename: FeedRename::default(),
+            overrides: Default::default(),
         }
     }
 

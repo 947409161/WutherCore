@@ -417,6 +417,7 @@ pub fn apply_filter_rename(detail: &FeedDetail, mut nodes: Vec<ParsedNode>) -> V
             n.name = n.name.trim().to_string();
         }
     }
+    detail.apply_overrides(&mut nodes);
     // 名称去重（保留先到的）
     let mut seen = std::collections::HashSet::new();
     nodes.retain(|n| seen.insert(n.name.clone()));
@@ -439,6 +440,7 @@ mod tests {
             keep: FeedFilter::default(),
             drop: FeedFilter::default(),
             rename: FeedRename::default(),
+            overrides: Default::default(),
         }
     }
 
@@ -552,6 +554,36 @@ proxies:
             nodes[0].params.get("disable-reuse").map(String::as_str),
             Some("0")
         );
+    }
+
+    #[test]
+    fn provider_client_id_override_only_changes_anytls_nodes() {
+        let yaml = r#"
+proxies:
+  - name: AnyTLS
+    type: anytls
+    server: proxy.example.com
+    port: 443
+    password: secret
+    clientId: upstream-client/1.0
+  - name: Trojan
+    type: trojan
+    server: proxy.example.com
+    port: 443
+    password: secret
+"#;
+        let mut detail = detail();
+        detail.overrides.client_id = Some("sing-anytls/0.0.11".into());
+        let nodes = apply_filter_rename(
+            &detail,
+            parse_feed_payload(yaml.as_bytes(), FormatHint::Auto),
+        );
+
+        assert_eq!(
+            nodes[0].params.get("clientId").map(String::as_str),
+            Some("sing-anytls/0.0.11")
+        );
+        assert!(!nodes[1].params.contains_key("clientId"));
     }
 
     #[test]
