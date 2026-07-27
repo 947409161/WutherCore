@@ -390,7 +390,7 @@ fn recvmsg_with_destination(
     message.msg_iov = &mut iovec;
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr().cast();
-    message.msg_controllen = control.len();
+    message.msg_controllen = control.len() as _;
     let length = unsafe { libc::recvmsg(fd, &mut message, 0) };
     if length < 0 {
         return Err(io::Error::last_os_error());
@@ -404,8 +404,8 @@ fn recvmsg_with_destination(
         if family == IpFamily::V4
             && control_header.cmsg_level == libc::IPPROTO_IP
             && control_header.cmsg_type == libc::IP_PKTINFO
-            && control_header.cmsg_len
-                >= unsafe { libc::CMSG_LEN(std::mem::size_of::<libc::in_pktinfo>() as _) } as usize
+            && control_header.cmsg_len as u64
+                >= unsafe { libc::CMSG_LEN(std::mem::size_of::<libc::in_pktinfo>() as _) } as u64
         {
             let info = unsafe { &*(libc::CMSG_DATA(header).cast::<libc::in_pktinfo>()) };
             destination = Some(IpAddr::V4(Ipv4Addr::from(
@@ -414,8 +414,8 @@ fn recvmsg_with_destination(
         } else if family == IpFamily::V6
             && control_header.cmsg_level == libc::IPPROTO_IPV6
             && control_header.cmsg_type == libc::IPV6_PKTINFO
-            && control_header.cmsg_len
-                >= unsafe { libc::CMSG_LEN(std::mem::size_of::<libc::in6_pktinfo>() as _) } as usize
+            && control_header.cmsg_len as u64
+                >= unsafe { libc::CMSG_LEN(std::mem::size_of::<libc::in6_pktinfo>() as _) } as u64
         {
             let info = unsafe { &*(libc::CMSG_DATA(header).cast::<libc::in6_pktinfo>()) };
             destination = Some(IpAddr::V6(Ipv6Addr::from(info.ipi6_addr.s6_addr)));
@@ -499,7 +499,7 @@ fn sendmsg_from_source(
     message.msg_iov = &mut iovec;
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr().cast();
-    message.msg_controllen = control.len();
+    message.msg_controllen = control.len() as _;
     let header = unsafe { libc::CMSG_FIRSTHDR(&message) };
     if header.is_null() {
         return Err(io::Error::other("failed to allocate xicmp control message"));
@@ -508,8 +508,7 @@ fn sendmsg_from_source(
         IpAddr::V4(source) => unsafe {
             (*header).cmsg_level = libc::IPPROTO_IP;
             (*header).cmsg_type = libc::IP_PKTINFO;
-            (*header).cmsg_len =
-                libc::CMSG_LEN(std::mem::size_of::<libc::in_pktinfo>() as _) as usize;
+            (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::in_pktinfo>() as _) as _;
             let info = libc::CMSG_DATA(header).cast::<libc::in_pktinfo>();
             *info = std::mem::zeroed();
             (*info).ipi_spec_dst.s_addr = u32::from_ne_bytes(source.octets());
@@ -517,8 +516,7 @@ fn sendmsg_from_source(
         IpAddr::V6(source) => unsafe {
             (*header).cmsg_level = libc::IPPROTO_IPV6;
             (*header).cmsg_type = libc::IPV6_PKTINFO;
-            (*header).cmsg_len =
-                libc::CMSG_LEN(std::mem::size_of::<libc::in6_pktinfo>() as _) as usize;
+            (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::in6_pktinfo>() as _) as _;
             let info = libc::CMSG_DATA(header).cast::<libc::in6_pktinfo>();
             *info = std::mem::zeroed();
             (*info).ipi6_addr.s6_addr = source.octets();
