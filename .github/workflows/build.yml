@@ -372,7 +372,7 @@ jobs:
           - target: x86_64-pc-windows-msvc
             name: windows-amd64-msvc
             runner: windows-2025
-            default-tags: standard
+            default-tags: portable
           - target: aarch64-pc-windows-msvc
             name: windows-arm64-msvc
             runner: windows-11-arm

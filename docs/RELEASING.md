@@ -86,8 +86,8 @@ git push origin v0.4.0
 - `BUILD-COMPONENTS.txt` 版本、Rust target 与实际组件预设；
 - `licenses/xray-transport-MPL-2.0.txt` 第三方许可证。
 
-Linux GNU、Windows AMD64 与 macOS 默认归档使用 `standard`；Linux musl、
-Android 与 Windows ARM64 使用 `portable`。后者避开上游尚未覆盖这些目标的
+Linux GNU 与 macOS 默认归档使用 `standard`；Linux musl、Android 与 Windows
+使用 `portable`。后者避开上游尚未覆盖这些目标的
 Mozilla NSS/BoringSSL 构建链；可用目标仍能显式选择 `portable_boringssl` 或具体的
 `with_grpc`、`with_utls`、`with_xhttp`。预设都会在 `BUILD-COMPONENTS.txt`
 中明确记录，显式传入 `tags` 时则完全采用请求的组件集。
