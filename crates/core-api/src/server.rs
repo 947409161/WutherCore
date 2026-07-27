@@ -151,7 +151,7 @@ impl ApiServer {
 /* ====================== `GET /` hello ====================== */
 
 async fn hello() -> impl IntoResponse {
-    Json(json!({"hello": "mihomo"}))
+    Json(json!({"hello": "WutherCore"}))
 }
 
 /* ====================== Auth middleware ====================== */

@@ -1028,6 +1028,7 @@ dependencies = [
  "core-route",
  "core-runtime",
  "core-smart",
+ "core-store",
  "dashmap",
  "futures",
  "http-body-util",

@@ -75,6 +75,7 @@ pub struct Runtime {
 struct RuntimeNodeInfo {
     provider: Option<String>,
     remote_destination: String,
+    udp: bool,
 }
 
 impl RuntimeNodeInfo {
@@ -82,6 +83,7 @@ impl RuntimeNodeInfo {
         Self {
             provider,
             remote_destination: format_host_port(&node.host, node.port),
+            udp: node.udp,
         }
     }
 }
@@ -330,6 +332,17 @@ impl Runtime {
             .names()
             .map(|s| s.to_string())
             .collect()
+    }
+
+    pub fn node_provider(&self, name: &str) -> Option<String> {
+        self.node_info
+            .read()
+            .get(name)
+            .and_then(|node| node.provider.clone())
+    }
+
+    pub fn node_udp_enabled(&self, name: &str) -> Option<bool> {
+        self.node_info.read().get(name).map(|node| node.udp)
     }
 
     /// 把订阅刷新得到的最新节点列表注入到 outbound registry，

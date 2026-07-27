@@ -317,7 +317,7 @@ async fn proxies_includes_global_and_direct() {
 }
 
 #[tokio::test]
-async fn configs_get_and_put_round_trip() {
+async fn configs_get_and_patch_round_trip() {
     let app = core_api::compat::router(build_state());
     // GET 默认值
     let resp = app
@@ -333,6 +333,13 @@ async fn configs_get_and_put_round_trip() {
     let v = body_json(resp).await;
     assert_eq!(v["mode"], "rule");
     assert_eq!(v["log-level"], "info");
+    assert_eq!(v["mixed-port"], 7890);
+    assert_eq!(v["port"], 0);
+    assert_eq!(v["socks-port"], 0);
+    assert_ne!(v["bind-address"], "*");
+    assert!(v.get("tcp-concurrent").is_none());
+    assert!(v.get("geodata-loader").is_none());
+    assert!(v.get("etag-support").is_none());
     // authentication 必须是用户名列表，不能回传 password 字段对象。
     assert!(v["authentication"].is_array());
     // PATCH 修改 mode + log-level（Mihomo PUT 是完整配置重载）
@@ -363,6 +370,51 @@ async fn configs_get_and_put_round_trip() {
     let v = body_json(resp).await;
     assert_eq!(v["mode"], "global");
     assert_eq!(v["log-level"], "debug");
+}
+
+#[tokio::test]
+async fn proxy_capabilities_come_from_runtime_node() {
+    let cfg = r#"
+version: 1
+profile: desktop
+listen:
+  local: 7890
+nodes:
+  - name: NodeNoUdp
+    protocol: vless
+    address: 1.2.3.4:443
+    login:
+      uuid: 11111111-1111-1111-1111-111111111111
+    network:
+      udp: false
+      tfo: true
+      mptcp: true
+      mark: 123
+groups:
+  picker:
+    choose: manual
+    use: [NodeNoUdp]
+route:
+  final: picker
+"#;
+    let plan = load_from_str(cfg).expect("structured node config");
+    let runtime = Arc::new(Runtime::build(plan).expect("runtime"));
+    let state = NativeState::for_tests(runtime, UrlTester::new(Default::default()), None);
+    let app = core_api::compat::router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/proxies/NodeNoUdp")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let proxy = body_json(resp).await;
+    assert_eq!(proxy["udp"], false);
+    assert_eq!(proxy["tfo"], true);
+    assert_eq!(proxy["mptcp"], true);
+    assert_eq!(proxy["routing-mark"], 123);
 }
 
 #[tokio::test]
@@ -620,6 +672,27 @@ async fn dns_rejects_unknown_query_type() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     assert_eq!(body_json(resp).await["message"], "invalid query type");
+}
+
+#[tokio::test]
+async fn dns_does_not_fake_unsupported_record_types() {
+    let app = core_api::compat::router(build_state());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/dns/query?name=example.com&type=TXT")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    assert!(
+        body_json(resp).await["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("TXT")
+    );
 }
 
 #[tokio::test]

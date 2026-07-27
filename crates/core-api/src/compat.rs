@@ -1,13 +1,13 @@
-//! Clash / mihomo Dashboard 全量兼容层。
+//! Clash / Mihomo Dashboard 协议兼容层。
 //!
-//! 端点契约对齐 sing-box `experimental/clashapi`（Yacd / metacubexd /
-//! clash-dashboard / razord 等仪表盘的实际调用面）：
+//! 路由、字段名和传输形式兼容 Mihomo；身份、能力和值始终来自 WutherCore
+//! 的真实运行时，不伪装成 Mihomo，也不为尚未实现的功能返回虚假成功。
 //!
 //! ```text
-//!   GET    /version                         内核版本 + premium / meta 标识
+//!   GET    /version                         WutherCore 版本 + Clash Meta 兼容标识
 //!   GET    /traffic            [WS]         实时 up/down 字节速率
 //!   GET    /memory             [WS]         进程 RSS / oslimit
-//!   GET    /logs               [WS] [SSE]   日志流 (level + payload)
+//!   GET    /logs               [WS]         NDJSON 日志流 (level + payload)
 //!   GET    /connections        [WS]         连接列表 / 实时
 //!   DEL    /connections                     关闭全部
 //!   DEL    /connections/:id                 关闭单条 (uuid 或 numeric)
@@ -30,9 +30,9 @@
 //!   PUT    /providers/rules/:name           触发 rule provider 刷新
 //!   GET    /rules                           所有路由规则的 mihomo 序列化形式
 //!   GET    /configs                         当前 mode / log-level / port 等
-//!   PUT    /configs                         热改 mode / log-level / allow-lan / ipv6
-//!   PATCH  /configs                         与 PUT 同义（兼容旧 dashboard）
-//!   POST   /configs/geo                     触发 GeoIP/GeoSite 更新
+//!   PUT    /configs                         完整配置重载（运行时不支持时明确报错）
+//!   PATCH  /configs                         热改可变运行时字段
+//!   POST   /configs/geo                     Geo 更新（未配置 updater 时明确报错）
 //!   GET    /dns/query?name=&type=           DoH 风格上游解析
 //!   POST   /cache/fakeip/flush              清空 fake-ip 池
 //!   POST   /cache/dns/flush                 清空 DNS 缓存
@@ -628,7 +628,17 @@ async fn proxy_delay(
         )
             .into_response();
     };
-    let _expected = q.expected.as_deref();
+    let expected = match q.expected.as_deref().map(core_runtime::IntRanges::parse) {
+        Some(Ok(expected)) => Some(expected),
+        Some(Err(_)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"message": "Body invalid"})),
+            )
+                .into_response();
+        }
+        None => None,
+    };
     let to = q.timeout.map(Duration::from_millis);
     // Mihomo `proxy.URLTest()` 对 group 名递归到当前选中成员；WutherCore 的
     // `test_node` 只查 outbounds 注册表（不含 group），group 名直接 UnknownNode，
@@ -654,7 +664,16 @@ async fn proxy_delay(
     for i in 0..MAX_SAMPLES {
         match s
             .urltest
-            .test_node(&s.runtime, &target, Some(url), to)
+            .test_node_with(
+                &s.runtime,
+                &target,
+                core_runtime::UrlTestOpts {
+                    url: Some(url.to_string()),
+                    timeout: to,
+                    expected_status: expected.clone(),
+                    unified_delay: None,
+                },
+            )
             .await
         {
             Ok(ms) => {
@@ -729,7 +748,17 @@ async fn group_delay(
         )
             .into_response();
     };
-    let _expected = q.expected.as_deref();
+    let expected = match q.expected.as_deref().map(core_runtime::IntRanges::parse) {
+        Some(Ok(expected)) => Some(expected),
+        Some(Err(_)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"message": "Body invalid"})),
+            )
+                .into_response();
+        }
+        None => None,
+    };
     let members = match s.runtime.groups.read().get(&name) {
         Some(g) => g.members().to_vec(),
         None => {
@@ -743,7 +772,7 @@ async fn group_delay(
     let to = q.timeout.map(Duration::from_millis);
     // sing-box GroupBase.URLTest: 并发上限 4，避免 1000 节点同时拨号互相
     // 抢带宽导致测速值被网络拥塞放大。
-    let body = group_delay_bounded(&s, &members, Some(url), to, 4).await;
+    let body = group_delay_bounded(&s, &members, Some(url), to, expected, 4).await;
     Json(Value::Object(body)).into_response()
 }
 
@@ -753,6 +782,7 @@ async fn group_delay_bounded(
     members: &[String],
     url: Option<String>,
     timeout: Option<Duration>,
+    expected_status: Option<core_runtime::IntRanges>,
     max_in_flight: usize,
 ) -> Map<String, Value> {
     use tokio::sync::Semaphore;
@@ -771,11 +801,21 @@ async fn group_delay_bounded(
         let urltest = s.urltest.clone();
         let runtime = s.runtime.clone();
         let url_for = url.clone();
+        let expected_for = expected_status.clone();
         let n = name.clone();
         handles.push(tokio::spawn(async move {
             let _permit = permit; // hold until task ends
             let r = urltest
-                .test_node(&runtime, &n, url_for.as_deref(), timeout)
+                .test_node_with(
+                    &runtime,
+                    &n,
+                    core_runtime::UrlTestOpts {
+                        url: url_for,
+                        timeout,
+                        expected_status: expected_for,
+                        unified_delay: None,
+                    },
+                )
                 .await;
             (n, r)
         }));
@@ -863,24 +903,17 @@ fn collect_proxy_map(s: &NativeState) -> Map<String, Value> {
         let alive = urltest.alive_for_url(&n.name, &default_url);
         proxies.insert(
             n.name.clone(),
-            json!({
-                "type": map_proto(n.protocol.as_str()),
-                "name": n.name,
-                "history": history,
-                "extra": extra_for(urltest, &n.name),
-                "alive": alive,
-                "delay": delay,
-                "udp": true,
-                "uot": false,
-                "xudp": false,
-                "tfo": false,
-                "mptcp": false,
-                "smux": false,
-                "interface": "",
-                "routing-mark": 0,
-                "provider-name": provider_for_node(&n.name),
-                "dialer-proxy": "",
-            }),
+            node_proxy_json(
+                s,
+                &n.name,
+                n.protocol.as_str(),
+                Some(n),
+                history,
+                extra_for(urltest, &n.name),
+                alive,
+                delay,
+                &runtime.node_provider(&n.name).unwrap_or_default(),
+            ),
         );
     }
     proxies.insert(
@@ -914,6 +947,7 @@ fn collect_proxy_map(s: &NativeState) -> Map<String, Value> {
     } else {
         urltest.alive_for_url(&global_now, &default_url)
     };
+    let (global_udp, global_smux) = effective_proxy_capabilities(runtime, &global_now);
     proxies.insert(
         "GLOBAL".into(),
         json!({
@@ -925,12 +959,12 @@ fn collect_proxy_map(s: &NativeState) -> Map<String, Value> {
             "extra": {},
             "alive": global_alive,
             "delay": global_delay,
-            "udp": true,
+            "udp": global_udp,
             "uot": false,
             "xudp": false,
             "tfo": false,
             "mptcp": false,
-            "smux": false,
+            "smux": global_smux,
             "hidden": false,
             "icon": "",
             "fixed": "",
@@ -986,6 +1020,20 @@ fn group_json(
         obj.entry("dialer-proxy")
             .or_insert(Value::String(String::new()));
         obj.entry("emptyFallback").or_insert(Value::Bool(false));
+        let member_capabilities: Vec<_> = g
+            .members()
+            .iter()
+            .map(|member| effective_proxy_capabilities(runtime, member))
+            .collect();
+        let group_udp_enabled = obj.get("udp").and_then(Value::as_bool).unwrap_or(false);
+        obj.insert(
+            "udp".into(),
+            Value::Bool(group_udp_enabled && member_capabilities.iter().any(|(udp, _)| *udp)),
+        );
+        obj.insert(
+            "smux".into(),
+            Value::Bool(member_capabilities.iter().any(|(_, multiplex)| *multiplex)),
+        );
         if let Some(now_node) = now.as_deref() {
             let history = node_history(urltest, runtime, now_node, default_url);
             let alive = urltest.alive_for_url(now_node, default_url);
@@ -1000,6 +1048,45 @@ fn group_json(
         }
     }
     json
+}
+
+fn effective_proxy_capabilities(runtime: &Arc<Runtime>, name: &str) -> (bool, bool) {
+    effective_proxy_capabilities_inner(runtime, name, 0)
+}
+
+fn effective_proxy_capabilities_inner(
+    runtime: &Arc<Runtime>,
+    name: &str,
+    depth: usize,
+) -> (bool, bool) {
+    if depth >= 16 {
+        return (false, false);
+    }
+    if let Some(members) = runtime
+        .groups
+        .read()
+        .get(name)
+        .map(|group| group.members().to_vec())
+    {
+        return members
+            .iter()
+            .map(|member| effective_proxy_capabilities_inner(runtime, member, depth + 1))
+            .fold((false, false), |current, capabilities| {
+                (current.0 || capabilities.0, current.1 || capabilities.1)
+            });
+    }
+    runtime
+        .outbounds
+        .read()
+        .get(name)
+        .map(|outbound| {
+            let capabilities = outbound.capabilities();
+            (
+                capabilities.udp && runtime.node_udp_enabled(name).unwrap_or(true),
+                capabilities.multiplex,
+            )
+        })
+        .unwrap_or((false, false))
 }
 
 /// 按 (node, url) 拉历史；URLTester 空时退回 SmartSelector。
@@ -1059,20 +1146,6 @@ fn delay_from_history(history: &Value) -> u64 {
         .and_then(|entry| entry.get("delay"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0)
-}
-
-/// 节点名 → 所属 provider（feed）名。FeedManager 给节点加的命名约定为
-/// `feedname/nodename` 或 `nodename[feedname]`。命中其一即视为该 feed。
-fn provider_for_node(name: &str) -> String {
-    if let Some(idx) = name.find('/') {
-        return name[..idx].to_string();
-    }
-    if let (Some(start), Some(end)) = (name.rfind('['), name.rfind(']')) {
-        if start < end {
-            return name[start + 1..end].to_string();
-        }
-    }
-    String::new()
 }
 
 fn map_proto(p: &str) -> &'static str {
@@ -1139,6 +1212,12 @@ async fn provider_proxy_refresh(
     // 触发后台 FeedManager 立即刷新该 feed。
     if let Some(mgr) = s.feeds.as_ref() {
         mgr.refresh_now(&name);
+    } else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"message": "feed manager unavailable"})),
+        )
+            .into_response();
     }
     s.caches.invalidate_proxy_state();
     (StatusCode::NO_CONTENT, Json(json!({}))).into_response()
@@ -1239,24 +1318,17 @@ fn provider_json(s: &NativeState, name: &str) -> Value {
                             .collect(),
                     );
                     let delay = delay_from_history(&history);
-                    json!({
-                        "type": map_proto(n.protocol.as_str()),
-                        "name": n.name,
-                        "history": history,
-                        "extra": {},
-                        "alive": urltest.alive_for_url(&n.name, &default_url),
-                        "delay": delay,
-                        "udp": true,
-                        "uot": false,
-                        "xudp": false,
-                        "tfo": false,
-                        "mptcp": false,
-                        "smux": false,
-                        "interface": "",
-                        "routing-mark": 0,
-                        "provider-name": name,
-                        "dialer-proxy": "",
-                    })
+                    node_proxy_json(
+                        s,
+                        &n.name,
+                        n.protocol.as_str(),
+                        Some(n),
+                        history,
+                        json!({}),
+                        urltest.alive_for_url(&n.name, &default_url),
+                        delay,
+                        name,
+                    )
                 })
                 .collect();
         }
@@ -1284,42 +1356,25 @@ fn provider_json(s: &NativeState, name: &str) -> Value {
                         .collect(),
                 );
                 let delay = delay_from_history(&history);
-                json!({
-                    "type": map_proto(n.protocol.as_str()),
-                    "name": n.name,
-                    "history": history,
-                    "extra": {},
-                    "alive": urltest.alive_for_url(&n.name, &default_url),
-                    "delay": delay,
-                    "udp": true,
-                    "uot": false,
-                    "xudp": false,
-                    "tfo": false,
-                    "mptcp": false,
-                    "smux": false,
-                    "interface": "",
-                    "routing-mark": 0,
-                    "provider-name": name,
-                    "dialer-proxy": "",
-                })
+                node_proxy_json(
+                    s,
+                    &n.name,
+                    n.protocol.as_str(),
+                    Some(n),
+                    history,
+                    json!({}),
+                    urltest.alive_for_url(&n.name, &default_url),
+                    delay,
+                    name,
+                )
             })
             .collect();
     }
     let status = s.feeds.as_ref().and_then(|m| m.status(name));
-    let (last_ms, next_ms, raw_bytes, from_cache, every_secs, url, userinfo) = status
+    let (last_ms, url, userinfo) = status
         .as_ref()
-        .map(|st| {
-            (
-                st.last_refreshed_ms,
-                st.next_due_ms,
-                st.last_raw_bytes,
-                st.last_from_cache,
-                st.every_secs,
-                st.url.clone(),
-                st.userinfo,
-            )
-        })
-        .unwrap_or((0, 0, 0, false, 0, String::new(), None));
+        .map(|st| (st.last_refreshed_ms, st.url.clone(), st.userinfo))
+        .unwrap_or((0, String::new(), None));
     let configured_url = s
         .runtime
         .plan
@@ -1333,15 +1388,25 @@ fn provider_json(s: &NativeState, name: &str) -> Value {
         url
     };
     let vehicle_type = if url.is_empty() { "File" } else { "HTTP" };
+    let expected_status = s
+        .urltest
+        .current_config()
+        .default_expected_status
+        .to_string();
     let mut provider = json!({
         "name": name,
         "type": "Proxy",
         "vehicleType": vehicle_type,
         "proxies": nodes,
         "testUrl": default_url,
-        "expectedStatus": "*",
-        "updatedAt": iso8601(last_ms / 1000),
+        "expectedStatus": expected_status,
     });
+    if last_ms > 0 {
+        provider
+            .as_object_mut()
+            .expect("provider object")
+            .insert("updatedAt".into(), Value::String(iso8601(last_ms / 1000)));
+    }
     if let Some(ui) = userinfo {
         provider.as_object_mut().expect("provider object").insert(
             "subscriptionInfo".into(),
@@ -1353,7 +1418,6 @@ fn provider_json(s: &NativeState, name: &str) -> Value {
             }),
         );
     }
-    let _ = (next_ms, raw_bytes, from_cache, every_secs);
     provider
 }
 
@@ -1362,7 +1426,7 @@ async fn providers_rules(State(s): State<NativeState>) -> axum::response::Respon
     let bytes = s.caches.providers_rules.fetch_bytes(move || {
         let mut providers = Map::new();
         for (name, set) in &runtime.plan.route.sets {
-            providers.insert(name.clone(), rule_provider_json(name, set));
+            providers.insert(name.clone(), rule_provider_json(&runtime, name, set));
         }
         json!({"providers": providers})
     });
@@ -1374,7 +1438,7 @@ async fn provider_rule_one(
     Path(name): Path<String>,
 ) -> axum::response::Response {
     if let Some(set) = s.runtime.plan.route.sets.get(&name) {
-        Json(rule_provider_json(&name, set)).into_response()
+        Json(rule_provider_json(&s.runtime, &name, set)).into_response()
     } else {
         (
             StatusCode::NOT_FOUND,
@@ -1395,13 +1459,18 @@ async fn provider_rule_refresh(
         )
             .into_response();
     }
-    // RulesetManager 的强制刷新 API 暂未公开（后台 ticker 自动周期刷）；
-    // 这里 ack 让 dashboard 不报错。
-    s.caches.invalidate_rule_state();
-    (StatusCode::NO_CONTENT, Json(json!({}))).into_response()
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({"message": "ruleset refresh is not available at runtime"})),
+    )
+        .into_response()
 }
 
-fn rule_provider_json(name: &str, set: &core_config::model::RuleSetSpec) -> Value {
+fn rule_provider_json(
+    runtime: &Arc<Runtime>,
+    name: &str,
+    set: &core_config::model::RuleSetSpec,
+) -> Value {
     let vehicle_type = if set.url.is_some() {
         "HTTP"
     } else if set.path.is_some() {
@@ -1416,6 +1485,22 @@ fn rule_provider_json(name: &str, set: &core_config::model::RuleSetSpec) -> Valu
         "classical" => "Classical".to_string(),
         _ => lowered.clone(),
     };
+    let rule_count = runtime
+        .route
+        .rulesets()
+        .and_then(|rulesets| rulesets.get(name))
+        .map(|matcher| {
+            let stats = matcher.stats();
+            stats.domains
+                + stats.suffixes
+                + stats.keywords
+                + stats.regex
+                + stats.cidr_v4
+                + stats.cidr_v6
+                + stats.processes
+                + stats.ports
+        })
+        .unwrap_or(set.payload.len());
     json!({
         "name": name,
         "type": "Rule",
@@ -1426,8 +1511,7 @@ fn rule_provider_json(name: &str, set: &core_config::model::RuleSetSpec) -> Valu
             "mrs" => "MrsRule",
             _ => "YamlRule",
         },
-        "ruleCount": set.payload.len(),
-        "updatedAt": iso8601_now(),
+        "ruleCount": rule_count,
     })
 }
 
@@ -1448,10 +1532,10 @@ fn build_rules_value(runtime: &Arc<Runtime>) -> Value {
     for (index, st) in runtime.plan.route.steps.iter().enumerate() {
         let (rtype, payload) = match &st.matcher {
             RouteMatcher::Any => ("MATCH", String::new()),
-            RouteMatcher::Home => ("DOMAIN-SUFFIX", "lan,local,arpa".into()),
+            RouteMatcher::Home => ("HOME", String::new()),
             RouteMatcher::Cn => ("GEOIP", "CN".into()),
-            RouteMatcher::Ads => ("RULE-SET", "ads".into()),
-            RouteMatcher::Service(svc) => ("RULE-SET", svc.clone()),
+            RouteMatcher::Ads => ("ADS", String::new()),
+            RouteMatcher::Service(svc) => ("SERVICE", svc.clone()),
             RouteMatcher::Domain(d) => ("DOMAIN", d.clone()),
             RouteMatcher::Suffix(d) => ("DOMAIN-SUFFIX", d.clone()),
             RouteMatcher::Keyword(k) => ("DOMAIN-KEYWORD", k.clone()),
@@ -1461,8 +1545,7 @@ fn build_rules_value(runtime: &Arc<Runtime>) -> Value {
             RouteMatcher::Network(n) => ("NETWORK", n.clone()),
             RouteMatcher::Process(p) => ("PROCESS-NAME", p.clone()),
             RouteMatcher::Set(s) => ("RULE-SET", s.clone()),
-            RouteMatcher::Proto(p) => ("PROCESS-PATH", p.clone()),
-            // mihomo 标准里没有 AND/OR 组合规则；为面板可读，输出占位类型。
+            RouteMatcher::Proto(p) => ("PROTOCOL", p.clone()),
             RouteMatcher::And(parts) => ("AND", format!("{} clauses", parts.len())),
             RouteMatcher::Or(parts) => ("OR", format!("{} clauses", parts.len())),
         };
@@ -1518,14 +1601,18 @@ async fn configs(State(s): State<NativeState>) -> axum::response::Response {
 }
 
 fn build_configs_value(s: &NativeState) -> Value {
-    let port = s
-        .runtime
-        .plan
-        .listen
-        .mixed
-        .as_ref()
-        .map(|m| m.port)
-        .unwrap_or(0);
+    let mixed = s.runtime.plan.listen.mixed.as_ref();
+    let port = mixed.map(|m| m.port).unwrap_or(0);
+    let bind_address = mixed.map(|m| m.host.as_str()).unwrap_or("");
+    let inbound_sockopt = mixed
+        .and_then(|m| m.stream_settings.as_ref())
+        .and_then(|settings| settings.sockopt.as_ref());
+    let inbound_tfo = inbound_sockopt
+        .map(|sockopt| sockopt.tfo_value() != 0)
+        .unwrap_or(false);
+    let inbound_mptcp = inbound_sockopt
+        .map(|sockopt| sockopt.tcp_mptcp)
+        .unwrap_or(false);
     let mc = s.runtime.mutable.read().clone();
     let find_process_mode = match s.runtime.plan.find_process_mode {
         core_config::model::FindProcessMode::Off => "off",
@@ -1542,19 +1629,16 @@ fn build_configs_value(s: &NativeState) -> Value {
         .map(|up| up.user.clone())
         .collect();
     json!({
-        "port": port,
-        "socks-port": port,
+        "port": 0,
+        "socks-port": 0,
         "redir-port": 0,
         "tproxy-port": 0,
         "mixed-port": port,
         "authentication": authentication,
-        "skip-auth-prefixes": [],
-        "lan-allowed-ips": [],
-        "lan-disallowed-ips": [],
         "allow-lan": mc.allow_lan,
-        "bind-address": "*",
-        "inbound-tfo": false,
-        "inbound-mptcp": false,
+        "bind-address": bind_address,
+        "inbound-tfo": inbound_tfo,
+        "inbound-mptcp": inbound_mptcp,
         "mode": mc.mode,
         "log-level": mc.log_level,
         "ipv6": mc.ipv6,
@@ -1564,30 +1648,85 @@ fn build_configs_value(s: &NativeState) -> Value {
             "device": s.runtime.plan.capture.tun.interface_name.clone().unwrap_or_default(),
         },
         "find-process-mode": find_process_mode,
-        "unified-delay": false,
-        "tcp-concurrent": true,
-        "geo-update-interval": 24,
-        "geo-auto-update": false,
-        "geodata-mode": false,
-        "geodata-loader": "standard",
-        "geosite-matcher": "succinct",
-        "interface-name": "",
-        "routing-mark": 0,
-        "geox-url": {
-            "geo-ip": "",
-            "mmdb": "",
-            "asn": "",
-            "geo-site": "",
-        },
-        "sniffing": false,
-        "global-ua": "",
-        "etag-support": true,
-        "keep-alive-idle": 15,
-        "keep-alive-interval": 15,
-        "disable-keep-alive": false,
-        "tuic-server": {},
-        "ss-config": "",
-        "vmess-config": "",
+        "unified-delay": s.urltest.current_config().default_unified_delay,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn node_proxy_json(
+    s: &NativeState,
+    name: &str,
+    protocol: &str,
+    node: Option<&core_config::node_uri::ParsedNode>,
+    history: Value,
+    extra: Value,
+    alive: bool,
+    delay: u64,
+    provider: &str,
+) -> Value {
+    let capabilities = s
+        .runtime
+        .outbounds
+        .read()
+        .get(name)
+        .map(|outbound| outbound.capabilities());
+    let sockopt = node
+        .and_then(|node| node.stream_settings.as_ref())
+        .and_then(|settings| settings.sockopt.as_ref());
+    let param_bool = |key: &str| {
+        node.and_then(|node| node.params.get(key))
+            .is_some_and(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+    };
+    let udp = capabilities
+        .map(|capabilities| capabilities.udp)
+        .unwrap_or(false)
+        && s.runtime.node_udp_enabled(name).unwrap_or(true);
+    let smux = capabilities
+        .map(|capabilities| capabilities.multiplex)
+        .unwrap_or(false);
+    let uot = param_bool("udp-over-tcp") || param_bool("udp_over_tcp");
+    let tfo = sockopt
+        .map(|sockopt| sockopt.tfo_value() != 0)
+        .unwrap_or_else(|| param_bool("tfo"));
+    let mptcp = sockopt
+        .map(|sockopt| sockopt.tcp_mptcp)
+        .unwrap_or_else(|| param_bool("mptcp"));
+    let interface = sockopt
+        .map(|sockopt| sockopt.interface.clone())
+        .unwrap_or_default();
+    let routing_mark = sockopt
+        .map(|sockopt| sockopt.mark)
+        .or_else(|| {
+            node.and_then(|node| node.params.get("mark"))
+                .and_then(|mark| mark.parse::<i32>().ok())
+        })
+        .unwrap_or_default();
+    let dialer_proxy = sockopt
+        .map(|sockopt| sockopt.dialer_proxy.clone())
+        .unwrap_or_default();
+
+    json!({
+        "type": map_proto(protocol),
+        "name": name,
+        "history": history,
+        "extra": extra,
+        "alive": alive,
+        "delay": delay,
+        "udp": udp,
+        "uot": uot,
+        "xudp": false,
+        "tfo": tfo,
+        "mptcp": mptcp,
+        "smux": smux,
+        "interface": interface,
+        "routing-mark": routing_mark,
+        "provider-name": provider,
+        "dialer-proxy": dialer_proxy,
     })
 }
 
@@ -1711,8 +1850,11 @@ async fn configs_put(
 }
 
 async fn configs_geo(State(_s): State<NativeState>) -> impl IntoResponse {
-    // 触发 ruleset_index 全量刷新由 FeedManager 异步完成；这里仅 ack。
-    (StatusCode::NO_CONTENT, Json(json!({}))).into_response()
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({"message": "Geo database update is not configured"})),
+    )
+        .into_response()
 }
 
 /* ====================== DNS / cache ====================== */
@@ -1740,14 +1882,15 @@ async fn dns_query(
     let qtype_num: u16 = match qtype_label.as_str() {
         "A" => 1,
         "AAAA" => 28,
-        "CNAME" => 5,
-        "TXT" => 16,
-        "MX" => 15,
-        "NS" => 2,
-        "PTR" => 12,
-        "SRV" => 33,
-        "HTTPS" => 65,
-        "SVCB" => 64,
+        "CNAME" | "TXT" | "MX" | "NS" | "PTR" | "SRV" | "HTTPS" | "SVCB" => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(json!({
+                    "message": format!("DNS query type {qtype_label} is not supported")
+                })),
+            )
+                .into_response();
+        }
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -1806,29 +1949,68 @@ fn dashboard_storage() -> &'static dashmap::DashMap<String, Bytes> {
     STORAGE.get_or_init(dashmap::DashMap::new)
 }
 
-async fn storage_get(Path(key): Path<String>) -> Response {
-    let bytes = dashboard_storage()
-        .get(&key)
-        .map(|value| value.clone())
-        .unwrap_or_else(|| Bytes::from_static(b"null"));
-    json_bytes(bytes)
+fn storage_key(key: &str) -> String {
+    format!("clash_storage:{key}")
 }
 
-async fn storage_put(Path(key): Path<String>, body: Bytes) -> Response {
-    if serde_json::from_slice::<Value>(&body).is_err() {
+async fn storage_get(State(s): State<NativeState>, Path(key): Path<String>) -> Response {
+    if let Some(store) = s.runtime.store.as_ref() {
+        return match store.get_json::<Value>(core_store::schema::KV_META, &storage_key(&key)) {
+            Ok(Some(value)) => Json(value).into_response(),
+            Ok(None) => json_bytes(Bytes::from_static(b"null")),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"message": error.to_string()})),
+            )
+                .into_response(),
+        };
+    }
+    let value = dashboard_storage()
+        .get(&key)
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .unwrap_or(Value::Null);
+    Json(value).into_response()
+}
+
+async fn storage_put(
+    State(s): State<NativeState>,
+    Path(key): Path<String>,
+    body: Bytes,
+) -> Response {
+    let Ok(value) = serde_json::from_slice::<Value>(&body) else {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"message": "Body invalid"})),
         )
             .into_response();
+    };
+    if let Some(store) = s.runtime.store.as_ref() {
+        return match store.put_json(core_store::schema::KV_META, &storage_key(&key), &value) {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"message": error.to_string()})),
+            )
+                .into_response(),
+        };
     }
     dashboard_storage().insert(key, body);
     StatusCode::NO_CONTENT.into_response()
 }
 
-async fn storage_delete(Path(key): Path<String>) -> StatusCode {
+async fn storage_delete(State(s): State<NativeState>, Path(key): Path<String>) -> Response {
+    if let Some(store) = s.runtime.store.as_ref() {
+        return match store.delete(core_store::schema::KV_META, &storage_key(&key)) {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"message": error.to_string()})),
+            )
+                .into_response(),
+        };
+    }
     dashboard_storage().remove(&key);
-    StatusCode::NO_CONTENT
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /* ====================== misc ====================== */
@@ -1892,14 +2074,6 @@ fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
     (year, m, d)
 }
 
-fn iso8601_now() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    iso8601(secs)
-}
-
 fn clock_now() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1940,12 +2114,5 @@ mod time_tests {
     fn delay_from_empty_history_is_zero() {
         let h = json!([]);
         assert_eq!(super::delay_from_history(&h), 0);
-    }
-
-    #[test]
-    fn provider_for_node_handles_slash_and_brackets() {
-        assert_eq!(super::provider_for_node("primary/HK-01"), "primary");
-        assert_eq!(super::provider_for_node("HK-01[primary]"), "primary");
-        assert_eq!(super::provider_for_node("HK-01"), "");
     }
 }
