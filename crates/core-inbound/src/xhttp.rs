@@ -2292,8 +2292,10 @@ mod tests {
     async fn tls_handshake_timeout_releases_idle_tcp_client() {
         use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
-        let rcgen::CertifiedKey { cert, key_pair } =
-            rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let rcgen::CertifiedKey {
+            cert,
+            signing_key: key_pair,
+        } = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
         let tls_config = rustls::ServerConfig::builder_with_provider(ring_provider())
             .with_safe_default_protocol_versions()
@@ -2321,8 +2323,10 @@ mod tests {
         use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
         use tokio_rustls::TlsConnector;
 
-        let rcgen::CertifiedKey { cert, key_pair } =
-            rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let rcgen::CertifiedKey {
+            cert,
+            signing_key: key_pair,
+        } = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let certificate = cert.der().clone();
         let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
         let mut server_tls = rustls::ServerConfig::builder_with_provider(ring_provider())
@@ -2954,8 +2958,10 @@ mod tests {
         use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
         use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
-        let rcgen::CertifiedKey { cert, key_pair } =
-            rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let rcgen::CertifiedKey {
+            cert,
+            signing_key: key_pair,
+        } = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let certificate = cert.der().clone();
         let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
 
@@ -3199,8 +3205,10 @@ mod tests {
         use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
         use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
-        let rcgen::CertifiedKey { cert, key_pair } =
-            rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let rcgen::CertifiedKey {
+            cert,
+            signing_key: key_pair,
+        } = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let certificate = cert.der().clone();
         let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
         let mut server_tls = rustls::ServerConfig::builder_with_provider(ring_provider())
@@ -3314,8 +3322,10 @@ mod tests {
         use quinn::crypto::rustls::{HandshakeData, QuicClientConfig, QuicServerConfig};
         use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
-        let rcgen::CertifiedKey { cert, key_pair } =
-            rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let rcgen::CertifiedKey {
+            cert,
+            signing_key: key_pair,
+        } = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let certificate = cert.der().clone();
         let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
 
@@ -3433,8 +3443,10 @@ mod tests {
         use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
         use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
-        let rcgen::CertifiedKey { cert, key_pair } =
-            rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let rcgen::CertifiedKey {
+            cert,
+            signing_key: key_pair,
+        } = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let certificate = cert.der().clone();
         let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
 
@@ -3614,8 +3626,10 @@ mod tests {
         use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
         use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
-        let rcgen::CertifiedKey { cert, key_pair } =
-            rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let rcgen::CertifiedKey {
+            cert,
+            signing_key: key_pair,
+        } = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let certificate = cert.der().clone();
         let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
         let mut server_tls = rustls::ServerConfig::builder_with_provider(ring_provider())

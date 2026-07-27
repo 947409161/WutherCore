@@ -20,7 +20,7 @@ use std::{
 use bytes::{Buf, BytesMut};
 use parking_lot::Mutex as PlMutex;
 use pin_project_lite::pin_project;
-use rand::{Rng, RngCore};
+use rand::{Rng, RngExt};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::table::{Table, pack_hints_to_key};
@@ -88,11 +88,11 @@ pub fn encode_payload(table: &Table, payload: &[u8], padding_threshold: u64) -> 
     let mut out = Vec::with_capacity(payload.len() * 6 + 1);
     let pads = &table.padding_pool;
     let pad_len = pads.len();
-    let mut rng = rand::rngs::OsRng;
+    let mut rng = rand::rng();
 
     for &b in payload {
         if should_pad(padding_threshold) && pad_len > 0 {
-            out.push(pads[rng.gen_range(0..pad_len)]);
+            out.push(pads[rng.random_range(0..pad_len)]);
         }
         let puzzles = &table.encode_table[b as usize];
         if puzzles.is_empty() {
@@ -100,18 +100,18 @@ pub fn encode_payload(table: &Table, payload: &[u8], padding_threshold: u64) -> 
             out.push(table.layout.group_byte(b));
             continue;
         }
-        let puzzle = &puzzles[rng.gen_range(0..puzzles.len())];
-        let perm = &PERM4[rng.gen_range(0..PERM4.len())];
+        let puzzle = &puzzles[rng.random_range(0..puzzles.len())];
+        let perm = &PERM4[rng.random_range(0..PERM4.len())];
         for &idx in perm {
             if should_pad(padding_threshold) && pad_len > 0 {
-                out.push(pads[rng.gen_range(0..pad_len)]);
+                out.push(pads[rng.random_range(0..pad_len)]);
             }
             out.push(puzzle[idx as usize]);
         }
     }
 
     if should_pad(padding_threshold) && pad_len > 0 {
-        out.push(pads[rng.gen_range(0..pad_len)]);
+        out.push(pads[rng.random_range(0..pad_len)]);
     }
     out
 }

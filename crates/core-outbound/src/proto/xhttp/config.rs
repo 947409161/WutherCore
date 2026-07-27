@@ -20,7 +20,7 @@
 use std::collections::BTreeMap;
 
 use http::{HeaderName, HeaderValue};
-use rand::Rng;
+use rand::RngExt;
 
 pub const PLACEMENT_QUERY_IN_HEADER: &str = "queryInHeader";
 pub const PLACEMENT_COOKIE: &str = "cookie";
@@ -902,9 +902,9 @@ impl Range {
         if self.min == self.max {
             self.min
         } else {
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             // Xray common/crypto.RandBetween uses [from, to).
-            self.min + rng.gen_range(0..(self.max - self.min))
+            self.min + rng.random_range(0..(self.max - self.min))
         }
     }
 

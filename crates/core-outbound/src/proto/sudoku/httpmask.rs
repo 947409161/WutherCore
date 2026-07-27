@@ -3,7 +3,7 @@
 //! 与 mihomo `transport/sudoku/obfs/httpmask/masker.go` 等价。
 //! 仅实现客户端 write 方向的 legacy mode（最常用且与 CDN 不兼容但不用握手）。
 
-use rand::{Rng, seq::SliceRandom};
+use rand::{Rng, RngExt, seq::IndexedRandom};
 
 const USER_AGENTS: &[&str] = &[
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -59,18 +59,18 @@ fn join_path_root(path_root: &str, p: &str) -> String {
 
 /// 构造一段 HTTP/1.1 伪装请求头部，与 mihomo WriteRandomRequestHeaderWithPathRoot 等价。
 pub fn build_random_request_header(host: &str, path_root: &str) -> Vec<u8> {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let path = join_path_root(path_root, PATHS.choose(&mut rng).unwrap());
     let ctype = CONTENT_TYPES.choose(&mut rng).unwrap();
     let mut buf = Vec::with_capacity(1024);
 
     // 20% 概率 WebSocket 升级伪装
-    let pick = rng.gen_range(0..10);
+    let pick = rng.random_range(0..10);
     let host_no_port = strip_port(host);
     if pick < 2 {
         let mut ws_key_bytes = [0u8; 16];
         for b in ws_key_bytes.iter_mut() {
-            *b = rng.r#gen();
+            *b = rng.random();
         }
         let ws_key = base64_std(&ws_key_bytes);
         buf.extend_from_slice(b"GET ");
@@ -85,7 +85,7 @@ pub fn build_random_request_header(host: &str, path_root: &str) -> Vec<u8> {
     } else {
         let min_cl: i64 = 4 * 1024;
         let max_cl: i64 = 10 * 1024 * 1024;
-        let cl: i64 = rng.gen_range(min_cl..=max_cl);
+        let cl: i64 = rng.random_range(min_cl..=max_cl);
         buf.extend_from_slice(b"POST ");
         buf.extend_from_slice(path.as_bytes());
         buf.extend_from_slice(b" HTTP/1.1\r\n");
@@ -94,10 +94,10 @@ pub fn build_random_request_header(host: &str, path_root: &str) -> Vec<u8> {
         buf.extend_from_slice(ctype.as_bytes());
         buf.extend_from_slice(b"\r\nContent-Length: ");
         buf.extend_from_slice(cl.to_string().as_bytes());
-        if rng.gen_range(0..2) == 0 {
+        if rng.random_range(0..2) == 0 {
             buf.extend_from_slice(b"\r\nX-Requested-With: XMLHttpRequest");
         }
-        if rng.gen_range(0..3) == 0 {
+        if rng.random_range(0..3) == 0 {
             buf.extend_from_slice(b"\r\nReferer: https://");
             buf.extend_from_slice(host_no_port.as_bytes());
             buf.extend_from_slice(b"/");

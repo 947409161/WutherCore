@@ -296,8 +296,8 @@ fn recompute_l4_checksum(seg: &mut [u8]) -> Result<(), GsoSplitError> {
                     ip.total_len() as usize,
                 )
             };
-            let src_addr = IpAddress::Ipv4(Ipv4Address(src.0));
-            let dst_addr = IpAddress::Ipv4(Ipv4Address(dst.0));
+            let src_addr = IpAddress::Ipv4(src);
+            let dst_addr = IpAddress::Ipv4(dst);
             l4_fill(&mut seg[header_len..total_len], proto, &src_addr, &dst_addr);
             // IP checksum 已在 fix_ipv4 内重算
             Ok(())
@@ -320,8 +320,8 @@ fn recompute_l4_checksum(seg: &mut [u8]) -> Result<(), GsoSplitError> {
                     total_len,
                 )
             };
-            let src_addr = IpAddress::Ipv6(Ipv6Address(src.0));
-            let dst_addr = IpAddress::Ipv6(Ipv6Address(dst.0));
+            let src_addr = IpAddress::Ipv6(src);
+            let dst_addr = IpAddress::Ipv6(dst);
             l4_fill(&mut seg[header_len..total_len], proto, &src_addr, &dst_addr);
             Ok(())
         }
@@ -410,8 +410,8 @@ mod tests {
     /* ---------- 构造原始大段（IPv4+TCP）的辅助 ---------- */
 
     fn build_v4_tcp_segment(payload: &[u8], seq: u32) -> Vec<u8> {
-        let src = Ipv4Address([10, 0, 0, 1]);
-        let dst = Ipv4Address([1, 1, 1, 1]);
+        let src = Ipv4Address::from([10, 0, 0, 1]);
+        let dst = Ipv4Address::from([1, 1, 1, 1]);
         let tcp = TcpRepr {
             src_port: 30000,
             dst_port: 80,
@@ -423,6 +423,7 @@ mod tests {
             max_seg_size: None,
             sack_permitted: false,
             sack_ranges: [None, None, None],
+            timestamp: None,
             payload,
         };
         let ip = Ipv4Repr {
@@ -447,8 +448,8 @@ mod tests {
     }
 
     fn build_v6_tcp_segment(payload: &[u8], seq: u32) -> Vec<u8> {
-        let src = Ipv6Address(Ipv6Addr::new(0xfd, 0, 0, 0, 0, 0, 0, 1).octets());
-        let dst = Ipv6Address(Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 0x1111).octets());
+        let src = Ipv6Address::from(Ipv6Addr::new(0xfd, 0, 0, 0, 0, 0, 0, 1).octets());
+        let dst = Ipv6Address::from(Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 0x1111).octets());
         let tcp = TcpRepr {
             src_port: 30000,
             dst_port: 443,
@@ -460,6 +461,7 @@ mod tests {
             max_seg_size: None,
             sack_permitted: false,
             sack_ranges: [None, None, None],
+            timestamp: None,
             payload,
         };
         let ip = Ipv6Repr {
@@ -484,8 +486,8 @@ mod tests {
     }
 
     fn build_v4_udp_segment(payload: &[u8]) -> Vec<u8> {
-        let src = Ipv4Address([10, 0, 0, 1]);
-        let dst = Ipv4Address([1, 1, 1, 1]);
+        let src = Ipv4Address::from([10, 0, 0, 1]);
+        let dst = Ipv4Address::from([1, 1, 1, 1]);
         let udp = UdpRepr {
             src_port: 30000,
             dst_port: 53,

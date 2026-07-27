@@ -25,7 +25,7 @@ crc32fast   = "1"
 flate2      = { workspace = true }
 # 纯 Rust zstd 解码器 —— mihomo MRS v1 整体经 zstd 流压缩。
 # 选 ruzstd 而非 zstd-rs 是为了避免 C 依赖（zstd-sys）在 Android NDK 交叉编译时的麻烦。
-ruzstd      = "0.8"
-# Mihomo's current Go runtime uses Unicode 15.0 case tables. Pin the generated
-# table version so MRS domain matching is independent of the Rust toolchain.
-unicode-case-mapping = "=0.5.0"
+ruzstd      = "0.9"
+# Use the latest generated tables; domain_set keeps the small Unicode 16 delta
+# compatible with Mihomo's current Unicode 15 Go runtime.
+unicode-case-mapping = "=1.0.0"

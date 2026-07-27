@@ -17,6 +17,7 @@ use http::{HeaderName, HeaderValue, Request as HttpRequest};
 use http_body_util::BodyExt;
 use hyper::body::{Body as HyperBody, Frame, Incoming};
 use parking_lot::Mutex as PlMutex;
+use rand::RngExt;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     sync::{Mutex as AsyncMutex, mpsc},
@@ -74,7 +75,7 @@ impl Transport for H2Transport {
 
         // 2) 选 authority + path
         let authority = if !self.opts.host.is_empty() {
-            self.opts.host[rand::random::<usize>() % self.opts.host.len()].clone()
+            self.opts.host[rand::rng().random_range(0..self.opts.host.len())].clone()
         } else {
             host.to_string()
         };

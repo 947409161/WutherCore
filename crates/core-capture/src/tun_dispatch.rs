@@ -70,10 +70,10 @@ impl TunDispatcher {
     ) -> Self {
         let v6_addr = plan
             .tun_v6_cidr
-            .map(|c| smoltcp::wire::Ipv6Address(c.addr().octets()));
+            .map(|c| smoltcp::wire::Ipv6Address::from(c.addr().octets()));
         let stack = Arc::new(Mutex::new(UserSpaceStack::new(
             plan.mtu as usize,
-            smoltcp::wire::Ipv4Address(plan.tun_v4_cidr.addr().octets()),
+            smoltcp::wire::Ipv4Address::from(plan.tun_v4_cidr.addr().octets()),
             v6_addr,
         )));
         let idle = plan.udp_timeout;

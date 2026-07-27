@@ -72,7 +72,7 @@ pub(crate) fn build_connector(options: &TlsOptions) -> io::Result<SslConnector> 
         ));
     }
 
-    let mut builder = SslConnector::builder(SslMethod::tls_client())
+    let mut builder = SslConnector::builder(SslMethod::tls())
         .map_err(|error| crypto_error("create BoringSSL connector", error))?;
     let (min, max) = version_range(options)?;
     builder

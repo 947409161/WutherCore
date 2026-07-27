@@ -18,7 +18,7 @@ use std::{
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
-use rand::{Rng, seq::SliceRandom};
+use rand::{RngExt, seq::IndexedRandom};
 use tokio::{sync::Mutex, task::JoinHandle};
 
 use crate::{
@@ -92,7 +92,7 @@ impl UdpHopCarrier {
         };
         let initial_port = *plan
             .ports
-            .choose(&mut rand::thread_rng())
+            .choose(&mut rand::rng())
             .ok_or_else(|| invalid("UDP hop has no ports"))?;
         let (initial, local) = factory.open(initial_port).await?;
         let state = Arc::new(RwLock::new(HopState {
@@ -176,7 +176,7 @@ fn spawn_hopper(
             }
             let port = *plan
                 .ports
-                .choose(&mut rand::thread_rng())
+                .choose(&mut rand::rng())
                 .expect("validated non-empty UDP hop ports");
             let Ok((next, _)) = factory.open(port).await else {
                 tracing::debug!(
@@ -215,7 +215,7 @@ fn random_interval(min: Duration, max: Duration) -> Duration {
     }
     let min_ms = min.as_millis() as u64;
     let max_ms = max.as_millis() as u64;
-    Duration::from_millis(rand::thread_rng().gen_range(min_ms..=max_ms))
+    Duration::from_millis(rand::rng().random_range(min_ms..=max_ms))
 }
 
 #[async_trait]

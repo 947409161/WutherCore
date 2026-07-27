@@ -11,7 +11,7 @@ use hickory_proto::{
     serialize::binary::{BinDecodable, BinEncodable},
 };
 use parking_lot::Mutex;
-use rand::Rng;
+use rand::RngExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::{device::WireGuardDevice, io_err};
@@ -147,7 +147,7 @@ async fn query(
     name: Name,
     record_type: RecordType,
 ) -> std::io::Result<(Vec<IpAddr>, Duration)> {
-    let id = rand::thread_rng().r#gen::<u16>();
+    let id = rand::rng().random::<u16>();
     let mut request = Message::new(id, MessageType::Query, OpCode::Query);
     request.metadata.recursion_desired = true;
     request.add_query(Query::query(name, record_type));

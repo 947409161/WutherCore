@@ -51,14 +51,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit as AesKeyInit};
+use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit as AesKeyInit};
 use aes_gcm::{Aes128Gcm, Aes256Gcm, Nonce, aead::Aead};
 use async_trait::async_trait;
 use bytes::{Buf, BufMut, BytesMut};
 use chacha20poly1305::{ChaCha20Poly1305, XChaCha20Poly1305, XNonce};
 use parking_lot::Mutex;
 use pin_project_lite::pin_project;
-use rand::RngCore;
+use rand::Rng;
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::UdpSocket,
@@ -240,7 +240,7 @@ impl OutboundAdapter for Ss2022Outbound {
         // 1) 随机 salt 与 PSK 等长
         let salt_len = self.cipher.key_len();
         let mut salt = vec![0u8; salt_len];
-        rand::rngs::OsRng.fill_bytes(&mut salt);
+        rand::rng().fill_bytes(&mut salt);
 
         // 2) 派生 session subkey
         let subkey = derive_subkey(&self.psk, &salt, salt_len);
@@ -256,13 +256,13 @@ impl OutboundAdapter for Ss2022Outbound {
         // 随机 padding（防指纹识别）
         let padding_len = {
             let mut b = [0u8; 2];
-            rand::rngs::OsRng.fill_bytes(&mut b);
+            rand::rng().fill_bytes(&mut b);
             (u16::from_be_bytes(b) % MAX_PADDING_LEN + 1) as usize
         };
         var_hdr.put_u16(padding_len as u16);
         if padding_len > 0 {
             let mut padding = vec![0u8; padding_len];
-            rand::rngs::OsRng.fill_bytes(&mut padding);
+            rand::rng().fill_bytes(&mut padding);
             var_hdr.extend_from_slice(&padding);
         }
 
@@ -991,7 +991,7 @@ fn seal_udp_packet(
             let cipher = XChaCha20Poly1305::new_from_slice(user_psk)
                 .map_err(|_| invalid_data("ss2022 XChaCha20 key length"))?;
             let mut nonce = [0u8; UDP_XCHACHA_NONCE_LEN];
-            rand::rngs::OsRng.fill_bytes(&mut nonce);
+            rand::rng().fill_bytes(&mut nonce);
 
             let mut plaintext = Vec::with_capacity(separate_header.len() + body.len());
             plaintext.extend_from_slice(&separate_header);
@@ -1273,7 +1273,7 @@ impl ReplayWindow {
 
 fn random_nonzero_u64() -> u64 {
     loop {
-        let value = rand::rngs::OsRng.next_u64();
+        let value = rand::rng().next_u64();
         if value != 0 {
             return value;
         }

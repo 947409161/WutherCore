@@ -49,7 +49,7 @@ use chacha20poly1305::ChaCha20Poly1305;
 use hkdf::Hkdf;
 use md5::{Digest, Md5};
 use pin_project_lite::pin_project;
-use rand::RngCore;
+use rand::Rng;
 use sha1::Sha1;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf},
@@ -181,7 +181,7 @@ impl OutboundAdapter for SnellOutbound {
         // 1) salt
         let salt_len = self.cipher.key_len();
         let mut salt = vec![0u8; salt_len];
-        rand::rngs::OsRng.fill_bytes(&mut salt);
+        rand::rng().fill_bytes(&mut salt);
         stream.write_all(&salt).await?;
 
         // 2) 派生 subkey

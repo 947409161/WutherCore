@@ -32,7 +32,7 @@ use async_trait::async_trait;
 use bytes::{Buf, BufMut, BytesMut};
 use chacha20poly1305::ChaCha20Poly1305;
 use pin_project_lite::pin_project;
-use rand::RngCore;
+use rand::Rng;
 use sha2::Sha256;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
@@ -115,7 +115,7 @@ impl OutboundAdapter for MieruOutbound {
 
         // 1) salt + 派生 subkey
         let mut salt = [0u8; SALT_LEN];
-        rand::rngs::OsRng.fill_bytes(&mut salt);
+        rand::rng().fill_bytes(&mut salt);
         let subkey = derive_subkey(&self.password, &salt);
 
         // 2) 写出 salt

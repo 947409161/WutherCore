@@ -448,10 +448,10 @@ impl rustls::client::danger::ServerCertVerifier for InsecureVerifier {
 
 fn random_padding() -> String {
     use base64::Engine;
-    use rand::RngCore;
+    use rand::Rng;
     let len = 8 + (rand::random::<u8>() % 24) as usize;
     let mut buf = vec![0u8; len];
-    rand::rngs::OsRng.fill_bytes(&mut buf);
+    rand::rng().fill_bytes(&mut buf);
     base64::engine::general_purpose::STANDARD.encode(&buf)
 }
 

@@ -26,7 +26,7 @@ once_cell     = { workspace = true }
 serde         = { workspace = true }
 serde_json    = { workspace = true }
 # IP/TCP/UDP 报头解析。复用 smoltcp::wire；不启用 socket 栈以保持轻量。
-smoltcp       = { version = "0.11", default-features = false, features = [
+smoltcp       = { version = "0.13", default-features = false, features = [
     "std",
     "medium-ip",
     "proto-ipv4",
@@ -44,16 +44,15 @@ futures = { workspace = true }
 tun-rs = { version = "2", features = ["async"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
-nix      = { version = "0.29", features = ["net", "socket", "ioctl", "fs", "user"] }
+nix      = { version = "0.31", features = ["net", "socket", "ioctl", "fs", "user"] }
 libc     = "0.2"
 caps     = { workspace = true }
 rtnetlink = { workspace = true }
-netlink-packet-route = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # blake3 用于 wintun adapter 稳定 GUID
 blake3 = { workspace = true }
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
@@ -66,10 +65,10 @@ route_manager = { workspace = true }
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 libc = "0.2"
-nix  = { version = "0.29", features = ["net", "socket", "ioctl"] }
+nix  = { version = "0.31", features = ["net", "socket", "ioctl"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
-jni = "0.21"
+jni = "0.22"
 
 [dev-dependencies]
 boringtun = "=0.7.1"

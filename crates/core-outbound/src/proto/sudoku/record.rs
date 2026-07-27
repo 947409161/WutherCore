@@ -31,10 +31,10 @@ use aes_gcm::{
 };
 use bytes::{Buf, BufMut, BytesMut};
 use chacha20poly1305::ChaCha20Poly1305;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit as HmacKeyInit, Mac};
 use parking_lot::Mutex as PlMutex;
 use pin_project_lite::pin_project;
-use rand::RngCore;
+use rand::Rng;
 use sha2::Sha256;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -137,7 +137,7 @@ impl AeadInst {
 }
 
 fn derive_epoch_key(base: &[u8], epoch: u32, method: &str) -> [u8; 32] {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(base).expect("hmac base");
+    let mut mac = <HmacSha256 as HmacKeyInit>::new_from_slice(base).expect("hmac base");
     Mac::update(&mut mac, b"sudoku-record:");
     Mac::update(&mut mac, method.as_bytes());
     Mac::update(&mut mac, &epoch.to_be_bytes());
@@ -389,13 +389,13 @@ fn random_record_counters() -> (u32, u64) {
     let mut e = 0u32;
     while e == 0 || e == u32::MAX {
         let mut b = [0u8; 4];
-        rand::rngs::OsRng.fill_bytes(&mut b);
+        rand::rng().fill_bytes(&mut b);
         e = u32::from_be_bytes(b);
     }
     let mut s = 0u64;
     while s == 0 || s == u64::MAX {
         let mut b = [0u8; 8];
-        rand::rngs::OsRng.fill_bytes(&mut b);
+        rand::rng().fill_bytes(&mut b);
         s = u64::from_be_bytes(b);
     }
     (e, s)

@@ -185,8 +185,8 @@ impl SystemStack {
     ) -> ProcessOutcome {
         let (src_ip, dst_ip, src_port, dst_port) = {
             let ip = Ipv4Packet::new_unchecked(&packet[..total_len]);
-            let src_ip = Ipv4Addr::from(ip.src_addr().0);
-            let dst_ip = Ipv4Addr::from(ip.dst_addr().0);
+            let src_ip = Ipv4Addr::from(ip.src_addr().octets());
+            let dst_ip = Ipv4Addr::from(ip.dst_addr().octets());
             let tcp = match TcpPacket::new_checked(&packet[header_len..total_len]) {
                 Ok(t) => t,
                 Err(_) => return ProcessOutcome::Drop,
@@ -277,8 +277,8 @@ fn rewrite_ipv4_tcp(
 ) {
     {
         let mut ip = Ipv4Packet::new_unchecked(&mut packet[..total_len]);
-        ip.set_src_addr(Ipv4Address(new_src_ip.octets()));
-        ip.set_dst_addr(Ipv4Address(new_dst_ip.octets()));
+        ip.set_src_addr(Ipv4Address::from(new_src_ip.octets()));
+        ip.set_dst_addr(Ipv4Address::from(new_dst_ip.octets()));
     }
     {
         let tcp_buf = &mut packet[header_len..total_len];
@@ -286,8 +286,8 @@ fn rewrite_ipv4_tcp(
         tcp.set_src_port(new_src_port);
         tcp.set_dst_port(new_dst_port);
         tcp.fill_checksum(
-            &IpAddress::Ipv4(Ipv4Address(new_src_ip.octets())),
-            &IpAddress::Ipv4(Ipv4Address(new_dst_ip.octets())),
+            &IpAddress::Ipv4(Ipv4Address::from(new_src_ip.octets())),
+            &IpAddress::Ipv4(Ipv4Address::from(new_dst_ip.octets())),
         );
     }
     {
@@ -333,8 +333,8 @@ impl SystemStack {
 
         let (src_ip, dst_ip, src_port, dst_port) = {
             let ip = Ipv6Packet::new_unchecked(&packet[..total_len]);
-            let src_ip = Ipv6Addr::from(ip.src_addr().0);
-            let dst_ip = Ipv6Addr::from(ip.dst_addr().0);
+            let src_ip = Ipv6Addr::from(ip.src_addr().octets());
+            let dst_ip = Ipv6Addr::from(ip.dst_addr().octets());
             let tcp = match TcpPacket::new_checked(&packet[header_len..total_len]) {
                 Ok(t) => t,
                 Err(_) => return ProcessOutcome::Drop,
@@ -415,8 +415,8 @@ fn rewrite_ipv6_tcp(
 ) {
     {
         let mut ip = Ipv6Packet::new_unchecked(&mut packet[..total_len]);
-        ip.set_src_addr(Ipv6Address(new_src_ip.octets()));
-        ip.set_dst_addr(Ipv6Address(new_dst_ip.octets()));
+        ip.set_src_addr(Ipv6Address::from(new_src_ip.octets()));
+        ip.set_dst_addr(Ipv6Address::from(new_dst_ip.octets()));
     }
     {
         let tcp_buf = &mut packet[header_len..total_len];
@@ -424,8 +424,8 @@ fn rewrite_ipv6_tcp(
         tcp.set_src_port(new_src_port);
         tcp.set_dst_port(new_dst_port);
         tcp.fill_checksum(
-            &IpAddress::Ipv6(Ipv6Address(new_src_ip.octets())),
-            &IpAddress::Ipv6(Ipv6Address(new_dst_ip.octets())),
+            &IpAddress::Ipv6(Ipv6Address::from(new_src_ip.octets())),
+            &IpAddress::Ipv6(Ipv6Address::from(new_dst_ip.octets())),
         );
     }
 }
@@ -507,7 +507,7 @@ fn process_ipv6_icmp(packet: &mut [u8], total_len: usize, header_len: usize) -> 
         let mut icmp = Icmpv6Packet::new_unchecked(icmp_buf);
         icmp.set_msg_type(Icmpv6Message::EchoReply);
         // ICMPv6 checksum 含 pseudo-header（src/dst = 互换后的）
-        icmp.fill_checksum(&IpAddress::Ipv6(orig_dst), &IpAddress::Ipv6(orig_src));
+        icmp.fill_checksum(&orig_dst, &orig_src);
     }
     // IPv6 主头无 checksum
     ProcessOutcome::WriteBack
@@ -565,6 +565,7 @@ pub fn build_ipv4_tcp_rst(orig_ip_packet: &[u8]) -> Option<Vec<u8>> {
         max_seg_size: None,
         sack_permitted: false,
         sack_ranges: [None, None, None],
+        timestamp: None,
         payload: &[],
     };
     let ip_repr = Ipv4Repr {
@@ -632,6 +633,7 @@ pub fn build_ipv6_tcp_rst(orig_ip_packet: &[u8]) -> Option<Vec<u8>> {
         max_seg_size: None,
         sack_permitted: false,
         sack_ranges: [None, None, None],
+        timestamp: None,
         payload: &[],
     };
     let ip_repr = Ipv6Repr {
@@ -748,7 +750,7 @@ pub fn build_ipv6_icmp_unreachable(orig_ip_packet: &[u8], code: u8, mtu: usize) 
     {
         let icmp_buf = &mut buf[icmp_offset..icmp_offset + icmp_len];
         let mut icmp = Icmpv6Packet::new_unchecked(icmp_buf);
-        icmp.fill_checksum(&IpAddress::Ipv6(src_addr), &IpAddress::Ipv6(dst_addr));
+        icmp.fill_checksum(&src_addr, &dst_addr);
     }
     Some(buf)
 }
@@ -1145,8 +1147,8 @@ mod tests {
         ctrl: TcpControl,
         payload: &[u8],
     ) -> Vec<u8> {
-        let src = Ipv4Address(src_ip.octets());
-        let dst = Ipv4Address(dst_ip.octets());
+        let src = Ipv4Address::from(src_ip.octets());
+        let dst = Ipv4Address::from(dst_ip.octets());
         let tcp = TcpRepr {
             src_port,
             dst_port,
@@ -1158,6 +1160,7 @@ mod tests {
             max_seg_size: None,
             sack_permitted: false,
             sack_ranges: [None, None, None],
+            timestamp: None,
             payload,
         };
         let ip = Ipv4Repr {
@@ -1185,8 +1188,8 @@ mod tests {
 
     fn parse_v4_tcp(packet: &[u8]) -> (Ipv4Addr, u16, Ipv4Addr, u16) {
         let ip = Ipv4Packet::new_checked(packet).expect("ip");
-        let src_ip = Ipv4Addr::from(ip.src_addr().0);
-        let dst_ip = Ipv4Addr::from(ip.dst_addr().0);
+        let src_ip = Ipv4Addr::from(ip.src_addr().octets());
+        let dst_ip = Ipv4Addr::from(ip.dst_addr().octets());
         let header_len = ip.header_len() as usize;
         let total_len = ip.total_len() as usize;
         let tcp = TcpPacket::new_checked(&packet[header_len..total_len]).expect("tcp");
@@ -1398,8 +1401,8 @@ mod tests {
         ctrl: TcpControl,
         payload: &[u8],
     ) -> Vec<u8> {
-        let src = Ipv6Address(src_ip.octets());
-        let dst = Ipv6Address(dst_ip.octets());
+        let src = Ipv6Address::from(src_ip.octets());
+        let dst = Ipv6Address::from(dst_ip.octets());
         let tcp = TcpRepr {
             src_port,
             dst_port,
@@ -1411,6 +1414,7 @@ mod tests {
             max_seg_size: None,
             sack_permitted: false,
             sack_ranges: [None, None, None],
+            timestamp: None,
             payload,
         };
         let ip = Ipv6Repr {
@@ -1436,8 +1440,8 @@ mod tests {
 
     fn parse_v6_tcp(packet: &[u8]) -> (Ipv6Addr, u16, Ipv6Addr, u16) {
         let ip = Ipv6Packet::new_checked(packet).expect("ip6");
-        let src_ip = Ipv6Addr::from(ip.src_addr().0);
-        let dst_ip = Ipv6Addr::from(ip.dst_addr().0);
+        let src_ip = Ipv6Addr::from(ip.src_addr().octets());
+        let dst_ip = Ipv6Addr::from(ip.dst_addr().octets());
         let header_len = ip.header_len();
         let total_len = header_len + ip.payload_len() as usize;
         let tcp = TcpPacket::new_checked(&packet[header_len..total_len]).expect("tcp6");
@@ -1569,8 +1573,8 @@ mod tests {
         // 自己组装 ICMPv4 Echo Request
         let icmp_len = 8 + payload.len();
         let ip_repr = Ipv4Repr {
-            src_addr: Ipv4Address(src_ip.octets()),
-            dst_addr: Ipv4Address(dst_ip.octets()),
+            src_addr: Ipv4Address::from(src_ip.octets()),
+            dst_addr: Ipv4Address::from(dst_ip.octets()),
             next_header: IpProtocol::Icmp,
             payload_len: icmp_len,
             hop_limit: 64,
@@ -1610,8 +1614,8 @@ mod tests {
         assert_eq!(outcome, ProcessOutcome::WriteBack);
 
         let ip = Ipv4Packet::new_checked(&pkt).unwrap();
-        assert_eq!(ip.src_addr().0, dst_ip.octets());
-        assert_eq!(ip.dst_addr().0, src_ip.octets());
+        assert_eq!(ip.src_addr().octets(), dst_ip.octets());
+        assert_eq!(ip.dst_addr().octets(), src_ip.octets());
         assert!(ip.verify_checksum(), "IPv4 csum invalid");
         let header_len = ip.header_len() as usize;
         let total_len = ip.total_len() as usize;
@@ -1632,8 +1636,8 @@ mod tests {
     ) -> Vec<u8> {
         let icmp_len = 8 + payload.len();
         let ip_repr = Ipv6Repr {
-            src_addr: Ipv6Address(src_ip.octets()),
-            dst_addr: Ipv6Address(dst_ip.octets()),
+            src_addr: Ipv6Address::from(src_ip.octets()),
+            dst_addr: Ipv6Address::from(dst_ip.octets()),
             next_header: IpProtocol::Icmpv6,
             payload_len: icmp_len,
             hop_limit: 64,
@@ -1652,10 +1656,7 @@ mod tests {
         {
             let icmp_buf = &mut buf[icmp_offset..icmp_offset + icmp_len];
             let mut icmp = Icmpv6Packet::new_unchecked(icmp_buf);
-            icmp.fill_checksum(
-                &IpAddress::Ipv6(Ipv6Address(src_ip.octets())),
-                &IpAddress::Ipv6(Ipv6Address(dst_ip.octets())),
-            );
+            icmp.fill_checksum(&src_ip, &dst_ip);
         }
         buf
     }
@@ -1679,17 +1680,14 @@ mod tests {
         assert_eq!(outcome, ProcessOutcome::WriteBack);
 
         let ip = Ipv6Packet::new_checked(&pkt).unwrap();
-        assert_eq!(Ipv6Addr::from(ip.src_addr().0), dst_ip);
-        assert_eq!(Ipv6Addr::from(ip.dst_addr().0), src_ip);
+        assert_eq!(Ipv6Addr::from(ip.src_addr().octets()), dst_ip);
+        assert_eq!(Ipv6Addr::from(ip.dst_addr().octets()), src_ip);
         let header_len = ip.header_len();
         let total_len = header_len + ip.payload_len() as usize;
         let icmp = Icmpv6Packet::new_checked(&pkt[header_len..total_len]).unwrap();
         assert_eq!(icmp.msg_type(), Icmpv6Message::EchoReply);
         assert!(
-            icmp.verify_checksum(
-                &IpAddress::Ipv6(ip.src_addr()),
-                &IpAddress::Ipv6(ip.dst_addr())
-            ),
+            icmp.verify_checksum(&ip.src_addr(), &ip.dst_addr()),
             "ICMPv6 csum invalid"
         );
         assert_eq!(&pkt[header_len + 8..total_len], payload);
@@ -1707,8 +1705,8 @@ mod tests {
         );
         let rst = build_ipv4_tcp_rst(&pkt).expect("rst");
         let ip = Ipv4Packet::new_checked(&rst).unwrap();
-        assert_eq!(ip.src_addr().0, [1, 1, 1, 1]);
-        assert_eq!(ip.dst_addr().0, [10, 0, 0, 1]);
+        assert_eq!(ip.src_addr().octets(), [1, 1, 1, 1]);
+        assert_eq!(ip.dst_addr().octets(), [10, 0, 0, 1]);
         assert!(ip.verify_checksum());
         let header_len = ip.header_len() as usize;
         let total_len = ip.total_len() as usize;
@@ -1734,11 +1732,11 @@ mod tests {
         let rst = build_ipv6_tcp_rst(&pkt).expect("rst v6");
         let ip = Ipv6Packet::new_checked(&rst).unwrap();
         assert_eq!(
-            Ipv6Addr::from(ip.src_addr().0),
+            Ipv6Addr::from(ip.src_addr().octets()),
             "2606:4700::1".parse::<Ipv6Addr>().unwrap()
         );
         assert_eq!(
-            Ipv6Addr::from(ip.dst_addr().0),
+            Ipv6Addr::from(ip.dst_addr().octets()),
             "2001:db8::1".parse::<Ipv6Addr>().unwrap()
         );
         let header_len = ip.header_len();
@@ -1764,8 +1762,8 @@ mod tests {
         let reply =
             build_ipv4_icmp_unreachable(&pkt, 3 /* PortUnreachable */, 1500).expect("unreachable");
         let ip = Ipv4Packet::new_checked(&reply).unwrap();
-        assert_eq!(ip.src_addr().0, [1, 1, 1, 1]);
-        assert_eq!(ip.dst_addr().0, [10, 0, 0, 1]);
+        assert_eq!(ip.src_addr().octets(), [1, 1, 1, 1]);
+        assert_eq!(ip.dst_addr().octets(), [10, 0, 0, 1]);
         assert!(ip.verify_checksum());
         let header_len = ip.header_len() as usize;
         let total_len = ip.total_len() as usize;
@@ -1789,11 +1787,11 @@ mod tests {
             .expect("unreachable v6");
         let ip = Ipv6Packet::new_checked(&reply).unwrap();
         assert_eq!(
-            Ipv6Addr::from(ip.src_addr().0),
+            Ipv6Addr::from(ip.src_addr().octets()),
             "2606:4700::1".parse::<Ipv6Addr>().unwrap()
         );
         assert_eq!(
-            Ipv6Addr::from(ip.dst_addr().0),
+            Ipv6Addr::from(ip.dst_addr().octets()),
             "2001:db8::1".parse::<Ipv6Addr>().unwrap()
         );
         let header_len = ip.header_len();
@@ -1802,10 +1800,7 @@ mod tests {
         assert_eq!(u8::from(icmp.msg_type()), 1);
         assert_eq!(icmp.msg_code(), 4);
         assert!(
-            icmp.verify_checksum(
-                &IpAddress::Ipv6(ip.src_addr()),
-                &IpAddress::Ipv6(ip.dst_addr())
-            ),
+            icmp.verify_checksum(&ip.src_addr(), &ip.dst_addr()),
             "ICMPv6 unreachable csum invalid"
         );
     }

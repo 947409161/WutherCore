@@ -8,12 +8,12 @@ use std::{
 
 use aes::{
     Aes128,
-    cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray},
+    cipher::{Array, BlockCipherEncrypt, KeyInit},
 };
 use core_config::XmcMaskConfig;
 use num_bigint_dig::prime::probably_prime;
 use parking_lot::Mutex;
-use rand::{Rng, RngCore, rngs::OsRng};
+use rand::{Rng, RngExt};
 use rsa::{
     BigUint, Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey,
     pkcs8::{EncodePublicKey, spki::Document},
@@ -118,7 +118,7 @@ async fn handshake(
     write_packet(stream, 0, &fields).await?;
 
     let username = usernames
-        .get(rand::thread_rng().gen_range(0..usernames.len()))
+        .get(rand::rng().random_range(0..usernames.len()))
         .ok_or_else(|| invalid("xmc usernames must not be empty"))?;
     let mut login = Vec::new();
     put_string(&mut login, username)?;
@@ -143,15 +143,15 @@ async fn handshake(
     }
 
     let mut secret = [0u8; 16];
-    OsRng.fill_bytes(&mut secret);
+    rand::rng().fill_bytes(&mut secret);
     let encrypted_secret = key
         .public
-        .encrypt(&mut OsRng, Pkcs1v15Encrypt, &secret)
+        .encrypt(&mut rsa::rand_core::OsRng, Pkcs1v15Encrypt, &secret)
         .map_err(other)?;
     verify_token.extend_from_slice(password.as_bytes());
     let encrypted_token = key
         .public
-        .encrypt(&mut OsRng, Pkcs1v15Encrypt, &verify_token)
+        .encrypt(&mut rsa::rand_core::OsRng, Pkcs1v15Encrypt, &verify_token)
         .map_err(other)?;
     let mut response = Vec::new();
     put_bytes(&mut response, &encrypted_secret)?;
@@ -225,7 +225,7 @@ async fn server_login(
     std::io::Read::read_exact(&mut cursor, &mut uuid)?;
 
     let mut verify_token = [0u8; 4];
-    OsRng.fill_bytes(&mut verify_token);
+    rand::rng().fill_bytes(&mut verify_token);
     let mut request = Vec::new();
     put_string(&mut request, "")?;
     put_bytes(&mut request, &key.der)?;
@@ -326,7 +326,7 @@ struct Cfb8 {
 impl Cfb8 {
     fn new(secret: [u8; 16], decrypt: bool) -> Self {
         Self {
-            cipher: Aes128::new(GenericArray::from_slice(&secret)),
+            cipher: Aes128::new(&Array::from(secret)),
             iv: secret,
             decrypt,
         }
@@ -335,7 +335,7 @@ impl Cfb8 {
     fn apply(&mut self, bytes: &mut [u8]) {
         for byte in bytes {
             let ciphertext = *byte;
-            let mut block = GenericArray::clone_from_slice(&self.iv);
+            let mut block = Array::from(self.iv);
             self.cipher.encrypt_block(&mut block);
             *byte ^= block[0];
             self.iv.copy_within(1.., 0);
@@ -391,7 +391,8 @@ fn derive_prime(seed: &[u8]) -> BigUint {
 }
 
 fn acceptable_prime(value: &BigUint) -> bool {
-    probably_prime(value, 20)
+    let candidate = num_bigint_dig::BigUint::from_bytes_be(&value.to_bytes_be());
+    probably_prime(&candidate, 20)
         && ((value - BigUint::from(1u8)) % BigUint::from(65537u32)) != BigUint::from(0u8)
 }
 

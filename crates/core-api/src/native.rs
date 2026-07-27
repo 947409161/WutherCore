@@ -61,9 +61,9 @@ pub fn router(state: NativeState) -> Router {
         .route("/traffic", get(traffic))
         .route("/nodes", get(nodes))
         .route("/groups", get(groups))
-        .route("/groups/:name", patch(patch_group))
+        .route("/groups/{name}", patch(patch_group))
         .route("/connections", get(list_conns))
-        .route("/connections/:id", delete(close_conn))
+        .route("/connections/{id}", delete(close_conn))
         .route("/resolver/query", get(resolver_query))
         .route("/route/check", get(route_check))
         .route("/capture/state", get(capture_state))
@@ -73,7 +73,7 @@ pub fn router(state: NativeState) -> Router {
         .route("/smart/avoid", post(smart_avoid))
         .route("/smart/reset", post(smart_reset))
         .route("/smart/cache", get(smart_cache))
-        .route("/smart/nodes/:group", get(smart_nodes))
+        .route("/smart/nodes/{group}", get(smart_nodes))
         .with_state(state)
 }
 

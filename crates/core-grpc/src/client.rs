@@ -18,7 +18,8 @@ use hyper::{
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::oneshot;
-use tonic::{Request as GrpcRequest, body::Body, client::Grpc, codec::ProstCodec};
+use tonic::{Request as GrpcRequest, body::Body, client::Grpc};
+use tonic_prost::ProstCodec;
 use tower::Service;
 
 use crate::{
@@ -350,9 +351,9 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tonic::{
         Request as GrpcRequest, Response as GrpcResponse, Status, Streaming,
-        codec::ProstCodec,
         server::{Grpc, StreamingService},
     };
+    use tonic_prost::ProstCodec;
 
     use super::*;
     use crate::proto::Hunk;

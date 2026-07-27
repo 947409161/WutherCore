@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rand::Rng;
+use rand::RngExt;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 /// 每个新 XMUX connection entry 都要重新采样的 Xray `[from, to)` 区间。
@@ -37,7 +37,7 @@ impl XmuxSampleRange {
         if self.min == self.max {
             self.min
         } else {
-            rand::thread_rng().gen_range(self.min..self.max)
+            rand::rng().random_range(self.min..self.max)
         }
     }
 }
@@ -243,8 +243,7 @@ impl<C: ManagedConnection> XmuxManager<C> {
                 .cloned()
                 .collect::<Vec<_>>();
             if !candidates.is_empty() {
-                let selected =
-                    candidates[rand::thread_rng().gen_range(0..candidates.len())].clone();
+                let selected = candidates[rand::rng().random_range(0..candidates.len())].clone();
                 decrement_if_positive(&selected.left_usage);
                 selected.running.fetch_add(1, Ordering::AcqRel);
                 return Ok(XmuxLease {

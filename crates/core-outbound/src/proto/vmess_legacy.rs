@@ -19,13 +19,13 @@
 
 use std::sync::Arc;
 
-use aes::cipher::{AsyncStreamCipher, KeyIvInit};
+use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
 use async_trait::async_trait;
 use bytes::BufMut;
 use cfb_mode::{Decryptor as CfbDec, Encryptor as CfbEnc};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit as HmacKeyInit, Mac};
 use md5::{Digest, Md5};
-use rand::RngCore;
+use rand::Rng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
@@ -143,9 +143,9 @@ impl OutboundAdapter for VmessLegacyOutbound {
         let mut iv = [0u8; 16];
         let mut req_key = [0u8; 16];
         let mut resp_auth = [0u8; 1];
-        rand::rngs::OsRng.fill_bytes(&mut iv);
-        rand::rngs::OsRng.fill_bytes(&mut req_key);
-        rand::rngs::OsRng.fill_bytes(&mut resp_auth);
+        rand::rng().fill_bytes(&mut iv);
+        rand::rng().fill_bytes(&mut req_key);
+        rand::rng().fill_bytes(&mut resp_auth);
 
         let cmd = if ctx.network == "udp" { 0x02 } else { 0x01 };
         let mut header_payload = build_legacy_header_payload(

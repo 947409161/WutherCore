@@ -25,7 +25,7 @@ use http_body_util::BodyExt;
 use hyper::body::{Body as HyperBody, Frame, Incoming, SizeHint};
 use hyper_util::rt::TokioTimer;
 use parking_lot::Mutex;
-use rand::Rng;
+use rand::RngExt;
 use tokio::{
     io::{AsyncWrite, ReadBuf},
     sync::{Notify, OnceCell, mpsc},
@@ -1891,9 +1891,9 @@ fn generate_session_id(cfg: &Config) -> io::Result<String> {
         ));
     }
     let bytes = table.as_bytes();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     Ok((0..length)
-        .map(|_| bytes[rng.gen_range(0..bytes.len())] as char)
+        .map(|_| bytes[rng.random_range(0..bytes.len())] as char)
         .collect())
 }
 

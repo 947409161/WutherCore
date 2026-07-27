@@ -405,8 +405,10 @@ mod tests {
 
     #[test]
     fn tls_uses_the_shared_acceptor_and_requires_h2() {
-        let rcgen::CertifiedKey { cert, key_pair } =
-            rcgen::generate_simple_self_signed(vec!["grpc.example".into()]).unwrap();
+        let rcgen::CertifiedKey {
+            cert,
+            signing_key: key_pair,
+        } = rcgen::generate_simple_self_signed(vec!["grpc.example".into()]).unwrap();
         let certificate = XhttpDownloadTlsCertificate {
             certificate: Some(cert.pem().lines().map(str::to_owned).collect()),
             key: Some(

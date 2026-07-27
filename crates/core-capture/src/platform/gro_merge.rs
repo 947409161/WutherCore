@@ -634,8 +634,8 @@ mod tests {
         flags_fin: bool,
         payload: &[u8],
     ) -> Vec<u8> {
-        let src = Ipv4Address([10, 0, 0, 1]);
-        let dst = Ipv4Address([1, 1, 1, 1]);
+        let src = Ipv4Address::from([10, 0, 0, 1]);
+        let dst = Ipv4Address::from([1, 1, 1, 1]);
         let control = if flags_fin {
             TcpControl::Fin
         } else if flags_psh {
@@ -654,6 +654,7 @@ mod tests {
             max_seg_size: None,
             sack_permitted: false,
             sack_ranges: [None, None, None],
+            timestamp: None,
             payload,
         };
         let ip = Ipv4Repr {
@@ -678,8 +679,8 @@ mod tests {
     }
 
     fn build_v6_tcp(seq: u32, ack: u32, payload: &[u8]) -> Vec<u8> {
-        let src = Ipv6Address(Ipv6Addr::new(0xfd, 0, 0, 0, 0, 0, 0, 1).octets());
-        let dst = Ipv6Address(Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 0x1111).octets());
+        let src = Ipv6Address::from(Ipv6Addr::new(0xfd, 0, 0, 0, 0, 0, 0, 1).octets());
+        let dst = Ipv6Address::from(Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 0x1111).octets());
         let tcp = TcpRepr {
             src_port: 30000,
             dst_port: 443,
@@ -691,6 +692,7 @@ mod tests {
             max_seg_size: None,
             sack_permitted: false,
             sack_ranges: [None, None, None],
+            timestamp: None,
             payload,
         };
         let ip = Ipv6Repr {
@@ -957,8 +959,8 @@ mod tests {
     ========================================================= */
 
     fn build_v4_udp(src_port: u16, dst_port: u16, payload: &[u8]) -> Vec<u8> {
-        let src = Ipv4Address([10, 0, 0, 1]);
-        let dst = Ipv4Address([1, 1, 1, 1]);
+        let src = Ipv4Address::from([10, 0, 0, 1]);
+        let dst = Ipv4Address::from([1, 1, 1, 1]);
         let udp = UdpRepr { src_port, dst_port };
         let udp_buf_len = UDP_HEADER_LEN + payload.len();
         let ip = Ipv4Repr {
@@ -984,8 +986,8 @@ mod tests {
     }
 
     fn build_v6_udp(src_port: u16, dst_port: u16, payload: &[u8]) -> Vec<u8> {
-        let src = Ipv6Address(Ipv6Addr::new(0xfd, 0, 0, 0, 0, 0, 0, 1).octets());
-        let dst = Ipv6Address(Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 0x1111).octets());
+        let src = Ipv6Address::from(Ipv6Addr::new(0xfd, 0, 0, 0, 0, 0, 0, 1).octets());
+        let dst = Ipv6Address::from(Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 0x1111).octets());
         let udp_buf_len = UDP_HEADER_LEN + payload.len();
         let ip = Ipv6Repr {
             src_addr: src,

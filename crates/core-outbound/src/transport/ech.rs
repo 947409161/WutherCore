@@ -16,7 +16,7 @@ use bytes::Bytes;
 use http::{Method, Request, header};
 use http_body_util::{BodyExt, Full};
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use rand::Rng;
+use rand::RngExt;
 use tokio::sync::Mutex;
 use url::Url;
 
@@ -167,7 +167,7 @@ fn canonical_domain(domain: &str) -> io::Result<String> {
 async fn query_endpoint(endpoint: &str, domain: &str) -> io::Result<(Vec<u8>, Duration)> {
     let endpoint =
         Url::parse(endpoint).map_err(|error| invalid(format!("invalid ECH DNS URL: {error}")))?;
-    let id = rand::thread_rng().r#gen::<u16>();
+    let id = rand::rng().random::<u16>();
     let query = build_query(id, domain)?;
     let response = match endpoint.scheme() {
         "udp" => query_udp(&endpoint, &query).await?,

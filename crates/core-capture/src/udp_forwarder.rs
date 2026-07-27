@@ -140,8 +140,8 @@ fn build_v4(
     dst_port: u16,
     payload: &[u8],
 ) -> Vec<u8> {
-    let src_addr = Ipv4Address(src.octets());
-    let dst_addr = Ipv4Address(dst.octets());
+    let src_addr = Ipv4Address::from(src.octets());
+    let dst_addr = Ipv4Address::from(dst.octets());
     let udp_repr = UdpRepr { src_port, dst_port };
     let ip_repr = Ipv4Repr {
         src_addr,
@@ -174,8 +174,8 @@ fn build_v6(
     dst_port: u16,
     payload: &[u8],
 ) -> Vec<u8> {
-    let src_addr = Ipv6Address(src.octets());
-    let dst_addr = Ipv6Address(dst.octets());
+    let src_addr = Ipv6Address::from(src.octets());
+    let dst_addr = Ipv6Address::from(dst.octets());
     let udp_repr = UdpRepr { src_port, dst_port };
     let ip_repr = Ipv6Repr {
         src_addr,

@@ -6,8 +6,8 @@ use std::{
 
 use async_trait::async_trait;
 use core_config::{AddressPortStrategy, DomainStrategy, HappyEyeballsConfig, OutboundSocketConfig};
-use hickory_resolver::TokioAsyncResolver;
-use rand::Rng;
+use hickory_resolver::{TokioResolver, proto::rr::RData};
+use rand::RngExt;
 use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
 use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
@@ -95,7 +95,7 @@ pub(crate) async fn connect_boxed(
             .is_some_and(|cfg| cfg.domain_strategy.use_ip())
         && host.parse::<IpAddr>().is_err()
     {
-        let selected = rand::thread_rng().gen_range(0..addrs.len());
+        let selected = rand::rng().random_range(0..addrs.len());
         addrs = vec![addrs[selected]];
     }
     let stream = if let Some(cfg) = socket_cfg.as_ref()
@@ -131,7 +131,7 @@ async fn resolve_one_for_strategy(
         return Ok((host.to_string(), port));
     }
     let addrs = resolve_candidates(host, port, for_direct, Some(cfg)).await?;
-    let selected = rand::thread_rng().gen_range(0..addrs.len());
+    let selected = rand::rng().random_range(0..addrs.len());
     let selected = addrs[selected];
     Ok((selected.ip().to_string(), selected.port()))
 }
@@ -263,7 +263,7 @@ async fn rewrite_address_port(
     if strategy == AddressPortStrategy::None || host.parse::<IpAddr>().is_ok() {
         return (host.to_string(), port);
     }
-    let resolver = match TokioAsyncResolver::tokio_from_system_conf() {
+    let resolver = match TokioResolver::builder_tokio().and_then(|builder| builder.build()) {
         Ok(resolver) => resolver,
         Err(error) => {
             warn!(%error, "addressPortStrategy resolver initialization failed; keeping original target");
@@ -276,11 +276,14 @@ async fn rewrite_address_port(
         | AddressPortStrategy::SrvPortAndAddress => {
             let lookup = resolver.srv_lookup(host).await;
             lookup.map(|records| {
-                records.iter().next().map(|record| {
-                    (
-                        record.target().to_utf8().trim_end_matches('.').to_string(),
-                        record.port(),
-                    )
+                records.answers().iter().find_map(|record| {
+                    let RData::SRV(record) = &record.data else {
+                        return None;
+                    };
+                    Some((
+                        record.target.to_utf8().trim_end_matches('.').to_string(),
+                        record.port,
+                    ))
                 })
             })
         }
@@ -288,9 +291,12 @@ async fn rewrite_address_port(
         | AddressPortStrategy::TxtAddressOnly
         | AddressPortStrategy::TxtPortAndAddress => {
             resolver.txt_lookup(host).await.map(|records| {
-                records.iter().find_map(|record| {
+                records.answers().iter().find_map(|record| {
+                    let RData::TXT(record) = &record.data else {
+                        return None;
+                    };
                     let value = record
-                        .txt_data()
+                        .txt_data
                         .iter()
                         .flat_map(|part| part.iter().copied())
                         .collect::<Vec<_>>();

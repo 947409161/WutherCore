@@ -19,7 +19,7 @@ use futures::{StreamExt, stream};
 use hickory_resolver::proto::rr::{Record, RecordType};
 use parking_lot::Mutex;
 use rand::{
-    distributions::{Distribution, WeightedIndex},
+    distr::{Distribution, weighted::WeightedIndex},
     seq::SliceRandom,
 };
 use tokio::time::timeout;
@@ -252,13 +252,13 @@ impl DnsGroup {
                 let start = self.state.cursor.fetch_add(1, Ordering::Relaxed) as usize % len;
                 indices.rotate_left(start);
             }
-            GroupStrategy::Random => indices.shuffle(&mut rand::thread_rng()),
+            GroupStrategy::Random => indices.shuffle(&mut rand::rng()),
             GroupStrategy::Adaptive
             | GroupStrategy::Parallel
             | GroupStrategy::Fastest
             | GroupStrategy::All => {
                 let weights = self.selection_weights();
-                let mut rng = rand::thread_rng();
+                let mut rng = rand::rng();
                 let mut remaining = indices;
                 indices = Vec::with_capacity(len);
                 let mut remaining_weights = weights;

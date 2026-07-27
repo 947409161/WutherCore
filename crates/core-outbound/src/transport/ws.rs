@@ -120,7 +120,7 @@ where
                     return Poll::Ready(Ok(()));
                 }
                 Poll::Ready(Some(Ok(Message::Text(t)))) => {
-                    let bytes = t.into_bytes();
+                    let bytes = t.as_bytes().to_vec();
                     let n = std::cmp::min(buf.remaining(), bytes.len());
                     buf.put_slice(&bytes[..n]);
                     if bytes.len() > n {
@@ -156,7 +156,7 @@ where
             Poll::Ready(Err(e)) => return Poll::Ready(Err(io_other(e))),
             Poll::Ready(Ok(())) => {}
         }
-        let msg = Message::Binary(data.to_vec());
+        let msg = Message::Binary(data.to_vec().into());
         match this.inner.as_mut().start_send(msg) {
             Ok(()) => Poll::Ready(Ok(data.len())),
             Err(e) => Poll::Ready(Err(io_other(e))),

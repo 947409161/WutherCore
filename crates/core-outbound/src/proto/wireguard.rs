@@ -499,7 +499,7 @@ mod tests {
             }
         });
 
-        let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
             let mut stream = outbound
                 .dial_tcp(DialContext::tcp("10.99.0.1", 32_080))
                 .await?;

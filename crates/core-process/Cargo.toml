@@ -11,7 +11,7 @@ serde         = { workspace = true }
 once_cell     = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",
     "Win32_Networking_WinSock",
@@ -25,7 +25,7 @@ libc = "0.2"
 [target.'cfg(target_os = "android")'.dependencies]
 # JNI 桥 —— 调 ConnectivityManager.getConnectionOwnerUid 反查跨 UID 连接。
 # 与 core-capture 的 android_jni 同版本，避免 JavaVM 类型不一致。
-jni = "0.21"
+jni = "0.22"
 parking_lot = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]

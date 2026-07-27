@@ -78,8 +78,8 @@ pub struct VirtualTxToken<'a> {
 }
 
 impl RxToken for VirtualRxToken {
-    fn consume<R, F: FnOnce(&mut [u8]) -> R>(mut self, f: F) -> R {
-        f(&mut self.buf)
+    fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
+        f(&self.buf)
     }
 }
 impl<'a> TxToken for VirtualTxToken<'a> {
@@ -199,7 +199,10 @@ impl UserSpaceStack {
 
     pub fn poll(&mut self) -> bool {
         let now = SmolInstant::from_millis(now_millis());
-        self.iface.poll(now, &mut self.device, &mut self.sockets)
+        matches!(
+            self.iface.poll(now, &mut self.device, &mut self.sockets),
+            smoltcp::iface::PollResult::SocketStateChanged
+        )
     }
     pub fn drain_outbound(&mut self) -> Vec<Vec<u8>> {
         self.device.drain_outbound().collect()
@@ -277,14 +280,8 @@ impl UserSpaceStack {
 fn endpoint_to_addr(ep: smoltcp::wire::IpEndpoint) -> Option<std::net::SocketAddr> {
     let port = ep.port;
     match ep.addr {
-        IpAddress::Ipv4(v4) => Some(std::net::SocketAddr::new(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::from(v4.0)),
-            port,
-        )),
-        IpAddress::Ipv6(v6) => Some(std::net::SocketAddr::new(
-            std::net::IpAddr::V6(std::net::Ipv6Addr::from(v6.0)),
-            port,
-        )),
+        IpAddress::Ipv4(v4) => Some(std::net::SocketAddr::new(std::net::IpAddr::V4(v4), port)),
+        IpAddress::Ipv6(v6) => Some(std::net::SocketAddr::new(std::net::IpAddr::V6(v6), port)),
     }
 }
 

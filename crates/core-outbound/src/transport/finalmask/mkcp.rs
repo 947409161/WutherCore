@@ -9,7 +9,7 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
 };
 use core_config::MkcpLegacyMaskConfig;
-use rand::{RngCore, rngs::OsRng};
+use rand::Rng;
 use sha2::{Digest, Sha256};
 
 const AES_NONCE_SIZE: usize = 12;
@@ -92,7 +92,7 @@ impl MkcpCodec {
             Mode::Original => encode_original(payload),
             Mode::Aes128Gcm(cipher) => {
                 let mut nonce = [0u8; AES_NONCE_SIZE];
-                OsRng.fill_bytes(&mut nonce);
+                rand::rng().fill_bytes(&mut nonce);
                 let encrypted = cipher
                     .encrypt(Nonce::from_slice(&nonce), payload)
                     .map_err(other)?;

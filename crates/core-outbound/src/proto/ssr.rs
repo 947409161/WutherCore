@@ -39,15 +39,12 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::{Buf, BufMut, BytesMut};
-use cfb_mode::{
-    Decryptor as CfbDec, Encryptor as CfbEnc,
-    cipher::{AsyncStreamCipher, KeyIvInit},
-};
+use cfb_mode::{BufDecryptor as CfbDec, BufEncryptor as CfbEnc, cipher::KeyIvInit};
 use ctr::cipher::StreamCipher as CtrStreamCipher;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit as HmacKeyInit, Mac};
 use md5::{Digest, Md5};
 use pin_project_lite::pin_project;
-use rand::RngCore;
+use rand::Rng;
 use sha1::Sha1;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
@@ -212,7 +209,7 @@ impl OutboundAdapter for SsrOutbound {
         // 1) 生成 IV
         let iv_len = self.cipher.iv_len();
         let mut iv = vec![0u8; iv_len];
-        rand::rngs::OsRng.fill_bytes(&mut iv);
+        rand::rng().fill_bytes(&mut iv);
 
         // 2) 计算 obfs 前导（HTTP/TLS 模拟） + IV 透传
         let obfs_prefix = build_obfs_prefix(&self.obfs, &iv);
@@ -266,7 +263,7 @@ fn build_obfs_prefix(obfs: &SsrObfs, _iv: &[u8]) -> Vec<u8> {
             req.extend_from_slice(b"GET /");
             // 随机 path：8 字节 hex
             let mut rand_path = [0u8; 8];
-            rand::rngs::OsRng.fill_bytes(&mut rand_path);
+            rand::rng().fill_bytes(&mut rand_path);
             for b in rand_path {
                 req.extend_from_slice(format!("{b:02x}").as_bytes());
             }
@@ -290,12 +287,12 @@ fn build_obfs_prefix(obfs: &SsrObfs, _iv: &[u8]) -> Vec<u8> {
             let now = chrono::Utc::now().timestamp() as u32;
             hello.extend_from_slice(&now.to_be_bytes());
             let mut rand28 = [0u8; 28];
-            rand::rngs::OsRng.fill_bytes(&mut rand28);
+            rand::rng().fill_bytes(&mut rand28);
             hello.extend_from_slice(&rand28);
             // SessionID 长度 32 + 32B 随机
             hello.push(32);
             let mut sid = [0u8; 32];
-            rand::rngs::OsRng.fill_bytes(&mut sid);
+            rand::rng().fill_bytes(&mut sid);
             hello.extend_from_slice(&sid);
             // CipherSuites 长度 2 + 1 个 cipher
             hello.extend_from_slice(&[0x00, 0x02, 0xc0, 0x2f]);
@@ -349,7 +346,7 @@ fn wrap_protocol(
             auth.put_u32(now);
             // client_id 4B + connection_id 4B（随机）
             let mut cid = [0u8; 8];
-            rand::rngs::OsRng.fill_bytes(&mut cid);
+            rand::rng().fill_bytes(&mut cid);
             auth.extend_from_slice(&cid);
             // 计算 HMAC-MD5 over (key||iv) 与 payload
             let mut mac_key = key.to_vec();
@@ -383,7 +380,7 @@ fn wrap_protocol(
             let mut auth = Vec::with_capacity(12);
             auth.put_u32(now);
             let mut rand8 = [0u8; 8];
-            rand::rngs::OsRng.fill_bytes(&mut rand8);
+            rand::rng().fill_bytes(&mut rand8);
             auth.extend_from_slice(&rand8);
             let mut mac_key = key.to_vec();
             mac_key.extend_from_slice(iv);
@@ -408,7 +405,7 @@ enum StreamCipherInst {
     Aes128Ctr(ctr::Ctr128BE<aes::Aes128>, ctr::Ctr128BE<aes::Aes128>),
     Aes256Ctr(ctr::Ctr128BE<aes::Aes256>, ctr::Ctr128BE<aes::Aes256>),
     Chacha20(chacha20::ChaCha20, chacha20::ChaCha20),
-    Rc4Md5(rc4::Rc4<rc4::consts::U16>, rc4::Rc4<rc4::consts::U16>),
+    Rc4Md5(rc4::Rc4, rc4::Rc4),
     None,
 }
 
@@ -449,8 +446,8 @@ impl StreamCipherInst {
                 h.update(key);
                 h.update(iv);
                 let rc4_key = h.finalize();
-                let e = rc4::Rc4::<rc4::consts::U16>::new(&rc4_key);
-                let d = rc4::Rc4::<rc4::consts::U16>::new(&rc4_key);
+                let e = rc4::Rc4::new_from_slice(&rc4_key).expect("rc4 key");
+                let d = rc4::Rc4::new_from_slice(&rc4_key).expect("rc4 key");
                 Self::Rc4Md5(e, d)
             }
             SsrCipher::None => Self::None,
@@ -459,14 +456,8 @@ impl StreamCipherInst {
 
     fn encrypt_in_place(&mut self, data: &mut [u8]) {
         match self {
-            Self::Aes128Cfb(e, _) => {
-                let cloned = e.clone();
-                cloned.encrypt(data);
-            }
-            Self::Aes256Cfb(e, _) => {
-                let cloned = e.clone();
-                cloned.encrypt(data);
-            }
+            Self::Aes128Cfb(e, _) => e.encrypt(data),
+            Self::Aes256Cfb(e, _) => e.encrypt(data),
             Self::Aes128Ctr(e, _) => e.apply_keystream(data),
             Self::Aes256Ctr(e, _) => e.apply_keystream(data),
             Self::Chacha20(e, _) => {
@@ -483,14 +474,8 @@ impl StreamCipherInst {
 
     fn decrypt_in_place(&mut self, data: &mut [u8]) {
         match self {
-            Self::Aes128Cfb(_, d) => {
-                let cloned = d.clone();
-                cloned.decrypt(data);
-            }
-            Self::Aes256Cfb(_, d) => {
-                let cloned = d.clone();
-                cloned.decrypt(data);
-            }
+            Self::Aes128Cfb(_, d) => d.decrypt(data),
+            Self::Aes256Cfb(_, d) => d.decrypt(data),
             Self::Aes128Ctr(_, d) => d.apply_keystream(data),
             Self::Aes256Ctr(_, d) => d.apply_keystream(data),
             Self::Chacha20(_, d) => {

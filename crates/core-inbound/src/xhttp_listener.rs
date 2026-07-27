@@ -680,8 +680,10 @@ mod tests {
             fs::create_dir_all(&directory).unwrap();
             let cert_path = directory.join("cert.pem");
             let key_path = directory.join("key.pem");
-            let rcgen::CertifiedKey { cert, key_pair } =
-                rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+            let rcgen::CertifiedKey {
+                cert,
+                signing_key: key_pair,
+            } = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
             fs::write(&cert_path, cert.pem()).unwrap();
             fs::write(&key_path, key_pair.serialize_pem()).unwrap();
             Self {

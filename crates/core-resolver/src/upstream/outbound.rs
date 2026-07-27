@@ -409,7 +409,7 @@ mod tests {
     use std::{convert::Infallible, sync::Mutex};
 
     use hickory_resolver::proto::{
-        op::{Message, MessageType, ResponseCode},
+        op::{Message, MessageType, OpCode, ResponseCode},
         rr::{Name, RData, Record, rdata::A},
         serialize::binary::BinDecodable,
     };
@@ -529,14 +529,11 @@ mod tests {
     fn dns_response(request: &[u8]) -> io::Result<Vec<u8>> {
         let query = Message::from_bytes(request)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        let mut response = Message::new();
-        response
-            .set_id(query.id())
-            .set_message_type(MessageType::Response)
-            .set_recursion_desired(true)
-            .set_recursion_available(true)
-            .set_response_code(ResponseCode::NoError);
-        for question in query.queries() {
+        let mut response = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+        response.metadata.recursion_desired = true;
+        response.metadata.recursion_available = true;
+        response.metadata.response_code = ResponseCode::NoError;
+        for question in &query.queries {
             response.add_query(question.clone());
         }
         response.add_answer(Record::from_rdata(

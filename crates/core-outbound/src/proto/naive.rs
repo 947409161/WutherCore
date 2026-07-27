@@ -23,7 +23,7 @@ use hickory_proto::{
         rdata::{A, AAAA},
     },
 };
-use rand::{RngCore, rngs::OsRng};
+use rand::Rng;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf},
@@ -407,7 +407,7 @@ fn copy_to_cronet(
         }
         if padded < NAIVE_PADDING_CHUNKS {
             let payload_len = count.min(NAIVE_MAX_CHUNK);
-            let padding_len = (OsRng.next_u32() & 0xff) as usize;
+            let padding_len = (rand::rng().next_u32() & 0xff) as usize;
             let mut frame = Vec::with_capacity(3 + payload_len + padding_len);
             frame.extend_from_slice(&(payload_len as u16).to_be_bytes());
             frame.push(padding_len as u8);

@@ -33,5 +33,5 @@ tokio-rustls     = { workspace = true }
 rustls           = { workspace = true }
 rustls-pki-types = { workspace = true }
 webpki-roots     = { workspace = true }
-socket2          = { version = "0.5", features = ["all"] }
+socket2          = { version = "0.6", features = ["all"] }
 compact_str      = { workspace = true }

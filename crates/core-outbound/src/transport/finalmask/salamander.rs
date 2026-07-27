@@ -10,7 +10,7 @@ use blake2::{
     digest::{Update, VariableOutput},
 };
 use core_config::SalamanderMaskConfig;
-use rand::{Rng, RngCore, rngs::OsRng};
+use rand::{Rng, RngExt};
 
 const SALT_LEN: usize = 8;
 const KEY_LEN: usize = 32;
@@ -94,7 +94,7 @@ impl SalamanderCodec {
         }
 
         let chunk_count =
-            rand::thread_rng().gen_range(GECKO_MIN_FRAGMENT_CHUNKS..=GECKO_MAX_FRAGMENT_CHUNKS);
+            rand::rng().random_range(GECKO_MIN_FRAGMENT_CHUNKS..=GECKO_MAX_FRAGMENT_CHUNKS);
         let chunk_size = payload.len() / chunk_count;
         gecko.next_message_id = gecko.next_message_id.wrapping_add(1);
         let message_id = gecko.next_message_id;
@@ -112,7 +112,7 @@ impl SalamanderCodec {
             let pad_len = if low > gecko.max_packet {
                 0
             } else {
-                low - base + rand::thread_rng().gen_range(0..=gecko.max_packet - low)
+                low - base + rand::rng().random_range(0..=gecko.max_packet - low)
             };
             let pad_len = u16::try_from(pad_len).expect("gecko packet size is bounded");
             let mut frame = vec![0; GECKO_HEADER_SIZE + usize::from(pad_len) + chunk.len()];
@@ -120,7 +120,7 @@ impl SalamanderCodec {
             frame[1] = message_id;
             frame[2] = ((index as u8) << 4) | chunk_count as u8;
             frame[3..5].copy_from_slice(&pad_len.to_be_bytes());
-            OsRng.fill_bytes(
+            rand::rng().fill_bytes(
                 &mut frame[GECKO_HEADER_SIZE..GECKO_HEADER_SIZE + usize::from(pad_len)],
             );
             frame[GECKO_HEADER_SIZE + usize::from(pad_len)..].copy_from_slice(chunk);
@@ -229,7 +229,7 @@ fn decode_frame(frame: &[u8]) -> std::io::Result<(FrameHeader, &[u8])> {
 
 fn obfuscate(password: &[u8], payload: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut salt = [0u8; SALT_LEN];
-    OsRng.fill_bytes(&mut salt);
+    rand::rng().fill_bytes(&mut salt);
     let key = salamander_key(password, &salt)?;
     let mut output = Vec::with_capacity(SALT_LEN + payload.len());
     output.extend_from_slice(&salt);

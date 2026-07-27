@@ -2,7 +2,7 @@ use std::io;
 
 use aws_lc_rs::agreement;
 use base64::Engine as _;
-use rand::RngCore as _;
+use rand::Rng as _;
 
 pub fn x25519_public_key(private_key: &[u8; 32]) -> io::Result<[u8; 32]> {
     let private = agreement::PrivateKey::from_private_key(&agreement::X25519, private_key)

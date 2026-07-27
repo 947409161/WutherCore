@@ -7,7 +7,7 @@ use std::{
 use async_trait::async_trait;
 use base64::Engine;
 use core_config::{I32Range, NoiseItemConfig, NoiseMaskConfig, UdpMaskConfig};
-use rand::{Rng, RngCore};
+use rand::{Rng, RngExt};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::adapter::{BoxedUdp, UdpSocketLike};
@@ -632,7 +632,7 @@ impl NoiseItem {
                     return Err(invalid("noise packet exceeds 65535 bytes"));
                 }
                 let mut output = vec![0; length];
-                rand::thread_rng().fill_bytes(&mut output);
+                rand::rng().fill_bytes(&mut output);
                 if bytes.from != 0 || bytes.to != 255 {
                     let width = (bytes.to - bytes.from + 1) as u8;
                     for byte in &mut output {
@@ -655,7 +655,7 @@ fn random_between(range: I32Range) -> i32 {
     if range.from == range.to {
         range.from
     } else {
-        rand::thread_rng().gen_range(range.from..range.to)
+        rand::rng().random_range(range.from..range.to)
     }
 }
 

@@ -25,9 +25,9 @@ use tokio_util::sync::CancellationToken;
 use tonic::{
     Request as GrpcRequest, Response as GrpcResponse, Status, Streaming,
     body::Body,
-    codec::ProstCodec,
     server::{Grpc, StreamingService},
 };
+use tonic_prost::ProstCodec;
 
 use crate::{
     DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_QUEUE_CAPACITY, MAX_MESSAGE_SIZE_LIMIT, MAX_QUEUE_CAPACITY,

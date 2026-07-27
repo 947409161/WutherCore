@@ -18,7 +18,7 @@ use neqo_transport::{
     ConnectionParameters, Output, RandomConnectionIdGenerator, StreamId, StreamType,
 };
 use nss::AuthenticationStatus;
-use rand::{Rng, RngCore, rngs::OsRng};
+use rand::{Rng, RngExt};
 use sha2::{Digest as _, Sha256};
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _, DuplexStream},
@@ -344,7 +344,7 @@ impl ClientDriver {
             flows: HashMap::new(),
             udp_streams: HashMap::new(),
             udp_reassembler: UdpReassembler::default(),
-            next_packet_id: OsRng.next_u32(),
+            next_packet_id: rand::rng().next_u32(),
         }
     }
 
@@ -720,14 +720,14 @@ impl ClientDriver {
             .expect("initialized")
             .webtransport_create_stream(session_id, StreamType::BiDi)
             .map_err(neqo_error)?;
-        let mut flow_id = OsRng.next_u64();
+        let mut flow_id = rand::rng().next_u64();
         while flow_id == 0 || self.udp_streams.contains_key(&flow_id) {
-            flow_id = OsRng.next_u64();
+            flow_id = rand::rng().next_u64();
         }
         let padding = if self.config.padding_min == self.config.padding_max {
             self.config.padding_min
         } else {
-            OsRng.gen_range(self.config.padding_min..=self.config.padding_max)
+            rand::rng().random_range(self.config.padding_min..=self.config.padding_max)
         };
         let frame = encode_flow_open(
             self.session_key.as_ref().expect("ready"),

@@ -54,6 +54,7 @@ fn build_v4_tcp(src_port: u16, dst_port: u16, control: TcpControl) -> Vec<u8> {
         max_seg_size: None,
         sack_permitted: false,
         sack_ranges: [None, None, None],
+        timestamp: None,
         payload: &[],
     };
     let ip = Ipv4Repr {

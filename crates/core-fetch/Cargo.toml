@@ -20,7 +20,7 @@ url              = { workspace = true }
 bytes            = { workspace = true }
 flate2           = { workspace = true }
 brotli           = { workspace = true }
-socket2          = { version = "0.5", features = ["all"] }
+socket2          = { version = "0.6", features = ["all"] }
 once_cell        = { workspace = true }
 thiserror        = { workspace = true }
 tracing          = { workspace = true }

@@ -5,7 +5,7 @@
 
 use aws_lc_rs::kem::{EncapsulationKey, ML_KEM_768};
 use aws_lc_rs::{agreement, digest};
-use rand::RngCore;
+use rand::Rng;
 use std::io::{self, Read, Write};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;

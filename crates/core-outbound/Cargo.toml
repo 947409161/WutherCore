@@ -46,7 +46,7 @@ regex       = { workspace = true }
 aes-gcm           = { workspace = true }
 chacha20poly1305  = { workspace = true }
 hkdf              = { workspace = true }
-sha1              = "0.10"
+sha1              = "0.11"
 sha2              = { workspace = true }
 md-5              = { workspace = true }
 blake3            = { workspace = true }
@@ -70,12 +70,12 @@ fnv               = { workspace = true }
 hmac              = { workspace = true }
 zeroize           = { workspace = true }
 sha3              = { workspace = true }
+shake             = { workspace = true }
 rc4               = { workspace = true }
 chacha20          = { workspace = true }
 shadowsocks       = { workspace = true }
 chrono            = { version = "0.4", default-features = false, features = ["clock"] }
 russh             = { workspace = true }
-russh-keys        = { workspace = true }
 quinn             = { workspace = true }
 quinn-proto       = { workspace = true }
 h3                = { workspace = true }
@@ -86,21 +86,21 @@ blake2            = "0.10"
 # WireGuard NoiseIK、Cookie、重放窗口、密钥轮换均由成熟实现负责；
 # 禁止在协议适配层自行近似实现密码学状态机。
 boringtun         = { workspace = true }
-curve25519-dalek  = "4.1"
-pbkdf2            = "0.12"
+curve25519-dalek  = "5.0"
+pbkdf2            = "0.13"
 hyper             = { version = "1", features = ["client", "http1", "http2"] }
 hyper-util        = { version = "0.1", features = ["client", "client-legacy", "tokio", "http1", "http2"] }
 http-body-util    = "0.1"
-rand_chacha       = "0.3"
-smoltcp           = { version = "0.11", default-features = false, features = ["std", "alloc", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "proto-ipv4-fragmentation", "proto-ipv6-fragmentation", "fragmentation-buffer-size-65536", "reassembly-buffer-size-65536", "reassembly-buffer-count-4", "assembler-max-segment-count-32", "iface-max-addr-count-8", "iface-max-route-count-2", "socket-tcp", "socket-udp", "async"] }
+rand_chacha       = "0.10"
+smoltcp           = { version = "0.13", default-features = false, features = ["std", "alloc", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "proto-ipv4-fragmentation", "proto-ipv6-fragmentation", "fragmentation-buffer-size-65536", "reassembly-buffer-size-65536", "reassembly-buffer-count-4", "assembler-max-segment-count-32", "iface-max-addr-count-8", "iface-max-route-count-2", "socket-tcp", "socket-udp", "async"] }
 ggstd             = "0.1"
 rsa               = "0.9"
-num-bigint-dig    = "0.8"
+num-bigint-dig    = { version = "0.9.1", features = ["prime"] }
 # socket2：在 Linux/Android 上对 outbound socket 设置 SO_MARK，配合
 # `ip rule fwmark X lookup main` 让代理出站绕开 TUN 自身路由表，
 # 避免"resolve 出 IP 后 connect 又被 TUN 截走"的死循环。
 # `all` feature 才会启用 `Socket::set_mark` 等平台特定方法。
-socket2 = { version = "0.5", features = ["all"] }
+socket2 = { version = "0.6", features = ["all"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 libc = "0.2"
@@ -108,7 +108,7 @@ libc = "0.2"
 [target.'cfg(target_os = "windows")'.dependencies]
 # IP_UNICAST_IF / IPV6_UNICAST_IF setsockopt —— 出站 socket 强绑物理网卡，
 # 避免 WinTUN metric 最低导致出站包被自家 TUN 接管再走代理（死循环）。
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Networking_WinSock",
 ] }

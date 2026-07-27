@@ -2,7 +2,7 @@
 
 use std::{fmt, io, sync::Arc, sync::OnceLock};
 
-use rand::{Rng, seq::SliceRandom};
+use rand::{RngExt, seq::SliceRandom};
 use rustls::{
     CertificateCompressionAlgorithm, CipherSuite, Error as RustlsError, NamedGroup,
     ProtocolVersion,
@@ -225,7 +225,7 @@ fn select_profile(fingerprint: &str, require_tls13: bool) -> io::Result<UtlsClie
     match fingerprint {
         "random" => {
             let name = RANDOM_MODERN.get_or_init(|| {
-                let index = rand::rngs::OsRng.gen_range(0..MODERN_FINGERPRINTS.len());
+                let index = rand::rng().random_range(0..MODERN_FINGERPRINTS.len());
                 MODERN_FINGERPRINTS[index]
             });
             profile_for_fingerprint(name).cloned()
@@ -812,11 +812,11 @@ fn randomize_grease(profile: &mut UtlsClientHelloProfile) {
         0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a, 0x4a4a, 0x5a5a, 0x6a6a, 0x7a7a, 0x8a8a, 0x9a9a, 0xaaaa,
         0xbaba, 0xcaca, 0xdada, 0xeaea, 0xfafa,
     ];
-    let mut rng = rand::rngs::OsRng;
-    let first = VALUES[rng.gen_range(0..VALUES.len())];
-    let mut second = VALUES[rng.gen_range(0..VALUES.len())];
+    let mut rng = rand::rng();
+    let first = VALUES[rng.random_range(0..VALUES.len())];
+    let mut second = VALUES[rng.random_range(0..VALUES.len())];
     while second == first {
-        second = VALUES[rng.gen_range(0..VALUES.len())];
+        second = VALUES[rng.random_range(0..VALUES.len())];
     }
 
     for suite in &mut profile.cipher_suites {
@@ -860,13 +860,13 @@ enum RandomAlpn {
 }
 
 fn randomized_profile(alpn_mode: RandomAlpn, force_tls13: bool) -> UtlsClientHelloProfile {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let with_alpn = match alpn_mode {
         RandomAlpn::Always => true,
         RandomAlpn::Never => false,
-        RandomAlpn::Weighted => rng.gen_bool(0.7),
+        RandomAlpn::Weighted => rng.random_bool(0.7),
     };
-    let tls13 = force_tls13 || rng.gen_bool(0.4);
+    let tls13 = force_tls13 || rng.random_bool(0.4);
 
     // `cipherSuites` from the exact uTLS revision pinned by Xray. It shuffles
     // TLS-1.2-only suites before obsolete suites, then removes later entries
@@ -916,7 +916,7 @@ fn randomized_profile(alpn_mode: RandomAlpn, force_tls13: bool) -> UtlsClientHel
     let original_len = modern.len() as f64;
     let mut index = 1;
     while index < modern.len() {
-        if rng.gen_bool((0.4 * index as f64 / original_len).clamp(0.0, 1.0)) {
+        if rng.random_bool((0.4 * index as f64 / original_len).clamp(0.0, 1.0)) {
             modern.remove(index);
         } else {
             index += 1;
@@ -924,29 +924,29 @@ fn randomized_profile(alpn_mode: RandomAlpn, force_tls13: bool) -> UtlsClientHel
     }
 
     let mut signature_algorithms = vec![0x0403, 0x0401, 0x0503, 0x0501, 0x0201, 0x0601];
-    if rng.gen_bool(0.63) {
+    if rng.random_bool(0.63) {
         signature_algorithms.push(0x0203);
     }
-    if rng.gen_bool(0.59) {
+    if rng.random_bool(0.59) {
         signature_algorithms.push(0x0603);
     }
-    if tls13 || rng.gen_bool(0.51) {
+    if tls13 || rng.random_bool(0.51) {
         signature_algorithms.push(0x0804);
-        if rng.gen_bool(0.9) {
+        if rng.random_bool(0.9) {
             signature_algorithms.extend([0x0805, 0x0806]);
         }
     }
     signature_algorithms.shuffle(&mut rng);
 
     let mut supported_groups = Vec::new();
-    if tls13 && rng.gen_bool(0.71) {
+    if tls13 && rng.random_bool(0.71) {
         supported_groups.push(GROUP_X25519_MLKEM768);
     }
-    if tls13 || rng.gen_bool(0.71) {
+    if tls13 || rng.random_bool(0.71) {
         supported_groups.push(GROUP_X25519);
     }
     supported_groups.extend([GROUP_P256, GROUP_P384]);
-    if rng.gen_bool(0.46) {
+    if rng.random_bool(0.46) {
         supported_groups.push(0x0019); // secp521r1
     }
 
@@ -963,20 +963,20 @@ fn randomized_profile(alpn_mode: RandomAlpn, force_tls13: bool) -> UtlsClientHel
     } else {
         Vec::new()
     };
-    let with_padding = tls13 || rng.gen_bool(0.62);
+    let with_padding = tls13 || rng.random_bool(0.62);
     if with_padding {
         extensions.push(extension(EXT_PADDING));
     }
-    if rng.gen_bool(0.74) {
+    if rng.random_bool(0.74) {
         extensions.push(extension(EXT_STATUS_REQUEST));
     }
-    if rng.gen_bool(0.46) {
+    if rng.random_bool(0.46) {
         extensions.push(extension(EXT_SCT));
     }
-    if rng.gen_bool(0.75) {
+    if rng.random_bool(0.75) {
         extensions.push(extension(EXT_RENEGOTIATION));
     }
-    if rng.gen_bool(0.77) {
+    if rng.random_bool(0.77) {
         extensions.push(extension(EXT_EMS));
     }
 
@@ -988,13 +988,13 @@ fn randomized_profile(alpn_mode: RandomAlpn, force_tls13: bool) -> UtlsClientHel
             group: GROUP_X25519,
             key_exchange_len: 32,
         });
-        if rng.gen_bool(0.5) {
+        if rng.random_bool(0.5) {
             key_shares.push(UtlsKeyShare {
                 group: GROUP_P256,
                 key_exchange_len: 65,
             });
         }
-        if rng.gen_bool(0.5) {
+        if rng.random_bool(0.5) {
             key_shares.insert(
                 0,
                 UtlsKeyShare {
@@ -1004,7 +1004,7 @@ fn randomized_profile(alpn_mode: RandomAlpn, force_tls13: bool) -> UtlsClientHel
             );
         }
         supported_versions.extend([TLS13, TLS12]);
-        if rng.gen_bool(0.5) {
+        if rng.random_bool(0.5) {
             supported_versions.extend([0x0302, TLS10]);
         }
         extensions.extend([
@@ -1014,7 +1014,7 @@ fn randomized_profile(alpn_mode: RandomAlpn, force_tls13: bool) -> UtlsClientHel
         ]);
         // uTLS deliberately derives this decision from a salted copy of its
         // seed. An independent secure draw has the same lifetime/distribution.
-        if with_alpn && rand::rngs::OsRng.gen_bool(0.33) {
+        if with_alpn && rand::rng().random_bool(0.33) {
             application_settings.push(UtlsApplicationSettings {
                 extension_type: EXT_ALPS,
                 protocols: vec![b"h2".to_vec()],

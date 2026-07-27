@@ -27,7 +27,7 @@ use crate::adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter};
 #[derive(Debug, Clone)]
 pub enum SshAuth {
     Password(String),
-    PrivateKey(Arc<russh_keys::key::KeyPair>),
+    PrivateKey(Arc<russh::keys::PrivateKey>),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -35,7 +35,7 @@ pub struct SshHostKeyCheck {
     /// 不校验 host key（默认；mihomo 行为）
     pub accept_unknown: bool,
     /// 已知公钥列表（OpenSSH 格式，每行一条；非空时严格校验）
-    pub keys: Vec<russh_keys::key::PublicKey>,
+    pub keys: Vec<russh::keys::PublicKey>,
 }
 
 #[derive(Clone)]
@@ -88,7 +88,7 @@ impl SshOutbound {
         passphrase: Option<String>,
     ) -> Result<Self, String> {
         let path = path.into();
-        let key = russh_keys::load_secret_key(&path, passphrase.as_deref()).map_err(|error| {
+        let key = russh::keys::load_secret_key(&path, passphrase.as_deref()).map_err(|error| {
             format!(
                 "failed to load SSH private key `{}`: {error}",
                 path.display()
@@ -104,13 +104,13 @@ impl SshOutbound {
         passphrase: Option<String>,
     ) -> Result<Self, String> {
         let content = content.into();
-        let key = russh_keys::decode_secret_key(&content, passphrase.as_deref())
+        let key = russh::keys::decode_secret_key(&content, passphrase.as_deref())
             .map_err(|error| format!("failed to decode SSH private key: {error}"))?;
         self.auth.push(SshAuth::PrivateKey(Arc::new(key)));
         Ok(self)
     }
 
-    pub fn with_host_keys(mut self, keys: Vec<russh_keys::key::PublicKey>) -> Self {
+    pub fn with_host_keys(mut self, keys: Vec<russh::keys::PublicKey>) -> Self {
         self.host_key_check = SshHostKeyCheck {
             accept_unknown: false,
             keys,
@@ -150,7 +150,7 @@ impl SshOutbound {
 
     async fn connect_session_inner(&self) -> std::io::Result<russh::client::Handle<NopHandler>> {
         let mut config = russh::client::Config {
-            client_id: russh::SshId::Standard(self.client_version.clone()),
+            client_id: russh::SshId::Standard(self.client_version.clone().into()),
             inactivity_timeout: Some(std::time::Duration::from_secs(
                 self.keepalive_interval_secs.max(60),
             )),
@@ -175,18 +175,31 @@ impl SshOutbound {
             auth_ok = session
                 .authenticate_none(&self.user)
                 .await
-                .map_err(|e| io_err(format!("ssh auth none: {e}")))?;
+                .map_err(|e| io_err(format!("ssh auth none: {e}")))?
+                .success();
         } else {
             for auth in &self.auth {
                 auth_ok = match auth {
                     SshAuth::Password(password) => session
                         .authenticate_password(&self.user, password)
                         .await
-                        .map_err(|e| io_err(format!("ssh auth password: {e}")))?,
-                    SshAuth::PrivateKey(key) => session
-                        .authenticate_publickey(&self.user, key.clone())
-                        .await
-                        .map_err(|e| io_err(format!("ssh auth pubkey: {e}")))?,
+                        .map_err(|e| io_err(format!("ssh auth password: {e}")))?
+                        .success(),
+                    SshAuth::PrivateKey(key) => {
+                        let hash_alg = session
+                            .best_supported_rsa_hash()
+                            .await
+                            .map_err(|e| io_err(format!("ssh RSA algorithm negotiation: {e}")))?
+                            .flatten();
+                        session
+                            .authenticate_publickey(
+                                &self.user,
+                                russh::keys::PrivateKeyWithHashAlg::new(key.clone(), hash_alg),
+                            )
+                            .await
+                            .map_err(|e| io_err(format!("ssh auth pubkey: {e}")))?
+                            .success()
+                    }
                 };
                 if auth_ok {
                     break;
@@ -250,30 +263,17 @@ struct NopHandler {
 impl russh::client::Handler for NopHandler {
     type Error = russh::Error;
 
-    fn check_server_key<'life0, 'life1, 'async_trait>(
-        &'life0 mut self,
-        server_public_key: &'life1 russh_keys::key::PublicKey,
-    ) -> core::pin::Pin<
-        Box<dyn core::future::Future<Output = Result<bool, Self::Error>> + Send + 'async_trait>,
-    >
-    where
-        'life0: 'async_trait,
-        'life1: 'async_trait,
-        Self: 'async_trait,
-    {
-        let accept = self.check.accept_unknown;
-        let known = self.check.keys.clone();
-        let server_public_key = server_public_key.clone();
-        Box::pin(async move {
-            if accept {
-                return Ok(true);
-            }
-            Ok(known.iter().any(|key| key == &server_public_key))
-        })
+    fn check_server_key(
+        &mut self,
+        server_public_key: &russh::keys::PublicKey,
+    ) -> impl core::future::Future<Output = Result<bool, Self::Error>> + Send {
+        let accepted =
+            self.check.accept_unknown || self.check.keys.iter().any(|key| key == server_public_key);
+        std::future::ready(Ok(accepted))
     }
 }
 
-pub fn parse_host_key(value: &str) -> Result<russh_keys::key::PublicKey, String> {
+pub fn parse_host_key(value: &str) -> Result<russh::keys::PublicKey, String> {
     let mut fields = value.split_whitespace();
     let first = fields
         .next()
@@ -285,35 +285,50 @@ pub fn parse_host_key(value: &str) -> Result<russh_keys::key::PublicKey, String>
     } else {
         first
     };
-    russh_keys::parse_public_key_base64(encoded)
+    russh::keys::parse_public_key_base64(encoded)
         .map_err(|error| format!("invalid SSH host-key: {error}"))
 }
 
-fn parse_host_key_algorithms(algorithms: &[String]) -> Result<Vec<russh_keys::key::Name>, String> {
+fn parse_host_key_algorithms(algorithms: &[String]) -> Result<Vec<russh::keys::Algorithm>, String> {
+    use russh::keys::{Algorithm, EcdsaCurve, HashAlg};
+
     let mut parsed = Vec::new();
     for algorithm in algorithms {
-        let names: &[russh_keys::key::Name] = match algorithm.trim().to_ascii_lowercase().as_str() {
-            "rsa" => &[
-                russh_keys::key::RSA_SHA2_512,
-                russh_keys::key::RSA_SHA2_256,
-                russh_keys::key::SSH_RSA,
+        let names: Vec<Algorithm> = match algorithm.trim().to_ascii_lowercase().as_str() {
+            "rsa" => vec![
+                Algorithm::Rsa {
+                    hash: Some(HashAlg::Sha512),
+                },
+                Algorithm::Rsa {
+                    hash: Some(HashAlg::Sha256),
+                },
+                Algorithm::Rsa { hash: None },
             ],
-            "ed25519" => &[russh_keys::key::ED25519],
-            "ecdsa" => &[
-                russh_keys::key::ECDSA_SHA2_NISTP521,
-                russh_keys::key::ECDSA_SHA2_NISTP384,
-                russh_keys::key::ECDSA_SHA2_NISTP256,
+            "ed25519" => vec![Algorithm::Ed25519],
+            "ecdsa" => vec![
+                Algorithm::Ecdsa {
+                    curve: EcdsaCurve::NistP521,
+                },
+                Algorithm::Ecdsa {
+                    curve: EcdsaCurve::NistP384,
+                },
+                Algorithm::Ecdsa {
+                    curve: EcdsaCurve::NistP256,
+                },
             ],
             exact => {
-                let name = russh_keys::key::Name::try_from(exact)
+                let name = Algorithm::new(exact)
                     .map_err(|_| format!("unsupported SSH host-key algorithm `{algorithm}`"))?;
+                if matches!(name, Algorithm::Other(_)) {
+                    return Err(format!("unsupported SSH host-key algorithm `{algorithm}`"));
+                }
                 parsed.push(name);
                 continue;
             }
         };
         for name in names {
-            if !parsed.contains(name) {
-                parsed.push(*name);
+            if !parsed.contains(&name) {
+                parsed.push(name);
             }
         }
     }
@@ -371,7 +386,7 @@ fn io_err<S: Into<String>>(s: S) -> std::io::Error {
 
 #[cfg(test)]
 mod tests {
-    use russh_keys::PublicKeyBase64;
+    use russh::keys::PublicKeyBase64;
 
     use super::*;
 
@@ -394,9 +409,10 @@ mod tests {
 
     #[test]
     fn known_hosts_strict_mode() {
-        let key = russh_keys::key::KeyPair::generate_ed25519()
-            .clone_public_key()
-            .unwrap();
+        let private =
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                .unwrap();
+        let key = private.public_key().clone();
         let ob = SshOutbound::new("ssh1", "1.2.3.4", 22, "alice").with_host_keys(vec![key]);
         assert!(!ob.host_key_check.accept_unknown);
         assert_eq!(ob.host_key_check.keys.len(), 1);
@@ -410,9 +426,10 @@ mod tests {
 
     #[test]
     fn host_key_parser_accepts_authorized_key_and_raw_base64() {
-        let key = russh_keys::key::KeyPair::generate_ed25519()
-            .clone_public_key()
-            .unwrap();
+        let private =
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                .unwrap();
+        let key = private.public_key().clone();
         let encoded = key.public_key_base64();
         assert_eq!(parse_host_key(&encoded).unwrap(), key);
         assert_eq!(
@@ -427,10 +444,14 @@ mod tests {
         assert_eq!(
             parsed,
             vec![
-                russh_keys::key::RSA_SHA2_512,
-                russh_keys::key::RSA_SHA2_256,
-                russh_keys::key::SSH_RSA,
-                russh_keys::key::ED25519,
+                russh::keys::Algorithm::Rsa {
+                    hash: Some(russh::keys::HashAlg::Sha512),
+                },
+                russh::keys::Algorithm::Rsa {
+                    hash: Some(russh::keys::HashAlg::Sha256),
+                },
+                russh::keys::Algorithm::Rsa { hash: None },
+                russh::keys::Algorithm::Ed25519,
             ]
         );
         assert!(parse_host_key_algorithms(&["not-an-algorithm".into()]).is_err());

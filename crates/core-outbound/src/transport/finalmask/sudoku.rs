@@ -6,7 +6,7 @@ use std::{
 use core_config::SudokuMaskConfig;
 use ggstd::math::rand::{Rand as GoRand, new_source};
 use parking_lot::Mutex;
-use rand::Rng;
+use rand::RngExt;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -296,7 +296,7 @@ impl Encoder {
         let padding_chance = if min == max {
             min
         } else {
-            rand::thread_rng().gen_range(min..=max)
+            rand::rng().random_range(min..=max)
         };
         Self {
             tables,
@@ -305,31 +305,31 @@ impl Encoder {
         }
     }
 
-    fn should_pad(&self, rng: &mut impl Rng) -> bool {
+    fn should_pad(&self, rng: &mut impl rand::Rng) -> bool {
         self.padding_chance >= 100
-            || (self.padding_chance > 0 && rng.gen_range(0..100) < self.padding_chance)
+            || (self.padding_chance > 0 && rng.random_range(0..100) < self.padding_chance)
     }
 
     fn encode(&mut self, input: &[u8]) -> std::io::Result<Vec<u8>> {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut output = Vec::with_capacity(input.len() * 6 + 8);
         for &byte in input {
             let table = &self.tables[self.table_index % self.tables.len()];
             if self.should_pad(&mut rng) {
                 output.push(
-                    table.layout.padding_pool[rng.gen_range(0..table.layout.padding_pool.len())],
+                    table.layout.padding_pool[rng.random_range(0..table.layout.padding_pool.len())],
                 );
             }
             let candidates = &table.encode[byte as usize];
             let hints = candidates
-                .get(rng.gen_range(0..candidates.len()))
+                .get(rng.random_range(0..candidates.len()))
                 .ok_or_else(|| invalid("sudoku encode table is empty"))?;
-            let permutation = PERM4[rng.gen_range(0..PERM4.len())];
+            let permutation = PERM4[rng.random_range(0..PERM4.len())];
             for index in permutation {
                 if self.should_pad(&mut rng) {
                     output.push(
                         table.layout.padding_pool
-                            [rng.gen_range(0..table.layout.padding_pool.len())],
+                            [rng.random_range(0..table.layout.padding_pool.len())],
                     );
                 }
                 output.push(hints[index]);
@@ -338,8 +338,9 @@ impl Encoder {
         }
         if self.should_pad(&mut rng) {
             let table = &self.tables[self.table_index % self.tables.len()];
-            output
-                .push(table.layout.padding_pool[rng.gen_range(0..table.layout.padding_pool.len())]);
+            output.push(
+                table.layout.padding_pool[rng.random_range(0..table.layout.padding_pool.len())],
+            );
         }
         Ok(output)
     }
@@ -404,7 +405,7 @@ impl PackedEncoder {
         let padding_chance = if min == max {
             min
         } else {
-            rand::thread_rng().gen_range(min..=max)
+            rand::rng().random_range(min..=max)
         };
         Self {
             tables,
@@ -413,17 +414,17 @@ impl PackedEncoder {
         }
     }
 
-    fn should_pad(&self, rng: &mut impl Rng) -> bool {
+    fn should_pad(&self, rng: &mut impl rand::Rng) -> bool {
         self.padding_chance >= 100
-            || (self.padding_chance > 0 && rng.gen_range(0..100) < self.padding_chance)
+            || (self.padding_chance > 0 && rng.random_range(0..100) < self.padding_chance)
     }
 
-    fn maybe_pad(&self, output: &mut Vec<u8>, layout: &Layout, rng: &mut impl Rng) {
+    fn maybe_pad(&self, output: &mut Vec<u8>, layout: &Layout, rng: &mut impl rand::Rng) {
         if !self.should_pad(rng) {
             return;
         }
         loop {
-            let byte = layout.padding_pool[rng.gen_range(0..layout.padding_pool.len())];
+            let byte = layout.padding_pool[rng.random_range(0..layout.padding_pool.len())];
             if byte != layout.pad_marker {
                 output.push(byte);
                 return;
@@ -435,7 +436,7 @@ impl PackedEncoder {
         let mut output = Vec::with_capacity(input.len() * 2 + 8);
         let mut bit_buffer = 0u64;
         let mut bit_count = 0usize;
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for &byte in input {
             bit_buffer = (bit_buffer << 8) | u64::from(byte);
             bit_count += 8;

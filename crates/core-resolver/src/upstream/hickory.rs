@@ -7,9 +7,10 @@ use std::{
 
 use async_trait::async_trait;
 use hickory_resolver::{
-    TokioAsyncResolver,
-    config::{NameServerConfig, NameServerConfigGroup, Protocol, ResolverConfig, ResolverOpts},
-    proto::rr::{Record, RecordType},
+    TokioResolver,
+    config::{ConnectionConfig, NameServerConfig, ResolveHosts, ResolverConfig, ResolverOpts},
+    net::runtime::TokioRuntimeProvider,
+    proto::rr::{RData, Record, RecordType},
 };
 
 use super::{DnsError, DnsUpstream};
@@ -31,12 +32,12 @@ impl HickoryKind {
             Self::Tcp => "tcp",
         }
     }
-    fn proto(&self) -> Protocol {
+    fn connection(&self, server_name: Arc<str>) -> ConnectionConfig {
         match self {
-            Self::DoH => Protocol::Https,
-            Self::DoT => Protocol::Tls,
-            Self::Udp => Protocol::Udp,
-            Self::Tcp => Protocol::Tcp,
+            Self::DoH => ConnectionConfig::https(server_name, None),
+            Self::DoT => ConnectionConfig::tls(server_name),
+            Self::Udp => ConnectionConfig::udp(),
+            Self::Tcp => ConnectionConfig::tcp(),
         }
     }
 }
@@ -45,7 +46,7 @@ impl HickoryKind {
 pub struct HickoryUpstream {
     name: String,
     kind: HickoryKind,
-    inner: Arc<TokioAsyncResolver>,
+    inner: Arc<TokioResolver>,
     client_subnet: Option<ipnet::IpNet>,
 }
 
@@ -65,20 +66,24 @@ impl HickoryUpstream {
         addr: SocketAddr,
         sni: Option<String>,
     ) -> Result<Self, DnsError> {
-        let mut nsg = NameServerConfigGroup::new();
-        let mut ns = NameServerConfig::new(addr, kind.proto());
-        if let Some(sni) = sni.clone().filter(|s| !s.is_empty()) {
-            ns.tls_dns_name = Some(sni);
-        }
-        ns.trust_negative_responses = true;
-        nsg.push(ns);
-        let cfg = ResolverConfig::from_parts(None, vec![], nsg);
+        let server_name: Arc<str> = sni
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| addr.ip().to_string())
+            .into();
+        let mut connection = kind.connection(server_name);
+        connection.port = addr.port();
+        let ns = NameServerConfig::new(addr.ip(), true, vec![connection]);
+        let cfg = ResolverConfig::from_parts(None, vec![], vec![ns]);
         let mut opts = ResolverOpts::default();
         opts.cache_size = 0; // 我们自己管缓存
         opts.attempts = 2;
         opts.timeout = std::time::Duration::from_secs(3);
-        opts.use_hosts_file = false;
-        let resolver = TokioAsyncResolver::tokio(cfg, opts);
+        opts.use_hosts_file = ResolveHosts::Never;
+        let mut builder = TokioResolver::builder_with_config(cfg, TokioRuntimeProvider::default());
+        *builder.options_mut() = opts;
+        let resolver = builder
+            .build()
+            .map_err(|error| DnsError::Failed(format!("构造 DNS resolver 失败: {error}")))?;
         Ok(Self {
             name: name.into(),
             kind,
@@ -168,7 +173,14 @@ impl DnsUpstream for HickoryUpstream {
             .ipv4_lookup(host)
             .await
             .map_err(|e| DnsError::Failed(e.to_string()))?;
-        let v: Vec<IpAddr> = r.iter().map(|a| IpAddr::V4(a.0)).collect();
+        let v: Vec<IpAddr> = r
+            .answers()
+            .iter()
+            .filter_map(|record| match &record.data {
+                RData::A(address) => Some(IpAddr::V4(address.0)),
+                _ => None,
+            })
+            .collect();
         if v.is_empty() {
             Err(DnsError::Empty)
         } else {
@@ -184,7 +196,14 @@ impl DnsUpstream for HickoryUpstream {
             .ipv6_lookup(host)
             .await
             .map_err(|e| DnsError::Failed(e.to_string()))?;
-        let v: Vec<IpAddr> = r.iter().map(|a| IpAddr::V6(a.0)).collect();
+        let v: Vec<IpAddr> = r
+            .answers()
+            .iter()
+            .filter_map(|record| match &record.data {
+                RData::AAAA(address) => Some(IpAddr::V6(address.0)),
+                _ => None,
+            })
+            .collect();
         if v.is_empty() {
             Err(DnsError::Empty)
         } else {
@@ -202,7 +221,7 @@ impl DnsUpstream for HickoryUpstream {
             .lookup(host.trim_end_matches('.'), record_type)
             .await
             .map_err(|e| DnsError::Failed(e.to_string()))?;
-        let records = r.records().to_vec();
+        let records = r.answers().to_vec();
         if records.is_empty() {
             Err(DnsError::Empty)
         } else {

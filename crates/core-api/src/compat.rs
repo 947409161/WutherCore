@@ -53,7 +53,7 @@ use axum::{
     body::Body,
     extract::{
         Path, Query, State,
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        ws::{Message, WebSocket, WebSocketUpgrade, rejection::WebSocketUpgradeRejection},
     },
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -92,43 +92,43 @@ pub fn router(state: NativeState) -> Router {
         .route("/logs", get(logs))
         // ---------- connections ----------
         .route("/connections", get(connections).delete(connections_close_all))
-        .route("/connections/:id", delete(connections_close_one))
-        .route("/connections/smart/:id", delete(connections_smart_block))
+        .route("/connections/{id}", delete(connections_close_one))
+        .route("/connections/smart/{id}", delete(connections_smart_block))
         // ---------- proxies ----------
         .route("/proxies", get(proxies))
         .route(
-            "/proxies/:name",
+            "/proxies/{name}",
             get(proxy_one)
                 .put(proxy_put)
                 .patch(proxy_put)
                 .delete(proxy_clear),
         )
-        .route("/proxies/:name/delay", get(proxy_delay))
+        .route("/proxies/{name}/delay", get(proxy_delay))
         // ---------- group (mihomo meta API) ----------
         .route("/group", get(groups_list))
-        .route("/group/:name", get(group_one))
-        .route("/group/:name/delay", get(group_delay))
+        .route("/group/{name}", get(group_one))
+        .route("/group/{name}/delay", get(group_delay))
         // ---------- providers ----------
         .route("/providers/proxies", get(providers_proxies))
         .route(
-            "/providers/proxies/:name",
+            "/providers/proxies/{name}",
             get(provider_proxy_one).put(provider_proxy_refresh),
         )
         .route(
-            "/providers/proxies/:name/healthcheck",
+            "/providers/proxies/{name}/healthcheck",
             get(provider_proxy_healthcheck),
         )
         .route(
-            "/providers/proxies/:provider/:proxy",
+            "/providers/proxies/{provider}/{proxy}",
             get(provider_proxy_node),
         )
         .route(
-            "/providers/proxies/:provider/:proxy/healthcheck",
+            "/providers/proxies/{provider}/{proxy}/healthcheck",
             get(provider_proxy_node_healthcheck),
         )
         .route("/providers/rules", get(providers_rules))
         .route(
-            "/providers/rules/:name",
+            "/providers/rules/{name}",
             get(provider_rule_one).put(provider_rule_refresh),
         )
         // ---------- rules ----------
@@ -147,7 +147,7 @@ pub fn router(state: NativeState) -> Router {
         .route("/upgrade/geo", post(configs_geo))
         .route("/upgrade/ui", post(upgrade_ui))
         .route(
-            "/storage/:key",
+            "/storage/{key}",
             get(storage_get).put(storage_put).delete(storage_delete),
         )
         .with_state(state)
@@ -166,9 +166,9 @@ async fn version() -> Json<Value> {
 
 async fn traffic(
     State(s): State<NativeState>,
-    ws: Option<WebSocketUpgrade>,
+    ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> axum::response::Response {
-    if let Some(ws) = ws {
+    if let Ok(ws) = ws {
         // 取 hub receiver；连接上限保护避免 fd 耗尽。
         let Some(permit) = ws_limiter().try_acquire() else {
             return (
@@ -186,9 +186,9 @@ async fn traffic(
 
 async fn memory(
     State(s): State<NativeState>,
-    ws: Option<WebSocketUpgrade>,
+    ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> axum::response::Response {
-    if let Some(ws) = ws {
+    if let Ok(ws) = ws {
         let Some(permit) = ws_limiter().try_acquire() else {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -235,14 +235,14 @@ async fn watch_to_ws(
     // 立刻送当前值（如果非空）。
     let initial = rx.borrow_and_update().clone();
     if !initial.is_empty() {
-        if sock.send(Message::Text(initial)).await.is_err() {
+        if sock.send(Message::Text(initial.into())).await.is_err() {
             return;
         }
     }
     // 之后监听变更；watch 永远只保留最新，慢消费者自动跳过中间帧。
     while rx.changed().await.is_ok() {
         let payload = rx.borrow_and_update().clone();
-        if sock.send(Message::Text(payload)).await.is_err() {
+        if sock.send(Message::Text(payload.into())).await.is_err() {
             break;
         }
     }
@@ -266,7 +266,7 @@ struct LogQ {
 async fn logs(
     State(s): State<NativeState>,
     Query(q): Query<LogQ>,
-    ws: Option<WebSocketUpgrade>,
+    ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> axum::response::Response {
     let level_filter = q.level.unwrap_or_else(|| "info".into()).to_lowercase();
     if !matches!(
@@ -280,7 +280,7 @@ async fn logs(
             .into_response();
     }
     let structured = q.format.as_deref() == Some("structured");
-    if let Some(ws) = ws {
+    if let Ok(ws) = ws {
         return ws.on_upgrade(move |sock| logs_ws(sock, s, level_filter, structured));
     }
     let stream = log_event_stream(s, level_filter, structured);
@@ -300,7 +300,7 @@ async fn logs_ws(mut sock: WebSocket, s: NativeState, level_filter: String, stru
             continue;
         }
         let payload = format_log_event(&ev, structured);
-        if sock.send(Message::Text(payload)).await.is_err() {
+        if sock.send(Message::Text(payload.into())).await.is_err() {
             return;
         }
     }
@@ -309,7 +309,7 @@ async fn logs_ws(mut sock: WebSocket, s: NativeState, level_filter: String, stru
             continue;
         }
         let payload = format_log_event(&ev, structured);
-        if sock.send(Message::Text(payload)).await.is_err() {
+        if sock.send(Message::Text(payload.into())).await.is_err() {
             break;
         }
     }
@@ -389,9 +389,9 @@ struct ConnQ {
 async fn connections(
     State(s): State<NativeState>,
     Query(q): Query<ConnQ>,
-    ws: Option<WebSocketUpgrade>,
+    ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> axum::response::Response {
-    if let Some(ws) = ws {
+    if let Ok(ws) = ws {
         let Some(permit) = ws_limiter().try_acquire() else {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -424,7 +424,7 @@ async fn connections_to_ws(
     loop {
         let payload = serde_json::to_string(&build_connections_value(&s.runtime))
             .unwrap_or_else(|_| "{}".into());
-        if sock.send(Message::Text(payload)).await.is_err() {
+        if sock.send(Message::Text(payload.into())).await.is_err() {
             return;
         }
         tokio::time::sleep(interval).await;

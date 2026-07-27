@@ -361,8 +361,8 @@ fn parse_v4(buf: &[u8]) -> Result<ParsedPacket, ParseError> {
 
     let ip = IpHeader {
         version: IpVersion::V4,
-        src: IpAddr::V4(Ipv4Addr::from(repr.src_addr.0)),
-        dst: IpAddr::V4(Ipv4Addr::from(repr.dst_addr.0)),
+        src: IpAddr::V4(repr.src_addr),
+        dst: IpAddr::V4(repr.dst_addr),
         protocol: u8::from(repr.next_header),
         total_len,
         l4_offset: ihl,
@@ -386,8 +386,8 @@ fn parse_v6(buf: &[u8]) -> Result<ParsedPacket, ParseError> {
     let payload = &buf[header_len..total_len];
     let ip = IpHeader {
         version: IpVersion::V6,
-        src: IpAddr::V6(Ipv6Addr::from(repr.src_addr.0)),
-        dst: IpAddr::V6(Ipv6Addr::from(repr.dst_addr.0)),
+        src: IpAddr::V6(repr.src_addr),
+        dst: IpAddr::V6(repr.dst_addr),
         protocol: u8::from(repr.next_header),
         total_len,
         l4_offset: header_len,
@@ -457,6 +457,7 @@ mod tests {
             max_seg_size: None,
             sack_permitted: false,
             sack_ranges: [None, None, None],
+            timestamp: None,
             payload: &[],
         };
         let ip = Repr {

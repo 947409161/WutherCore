@@ -232,9 +232,19 @@ struct WildcardCursor {
 
 #[inline]
 fn unicode_simple_lower(value: char) -> char {
-    // The dependency is pinned to the same Unicode version as Mihomo's current
-    // Go runtime. Its first scalar is the simple lowercase mapping Go applies to
-    // each rune; zero means that the rune maps to itself.
+    // Keep Mihomo's Unicode 15 case-folding semantics while using the current
+    // unicode-case-mapping tables. These scalars acquired lowercase mappings in
+    // Unicode 16 and therefore remain unchanged in Mihomo's current Go tables.
+    if matches!(
+        value,
+        '\u{1c89}' | '\u{a7cb}' | '\u{a7cc}' | '\u{a7da}' | '\u{a7dc}'
+    ) || ('\u{10d50}'..='\u{10d65}').contains(&value)
+    {
+        return value;
+    }
+
+    // The first scalar is the simple lowercase mapping Go applies to each rune;
+    // zero means that the rune maps to itself.
     let first = unicode_case_mapping::to_lowercase(value)[0];
     if first == 0 {
         value
@@ -506,7 +516,7 @@ mod tests {
 
     #[test]
     fn unicode_lower_helper_uses_simple_mapping() {
-        assert_eq!(unicode_case_mapping::UNICODE_VERSION, (15, 0, 0));
+        assert_eq!(unicode_case_mapping::UNICODE_VERSION, (16, 0, 0));
         assert_eq!(unicode_simple_lower('A'), 'a');
         assert_eq!(unicode_simple_lower('Ä'), 'ä');
         assert_eq!(unicode_simple_lower('例'), '例');

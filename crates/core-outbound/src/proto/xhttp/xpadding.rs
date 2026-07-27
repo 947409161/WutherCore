@@ -9,7 +9,7 @@
 //!
 //! padding 可放在：header / queryInHeader / cookie / query
 
-use rand::RngCore;
+use rand::Rng;
 
 /// 长度调整迭代上限
 const MAX_ADJUST_ITER: usize = 150;
@@ -138,7 +138,7 @@ fn rand_string_from_charset(n: usize, charset: &[u8]) -> Option<String> {
     let mut result = Vec::with_capacity(n);
     let mut buf = [0u8; 256];
     while result.len() < n {
-        rand::rngs::OsRng.fill_bytes(&mut buf);
+        rand::rng().fill_bytes(&mut buf);
         for &rb in buf.iter() {
             if (rb as usize) >= limit {
                 continue;

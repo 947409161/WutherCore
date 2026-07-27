@@ -283,7 +283,7 @@ mod tests {
             .unwrap();
         assert_eq!(json.len(), 87_017);
         assert_eq!(
-            format!("{:x}", Sha256::digest(&json)),
+            hex::encode(Sha256::digest(&json)),
             "2f6d1f4546c25e9c968713585843e6892780957d28a4c35fc70e2c8f500ca3a7"
         );
     }

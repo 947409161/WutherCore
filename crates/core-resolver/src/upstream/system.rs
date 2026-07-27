@@ -4,7 +4,7 @@ use std::net::{IpAddr, ToSocketAddrs};
 
 use async_trait::async_trait;
 use hickory_resolver::{
-    TokioAsyncResolver,
+    TokioResolver,
     proto::rr::{Record, RecordType},
 };
 
@@ -60,13 +60,15 @@ impl DnsUpstream for SystemUpstream {
             _ => {}
         }
 
-        let resolver = TokioAsyncResolver::tokio_from_system_conf()
-            .map_err(|e| DnsError::Failed(format!("读取系统 DNS 配置失败: {e}")))?;
+        let resolver = TokioResolver::builder_tokio()
+            .map_err(|e| DnsError::Failed(format!("读取系统 DNS 配置失败: {e}")))?
+            .build()
+            .map_err(|e| DnsError::Failed(format!("构造系统 DNS resolver 失败: {e}")))?;
         let lookup = resolver
             .lookup(host.trim_end_matches('.'), record_type)
             .await
             .map_err(|e| DnsError::Failed(e.to_string()))?;
-        let records = lookup.records().to_vec();
+        let records = lookup.answers().to_vec();
         if records.is_empty() {
             Err(DnsError::Empty)
         } else {

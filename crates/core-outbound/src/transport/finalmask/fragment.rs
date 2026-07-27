@@ -5,7 +5,7 @@ use std::{
 };
 
 use core_config::{FragmentMaskConfig, I32Range};
-use rand::Rng;
+use rand::RngExt;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     time::Sleep,
@@ -285,7 +285,7 @@ fn random_between(range: I32Range) -> i32 {
     if range.from == range.to {
         range.from
     } else {
-        rand::thread_rng().gen_range(range.from..range.to)
+        rand::rng().random_range(range.from..range.to)
     }
 }
 

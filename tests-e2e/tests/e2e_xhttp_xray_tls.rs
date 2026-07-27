@@ -123,9 +123,11 @@ impl TestIdentity {
         fs::create_dir_all(&directory).expect("create TLS identity directory");
         let cert_path = directory.join("cert.pem");
         let key_path = directory.join("key.pem");
-        let rcgen::CertifiedKey { cert, key_pair } =
-            rcgen::generate_simple_self_signed(vec!["localhost".into()])
-                .expect("generate localhost test certificate");
+        let rcgen::CertifiedKey {
+            cert,
+            signing_key: key_pair,
+        } = rcgen::generate_simple_self_signed(vec!["localhost".into()])
+            .expect("generate localhost test certificate");
         let cert_der = cert.der().clone();
         let key_der = key_pair.serialize_der();
         fs::write(&cert_path, cert.pem()).expect("write PEM certificate");

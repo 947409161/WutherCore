@@ -26,7 +26,7 @@ use hickory_proto::{
         rdata::{A, AAAA, TXT},
     },
 };
-use rand::RngCore;
+use rand::Rng;
 use tokio::sync::{Mutex, Notify, mpsc};
 
 use crate::adapter::{BoxedUdp, UdpSocketLike};
@@ -60,7 +60,7 @@ pub(super) fn wrap_client(inner: BoxedUdp, config: &XdnsMaskConfig) -> io::Resul
         .map(|resolver| parse_resolver(resolver))
         .collect::<io::Result<Vec<_>>>()?;
     let mut client_id = [0; 8];
-    rand::rngs::OsRng.fill_bytes(&mut client_id);
+    rand::rng().fill_bytes(&mut client_id);
     let inner: Arc<dyn UdpSocketLike> = Arc::from(inner);
     let (write_tx, write_rx) = mpsc::channel(QUEUE_LIMIT);
     let (read_tx, read_rx) = mpsc::channel(QUEUE_LIMIT);
@@ -557,7 +557,7 @@ fn encode_query(payload: &[u8], client_id: &[u8; 8], resolver: &Resolver) -> io:
     decoded.extend_from_slice(client_id);
     decoded.push(224 + padding_length as u8);
     let mut padding = vec![0; padding_length];
-    rand::rngs::OsRng.fill_bytes(&mut padding);
+    rand::rng().fill_bytes(&mut padding);
     decoded.extend_from_slice(&padding);
     if !payload.is_empty() {
         decoded.push(payload.len() as u8);

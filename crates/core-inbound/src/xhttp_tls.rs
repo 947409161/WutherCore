@@ -31,7 +31,7 @@ use core_config::{
 };
 use ocsp_stapler::Client as OcspClient;
 use rasn_ocsp::{BasicOcspResponse, OcspResponse, OcspResponseStatus, ResponderId};
-use rcgen::{CertificateParams, DistinguishedName, DnType, IsCa, KeyPair};
+use rcgen::{CertificateParams, DistinguishedName, DnType, Issuer, KeyPair};
 use rustls::{
     RootCertStore, ServerConfig,
     crypto::CryptoProvider,
@@ -539,11 +539,8 @@ impl DynamicIssuer {
             .map_err(|error| invalid(format!("usage=issue key is not UTF-8 PEM: {error}")))?;
         let ca_key = KeyPair::from_pem(key_pem)
             .map_err(|error| invalid(format!("parse usage=issue CA key: {error}")))?;
-        let ca_params = CertificateParams::from_ca_cert_pem(ca_pem)
+        let ca_issuer = Issuer::from_ca_cert_pem(ca_pem, ca_key)
             .map_err(|error| invalid(format!("parse usage=issue CA certificate: {error}")))?;
-        let ca_certificate = ca_params
-            .self_signed(&ca_key)
-            .map_err(|error| invalid(format!("materialize usage=issue CA: {error}")))?;
 
         let leaf_key = KeyPair::generate()
             .map_err(|error| invalid(format!("generate usage=issue leaf key: {error}")))?;
@@ -553,7 +550,7 @@ impl DynamicIssuer {
         distinguished_name.push(DnType::CommonName, domain);
         leaf_params.distinguished_name = distinguished_name;
         let leaf = leaf_params
-            .signed_by(&leaf_key, &ca_certificate, &ca_key)
+            .signed_by(&leaf_key, &ca_issuer)
             .map_err(|error| invalid(format!("sign usage=issue leaf for {domain:?}: {error}")))?;
 
         let mut certificate = leaf.pem().into_bytes();
@@ -601,15 +598,24 @@ fn validate_dynamic_issuer_material(material: &IssuerMaterial) -> io::Result<()>
         .map_err(|error| invalid(format!("usage=issue CA is not UTF-8 PEM: {error}")))?;
     let key_pem = str::from_utf8(&material.key_pem)
         .map_err(|error| invalid(format!("usage=issue key is not UTF-8 PEM: {error}")))?;
-    let params = CertificateParams::from_ca_cert_pem(certificate_pem)
+    let (_, pem) = x509_parser::pem::parse_x509_pem(&material.certificate_pem)
+        .map_err(|error| invalid(format!("parse usage=issue CA PEM: {error}")))?;
+    let parsed = pem
+        .parse_x509()
         .map_err(|error| invalid(format!("parse usage=issue CA certificate: {error}")))?;
-    if !matches!(params.is_ca, IsCa::Ca(_)) {
+    let is_ca = parsed
+        .basic_constraints()
+        .map_err(|error| invalid(format!("read usage=issue CA constraints: {error}")))?
+        .is_some_and(|constraints| constraints.value.ca);
+    if !is_ca {
         return Err(invalid(
             "usage=issue certificate must have CA basic constraints",
         ));
     }
-    KeyPair::from_pem(key_pem)
+    let key_pair = KeyPair::from_pem(key_pem)
         .map_err(|error| invalid(format!("parse usage=issue CA key: {error}")))?;
+    Issuer::from_ca_cert_pem(certificate_pem, key_pair)
+        .map_err(|error| invalid(format!("load usage=issue CA issuer: {error}")))?;
 
     let certificate = X509::stack_from_pem(&material.certificate_pem)
         .map_err(|error| invalid(format!("parse usage=issue X.509 certificate: {error}")))?
@@ -1199,7 +1205,7 @@ impl BoringIdentitySlot {
 }
 
 fn build_boring(tls: &XhttpListenTlsPlan, alpn: &[String]) -> io::Result<SslAcceptor> {
-    let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server())
+    let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())
         .map_err(|error| invalid(format!("create BoringSSL acceptor: {error}")))?;
     let (min, max) = version_range(tls)?;
     if min < 12 {
@@ -1950,7 +1956,8 @@ mod tests {
         let key = KeyPair::generate().unwrap();
         let mut params = CertificateParams::new(vec![name.to_owned()]).unwrap();
         params.distinguished_name.push(DnType::CommonName, name);
-        let certificate = params.signed_by(&key, ca, ca_key).unwrap();
+        let issuer = Issuer::from_ca_cert_pem(&ca.pem(), ca_key).unwrap();
+        let certificate = params.signed_by(&key, &issuer).unwrap();
         (certificate, key)
     }
 
@@ -2200,9 +2207,8 @@ mod tests {
             .push(DnType::CommonName, "WutherCore test OCSP responder");
         responder_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         responder_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::OcspSigning];
-        let responder = responder_params
-            .signed_by(&responder_key, &ca, &ca_key)
-            .unwrap();
+        let issuer = Issuer::from_ca_cert_pem(&ca.pem(), &ca_key).unwrap();
+        let responder = responder_params.signed_by(&responder_key, &issuer).unwrap();
         let response = signed_ocsp_response(&leaf, &ca, &responder, &responder_key, true);
         validate_ocsp_response(&response, leaf.der().as_ref(), ca.der().as_ref()).unwrap();
 
@@ -2226,7 +2232,7 @@ mod tests {
     fn usage_issue_rejects_non_ca_and_mismatched_private_key() {
         let rcgen::CertifiedKey {
             cert: leaf,
-            key_pair: leaf_key,
+            signing_key: leaf_key,
         } = rcgen::generate_simple_self_signed(vec!["not-a-ca.example".into()]).unwrap();
         let non_ca = IssuerMaterial {
             certificate_pem: leaf.pem().into_bytes(),
@@ -2320,8 +2326,10 @@ mod tests {
 
     #[tokio::test]
     async fn public_xray_acceptor_wraps_arbitrary_bidirectional_io() {
-        let rcgen::CertifiedKey { cert, key_pair } =
-            rcgen::generate_simple_self_signed(vec!["public-api.example".into()]).unwrap();
+        let rcgen::CertifiedKey {
+            cert,
+            signing_key: key_pair,
+        } = rcgen::generate_simple_self_signed(vec!["public-api.example".into()]).unwrap();
         let settings = core_config::model::XhttpDownloadTlsSettings {
             alpn: Some(vec!["h2".into()]),
             certificates: vec![XhttpDownloadTlsCertificate {
@@ -2451,8 +2459,10 @@ mod tests {
 
     #[tokio::test]
     async fn boring_listener_negotiates_real_tls10() {
-        let rcgen::CertifiedKey { cert, key_pair } =
-            rcgen::generate_simple_self_signed(vec!["legacy.example".into()]).unwrap();
+        let rcgen::CertifiedKey {
+            cert,
+            signing_key: key_pair,
+        } = rcgen::generate_simple_self_signed(vec!["legacy.example".into()]).unwrap();
         let plan = static_plan(
             &cert,
             &key_pair,
@@ -2465,7 +2475,7 @@ mod tests {
         );
         let acceptor = build_boring(&plan, &["h2".into()]).unwrap();
 
-        let mut connector = SslConnector::builder(SslMethod::tls_client()).unwrap();
+        let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
         connector.set_verify(SslVerifyMode::NONE);
         connector
             .set_min_proto_version(Some(SslVersion::TLS1))
@@ -2494,8 +2504,10 @@ mod tests {
 
     #[tokio::test]
     async fn boring_listener_staples_selected_identity_ocsp_response() {
-        let rcgen::CertifiedKey { cert, key_pair } =
-            rcgen::generate_simple_self_signed(vec!["ocsp.example".into()]).unwrap();
+        let rcgen::CertifiedKey {
+            cert,
+            signing_key: key_pair,
+        } = rcgen::generate_simple_self_signed(vec!["ocsp.example".into()]).unwrap();
         let mut identity = parse_boring_identity(
             cert.pem().as_bytes(),
             key_pair.serialize_pem().as_bytes(),
@@ -2506,7 +2518,7 @@ mod tests {
         identity.ocsp = Some(expected.clone());
         let identity = Arc::new(identity);
 
-        let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server()).unwrap();
+        let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
         install_boring_identity_on_context(&mut builder, &identity).unwrap();
         let selected_identity_index = Ssl::new_ex_index::<Arc<BoringIdentity>>().unwrap();
         let selected = Arc::clone(&identity);
@@ -2529,7 +2541,7 @@ mod tests {
             .unwrap();
         let acceptor = builder.build();
 
-        let mut connector = SslConnector::builder(SslMethod::tls_client()).unwrap();
+        let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
         connector.set_verify(SslVerifyMode::NONE);
         let mut configuration = connector
             .build()
@@ -2550,8 +2562,10 @@ mod tests {
 
     #[tokio::test]
     async fn boring_listener_accepts_xray_framed_ech_server_keys() {
-        let rcgen::CertifiedKey { cert, key_pair } =
-            rcgen::generate_simple_self_signed(vec!["foobar.com".into()]).unwrap();
+        let rcgen::CertifiedKey {
+            cert,
+            signing_key: key_pair,
+        } = rcgen::generate_simple_self_signed(vec!["foobar.com".into()]).unwrap();
         let plan = static_plan(
             &cert,
             &key_pair,
@@ -2564,7 +2578,7 @@ mod tests {
         );
         let acceptor = build_boring(&plan, &["h2".into()]).unwrap();
 
-        let mut connector = SslConnector::builder(SslMethod::tls_client()).unwrap();
+        let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
         connector.set_verify(SslVerifyMode::NONE);
         connector.set_alpn_protos(b"\x02h2").unwrap();
         let connector = connector.build();
@@ -2591,8 +2605,10 @@ mod tests {
 
     #[tokio::test]
     async fn shaped_rustls_client_and_boring_server_interoperate_with_real_ech() {
-        let rcgen::CertifiedKey { cert, key_pair } =
-            rcgen::generate_simple_self_signed(vec!["foobar.com".into()]).unwrap();
+        let rcgen::CertifiedKey {
+            cert,
+            signing_key: key_pair,
+        } = rcgen::generate_simple_self_signed(vec!["foobar.com".into()]).unwrap();
         let plan = static_plan(
             &cert,
             &key_pair,

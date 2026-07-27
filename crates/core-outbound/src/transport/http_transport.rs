@@ -14,7 +14,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use rand::seq::SliceRandom;
+use rand::seq::IndexedRandom;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::{
@@ -49,7 +49,7 @@ impl Transport for HttpTransport {
         tls.enabled = true;
         // 选 path / host 在 await 前完成（避免 ThreadRng 跨 await）
         let (path, host_header) = {
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             let p = if !self.opts.path.is_empty() {
                 self.opts
                     .path

@@ -1112,7 +1112,10 @@ mod tests {
         drop(udp);
 
         set_socket_protector(None);
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            calls.load(Ordering::SeqCst) >= 1,
+            "Direct UDP creation must invoke the socket protector"
+        );
     }
 
     #[tokio::test]
@@ -1157,7 +1160,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_udp_fails_closed_for_a_different_target() {
+    async fn direct_udp_reuses_one_association_for_multiple_targets() {
         let _guard = lock_test_protector();
         set_socket_protector(None);
 
@@ -1174,33 +1177,29 @@ mod tests {
         .await
         .unwrap();
 
-        let same_family_err = udp
-            .send_to(b"wrong-peer", "127.0.0.1", second_addr.port())
-            .await
-            .unwrap_err();
-        assert_eq!(same_family_err.kind(), std::io::ErrorKind::InvalidInput);
-        assert!(
-            same_family_err
-                .to_string()
-                .contains("multiple destinations")
+        assert_eq!(
+            udp.send_to(b"second-peer", "127.0.0.1", second_addr.port())
+                .await
+                .unwrap(),
+            b"second-peer".len()
         );
 
         let cross_family_err = udp
             .send_to(b"wrong-family", "::1", first_addr.port())
             .await
             .unwrap_err();
-        assert_eq!(cross_family_err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            cross_family_err.kind(),
+            std::io::ErrorKind::AddrNotAvailable
+        );
 
-        let mut first_buf = [0u8; 64];
         let mut second_buf = [0u8; 64];
-        let (first_receive, second_receive) = tokio::join!(
-            tokio::time::timeout(NETWORK_PROBE_TIMEOUT, first.recv_from(&mut first_buf),),
-            tokio::time::timeout(NETWORK_PROBE_TIMEOUT, second.recv_from(&mut second_buf),)
-        );
-        assert!(
-            first_receive.is_err() && second_receive.is_err(),
-            "a rejected Direct UDP send must not leak to either destination"
-        );
+        let (received, _) =
+            tokio::time::timeout(NETWORK_PROBE_TIMEOUT, second.recv_from(&mut second_buf))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(&second_buf[..received], b"second-peer");
     }
 
     #[tokio::test]

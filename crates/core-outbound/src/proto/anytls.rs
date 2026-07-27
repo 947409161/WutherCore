@@ -46,7 +46,7 @@ use std::{
 use async_trait::async_trait;
 use bytes::{Buf, BufMut, BytesMut};
 use parking_lot::Mutex as PlMutex;
-use rand::RngCore;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
@@ -329,7 +329,7 @@ impl AnyTlsSession {
         wire.extend_from_slice(data);
         if padding_len > 0 {
             let mut padding = vec![0u8; padding_len];
-            rand::rngs::OsRng.fill_bytes(&mut padding);
+            rand::rng().fill_bytes(&mut padding);
             wire.extend_from_slice(&padding);
         }
         let mut w = self.writer.lock().await;

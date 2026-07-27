@@ -28,8 +28,8 @@
 use bytes::{Buf, BufMut};
 use curve25519_dalek::{montgomery::MontgomeryPoint, scalar::Scalar};
 use hex::ToHex;
-use hmac::{Hmac, Mac};
-use rand::RngCore;
+use hmac::{Hmac, KeyInit as HmacKeyInit, Mac};
+use rand::Rng;
 use sha2::{Digest, Sha256};
 
 const KIP_MAGIC: &[u8; 3] = b"kip";
@@ -260,13 +260,13 @@ pub fn client_aead_seed(key: &str) -> &str {
 
 pub fn random_nonce() -> [u8; KIP_HELLO_NONCE_SIZE] {
     let mut nonce = [0u8; KIP_HELLO_NONCE_SIZE];
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    rand::rng().fill_bytes(&mut nonce);
     nonce
 }
 
 pub fn random_x25519_priv() -> [u8; 32] {
     let mut priv_key = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut priv_key);
+    rand::rng().fill_bytes(&mut priv_key);
     priv_key[0] &= 248;
     priv_key[31] &= 127;
     priv_key[31] |= 64;
@@ -312,8 +312,8 @@ mod tests {
     fn x25519_dh_consistency() {
         let mut a_priv = [0u8; 32];
         let mut b_priv = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut a_priv);
-        rand::rngs::OsRng.fill_bytes(&mut b_priv);
+        rand::rng().fill_bytes(&mut a_priv);
+        rand::rng().fill_bytes(&mut b_priv);
         let a_pub = x25519_pub(&a_priv);
         let b_pub = x25519_pub(&b_priv);
         let s_ab = x25519_shared(&a_priv, &b_pub);

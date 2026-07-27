@@ -9,7 +9,7 @@
 use std::{future::Future, net::IpAddr, thread};
 
 use futures::TryStreamExt;
-use netlink_packet_route::{
+use rtnetlink::packet_route::{
     route::{RouteMessage, RouteScope, RouteType},
     rule::RuleAction,
 };

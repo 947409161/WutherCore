@@ -24,7 +24,7 @@ use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
-use rand::{Rng, RngCore};
+use rand::{Rng, RngExt};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use tokio::{sync::Mutex, task::JoinHandle};
@@ -1156,8 +1156,8 @@ impl PunchMetadata {
     fn random() -> Self {
         let mut nonce = [0; 16];
         let mut obfs = [0; 32];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
-        rand::rngs::OsRng.fill_bytes(&mut obfs);
+        rand::rng().fill_bytes(&mut nonce);
+        rand::rng().fill_bytes(&mut obfs);
         Self {
             nonce: hex::encode(nonce),
             obfs: hex::encode(obfs),
@@ -1282,7 +1282,7 @@ async fn discover(
 
 fn stun_binding_request() -> (Vec<u8>, [u8; 12]) {
     let mut transaction = [0; 12];
-    rand::rngs::OsRng.fill_bytes(&mut transaction);
+    rand::rng().fill_bytes(&mut transaction);
     let mut packet = vec![0; 20];
     packet[..2].copy_from_slice(&1_u16.to_be_bytes());
     packet[4..8].copy_from_slice(&STUN_MAGIC.to_be_bytes());
@@ -1423,14 +1423,14 @@ enum PunchType {
 
 fn encode_punch(kind: PunchType, metadata: &PunchMetadata) -> io::Result<Vec<u8>> {
     let (nonce, obfs) = decode_metadata(metadata)?;
-    let padding = rand::thread_rng().gen_range(0..=MAX_PUNCH_PADDING);
+    let padding = rand::rng().random_range(0..=MAX_PUNCH_PADDING);
     let mut plain = vec![0; PUNCH_HEADER_LEN + padding];
     plain[..8].copy_from_slice(PUNCH_MAGIC);
     plain[8] = kind as u8;
     plain[9..25].copy_from_slice(&nonce);
-    rand::rngs::OsRng.fill_bytes(&mut plain[PUNCH_HEADER_LEN..]);
+    rand::rng().fill_bytes(&mut plain[PUNCH_HEADER_LEN..]);
     let mut packet = vec![0; PUNCH_SALT_LEN + plain.len()];
-    rand::rngs::OsRng.fill_bytes(&mut packet[..PUNCH_SALT_LEN]);
+    rand::rng().fill_bytes(&mut packet[..PUNCH_SALT_LEN]);
     packet[PUNCH_SALT_LEN..].copy_from_slice(&plain);
     let (salt, encrypted) = packet.split_at_mut(PUNCH_SALT_LEN);
     xor_punch(encrypted, &obfs, salt);

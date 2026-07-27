@@ -19,7 +19,7 @@ use neqo_transport::{
     ConnectionParameters, Output, RandomConnectionIdGenerator, StreamId, StreamType,
 };
 use nss::AntiReplay;
-use rand::{RngCore, rngs::OsRng};
+use rand::Rng;
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
     net::{TcpStream, UdpSocket},
@@ -1066,7 +1066,7 @@ async fn udp_target(
         stream_id,
         association_id,
     });
-    let mut packet_id = OsRng.next_u32();
+    let mut packet_id = rand::rng().next_u32();
     let mut buffer = vec![0; 65_535];
     loop {
         tokio::select! {

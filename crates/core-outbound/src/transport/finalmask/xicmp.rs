@@ -18,7 +18,7 @@ use std::{
 
 use async_trait::async_trait;
 use core_config::XicmpMaskConfig;
-use rand::{RngCore, seq::SliceRandom};
+use rand::{Rng, seq::IndexedRandom};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use tokio::{sync::Mutex, task::JoinHandle};
 
@@ -50,7 +50,7 @@ pub(super) fn wrap_client(
     let (ipv4, ipv4_guard) = open_icmp_socket(false, config.dgram, false)?;
     let (ipv6, ipv6_guard) = open_icmp_socket(true, config.dgram, false)?;
     let mut client_id = [0; CLIENT_ID];
-    rand::rngs::OsRng.fill_bytes(&mut client_id);
+    rand::rng().fill_bytes(&mut client_id);
     let id = rand::random::<u16>();
     let sequence = Arc::new(AtomicU16::new(1));
     let closed = Arc::new(AtomicBool::new(false));
@@ -598,7 +598,7 @@ impl UdpSocketLike for XicmpClient {
                 MAX_PACKET - ICMP_HEADER - CLIENT_ID
             )));
         }
-        let ip = if let Some(ip) = self.ips.choose(&mut rand::thread_rng()) {
+        let ip = if let Some(ip) = self.ips.choose(&mut rand::rng()) {
             *ip
         } else if let Some(remote) = self.remote {
             remote.ip()

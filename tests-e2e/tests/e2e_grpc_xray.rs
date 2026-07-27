@@ -148,9 +148,11 @@ struct TestCertificate {
 
 impl TestCertificate {
     fn generate(name: &str) -> Self {
-        let rcgen::CertifiedKey { cert, key_pair } =
-            rcgen::generate_simple_self_signed(vec![name.to_owned()])
-                .expect("generate gRPC TLS test certificate");
+        let rcgen::CertifiedKey {
+            cert,
+            signing_key: key_pair,
+        } = rcgen::generate_simple_self_signed(vec![name.to_owned()])
+            .expect("generate gRPC TLS test certificate");
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock after epoch")

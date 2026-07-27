@@ -48,7 +48,7 @@ use std::{
 use async_trait::async_trait;
 use bytes::{Buf, BufMut, Bytes};
 use quinn::{ClientConfig, Endpoint, TransportConfig, crypto::rustls::QuicClientConfig};
-use rand::{RngCore, rngs::OsRng};
+use rand::Rng;
 use rustls::ClientConfig as RustlsConfig;
 use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore, mpsc};
 use uuid::Uuid;
@@ -1332,7 +1332,7 @@ impl FragmentReassembler {
 }
 
 fn random_u16() -> u16 {
-    OsRng.next_u32() as u16
+    rand::rng().next_u32() as u16
 }
 
 fn invalid_data(message: impl Into<String>) -> io::Error {

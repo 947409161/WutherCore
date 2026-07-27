@@ -72,11 +72,8 @@ fn create_marked_tcp(peer: SocketAddr) -> std::io::Result<tokio::net::TcpStream>
 pub(super) fn build_query(host: &str, qtype: RecordType) -> Result<Vec<u8>, DnsError> {
     let name = Name::from_ascii(host.trim_end_matches('.'))
         .map_err(|e| DnsError::Failed(format!("invalid DNS name: {e}")))?;
-    let mut msg = Message::new();
-    msg.set_id(rand_id());
-    msg.set_message_type(MessageType::Query);
-    msg.set_op_code(OpCode::Query);
-    msg.set_recursion_desired(true);
+    let mut msg = Message::new(rand_id(), MessageType::Query, OpCode::Query);
+    msg.metadata.recursion_desired = true;
     msg.add_query(Query::query(name, qtype));
     msg.to_vec()
         .map_err(|e| DnsError::Failed(format!("DNS encode: {e}")))
@@ -85,10 +82,10 @@ pub(super) fn build_query(host: &str, qtype: RecordType) -> Result<Vec<u8>, DnsE
 pub(super) fn parse_response(buf: &[u8], qtype: RecordType) -> Result<Vec<IpAddr>, DnsError> {
     let msg = Message::from_bytes(buf).map_err(|e| DnsError::Failed(format!("DNS decode: {e}")))?;
     let mut ips = Vec::new();
-    for answer in msg.answers() {
-        match (qtype, answer.data()) {
-            (RecordType::A, Some(RData::A(a))) => ips.push(IpAddr::V4(a.0)),
-            (RecordType::AAAA, Some(RData::AAAA(a))) => ips.push(IpAddr::V6(a.0)),
+    for answer in &msg.answers {
+        match (qtype, &answer.data) {
+            (RecordType::A, RData::A(a)) => ips.push(IpAddr::V4(a.0)),
+            (RecordType::AAAA, RData::AAAA(a)) => ips.push(IpAddr::V6(a.0)),
             _ => {}
         }
     }
@@ -101,7 +98,7 @@ pub(super) fn parse_response(buf: &[u8], qtype: RecordType) -> Result<Vec<IpAddr
 
 pub(super) fn parse_records(buf: &[u8]) -> Result<Vec<Record>, DnsError> {
     let msg = Message::from_bytes(buf).map_err(|e| DnsError::Failed(format!("DNS decode: {e}")))?;
-    let records = msg.answers().to_vec();
+    let records = msg.answers;
     if records.is_empty() {
         Err(DnsError::Empty)
     } else {

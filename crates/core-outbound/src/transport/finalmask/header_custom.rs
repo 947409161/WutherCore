@@ -11,7 +11,7 @@ use core_config::{
     HeaderCustomUdpConfig, HeaderCustomUdpItem, I32Range,
 };
 use parking_lot::Mutex;
-use rand::{Rng, RngCore};
+use rand::{Rng, RngExt};
 use regex::Regex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -353,11 +353,11 @@ fn evaluate_item(
             let range = item.rand_range.unwrap_or_else(|| I32Range::new(0, 255));
             let mut value = vec![0; length];
             if range.from == 0 && range.to == 255 {
-                rand::thread_rng().fill_bytes(&mut value);
+                rand::rng().fill_bytes(&mut value);
             } else {
-                let mut rng = rand::thread_rng();
+                let mut rng = rand::rng();
                 for byte in &mut value {
-                    *byte = rng.gen_range(range.from..=range.to) as u8;
+                    *byte = rng.random_range(range.from..=range.to) as u8;
                 }
             }
             value
@@ -867,11 +867,11 @@ fn evaluate_udp_item(
         let range = item.rand_range.unwrap_or_else(|| I32Range::new(0, 255));
         let mut output = vec![0; length];
         if range.from == 0 && range.to == 255 {
-            rand::thread_rng().fill_bytes(&mut output);
+            rand::rng().fill_bytes(&mut output);
         } else {
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             for byte in &mut output {
-                *byte = rng.gen_range(range.from..=range.to) as u8;
+                *byte = rng.random_range(range.from..=range.to) as u8;
             }
         }
         output
@@ -976,7 +976,7 @@ fn random_between(range: I32Range) -> i32 {
     if range.from == range.to {
         range.from
     } else {
-        rand::thread_rng().gen_range(range.from..range.to)
+        rand::rng().random_range(range.from..range.to)
     }
 }
 

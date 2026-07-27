@@ -68,7 +68,7 @@ use std::{
 
 use aes::{
     Aes128,
-    cipher::{BlockEncrypt, KeyInit as AesKeyInit},
+    cipher::{BlockCipherEncrypt, KeyInit as AesKeyInit},
 };
 use aes_gcm::{
     Aes128Gcm, Nonce,
@@ -79,8 +79,8 @@ use bytes::{Buf, BufMut, BytesMut};
 use chacha20poly1305::ChaCha20Poly1305;
 use md5::{Digest, Md5};
 use pin_project_lite::pin_project;
-use rand::RngCore;
-use sha3::{
+use rand::Rng;
+use shake::{
     Shake128,
     digest::{ExtendableOutput, XofReader},
 };
@@ -322,9 +322,9 @@ impl OutboundAdapter for VmessOutbound {
         let mut iv = [0u8; 16];
         let mut req_key = [0u8; 16];
         let mut resp_auth = [0u8; 1];
-        rand::rngs::OsRng.fill_bytes(&mut iv);
-        rand::rngs::OsRng.fill_bytes(&mut req_key);
-        rand::rngs::OsRng.fill_bytes(&mut resp_auth);
+        rand::rng().fill_bytes(&mut iv);
+        rand::rng().fill_bytes(&mut req_key);
+        rand::rng().fill_bytes(&mut resp_auth);
 
         let security = self.security.select();
         let cmd = if ctx.network == "udp" {
@@ -349,7 +349,7 @@ impl OutboundAdapter for VmessOutbound {
         let mut auth_id = [0u8; 16];
         build_auth_id(&cmd_key, &mut auth_id);
         let mut conn_nonce = [0u8; 8];
-        rand::rngs::OsRng.fill_bytes(&mut conn_nonce);
+        rand::rng().fill_bytes(&mut conn_nonce);
 
         let length_aead =
             aead_seal_header_length(&cmd_key, &auth_id, &conn_nonce, header_payload.len() as u16)?;
@@ -467,7 +467,7 @@ fn build_auth_id(cmd_key: &[u8; 16], out: &mut [u8; 16]) {
     let mut buf = [0u8; 16];
     buf[..8].copy_from_slice(&(now as u64).to_be_bytes());
     let mut rand4 = [0u8; 4];
-    rand::rngs::OsRng.fill_bytes(&mut rand4);
+    rand::rng().fill_bytes(&mut rand4);
     buf[8..12].copy_from_slice(&rand4);
     let crc = crc32fast::hash(&buf[..12]);
     buf[12..16].copy_from_slice(&crc.to_be_bytes());
@@ -786,7 +786,7 @@ impl AsyncWrite for VmessResponseStream {
 /* ---------------- Shaker (SHAKE128 派生器) ---------------- */
 
 struct Shaker {
-    reader: sha3::Shake128Reader,
+    reader: shake::Shake128Reader,
 }
 
 impl Shaker {
@@ -1177,7 +1177,7 @@ impl AsyncWrite for VmessStream {
             // Xray asks the padding generator before encoding the size.
             let padding_len = this.send.next_padding_len();
             let mut padding = vec![0_u8; padding_len];
-            rand::rngs::OsRng.fill_bytes(&mut padding);
+            rand::rng().fill_bytes(&mut padding);
             let total_size = (sealed.len() + padding_len) as u16;
             let length_field = match this.send.encode_length_field(total_size) {
                 Ok(value) => value,

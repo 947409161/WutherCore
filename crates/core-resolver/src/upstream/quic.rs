@@ -339,11 +339,8 @@ fn build_dns_query(host: &str, record_type: RecordType) -> Result<Vec<u8>, DnsEr
     let name = Name::from_ascii(host.trim_end_matches('.'))
         .map_err(|e| DnsError::Failed(format!("invalid domain: {e}")))?;
 
-    let mut msg = Message::new();
-    msg.set_id(0); // RFC 9250: ID MUST be 0
-    msg.set_message_type(MessageType::Query);
-    msg.set_op_code(OpCode::Query);
-    msg.set_recursion_desired(true);
+    let mut msg = Message::new(0, MessageType::Query, OpCode::Query);
+    msg.metadata.recursion_desired = true;
 
     let mut query = Query::new();
     query.set_name(name);
@@ -361,15 +358,12 @@ fn parse_dns_response(buf: &[u8], record_type: RecordType) -> Result<Vec<IpAddr>
     let msg = Message::from_bytes(buf).map_err(|e| DnsError::Failed(format!("DNS decode: {e}")))?;
 
     let ips: Vec<IpAddr> = msg
-        .answers()
+        .answers
         .iter()
-        .filter_map(|r| {
-            let data = r.data()?;
-            match (record_type, data) {
-                (RecordType::A, RData::A(a)) => Some(IpAddr::V4(a.0)),
-                (RecordType::AAAA, RData::AAAA(a)) => Some(IpAddr::V6(a.0)),
-                _ => None,
-            }
+        .filter_map(|r| match (record_type, &r.data) {
+            (RecordType::A, RData::A(a)) => Some(IpAddr::V4(a.0)),
+            (RecordType::AAAA, RData::AAAA(a)) => Some(IpAddr::V6(a.0)),
+            _ => None,
         })
         .collect();
 
@@ -389,7 +383,7 @@ fn parse_dns_records(
 
     let msg = Message::from_bytes(buf).map_err(|e| DnsError::Failed(format!("DNS decode: {e}")))?;
 
-    let records: Vec<Record> = msg.answers().to_vec();
+    let records: Vec<Record> = msg.answers;
     if records.is_empty() {
         Err(DnsError::Empty)
     } else {

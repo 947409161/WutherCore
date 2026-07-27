@@ -7,8 +7,8 @@ use std::{
 };
 
 use base64::Engine as _;
-use hmac::{Hmac, Mac};
-use rand::{RngCore, rngs::OsRng};
+use hmac::{Hmac, KeyInit, Mac};
+use rand::Rng;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
@@ -311,7 +311,7 @@ pub fn create_authorization(
 ) -> io::Result<(String, [u8; 16])> {
     let timestamp = unix_time_secs()?;
     let mut nonce = [0; 16];
-    OsRng.fill_bytes(&mut nonce);
+    rand::rng().fill_bytes(&mut nonce);
     Ok((
         create_authorization_at(key, authority, path, capabilities, timestamp, nonce),
         nonce,
@@ -435,7 +435,7 @@ pub fn encode_flow_open(
     );
     let padding_start = frame.len();
     frame.resize(padding_start + padding_len, 0);
-    OsRng.fill_bytes(&mut frame[padding_start..]);
+    rand::rng().fill_bytes(&mut frame[padding_start..]);
     let tag = hmac_tag(session_key.as_bytes(), &[b"young/flow-open/v1", &frame]);
     frame.extend_from_slice(&tag[..FLOW_TAG_BYTES]);
     Ok(frame)

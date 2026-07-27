@@ -14,11 +14,14 @@ use futures::future::poll_fn;
 use parking_lot::Mutex;
 use smoltcp::{
     iface::{Config as InterfaceConfig, Interface, SocketHandle, SocketSet},
-    phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
+    phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken},
     socket::{tcp, udp},
     storage::PacketMetadata,
     time::Instant,
-    wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint},
+    wire::{
+        HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, IpProtocol, Ipv6Address,
+        Ipv6Packet, Ipv6Repr, UdpPacket, UdpRepr,
+    },
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
@@ -42,10 +45,7 @@ struct VirtualDevice {
 
 impl VirtualDevice {
     fn new(mtu: usize, queue_limit: usize) -> Self {
-        // smoltcp 0.11 advances IPv4 fragment offsets in octets but rounds the
-        // encoded offset down to 8-byte units. Reporting an IP MTU whose
-        // (mtu - 20) is aligned prevents overlapping fragments for arbitrary
-        // configured WireGuard MTUs; the public MTU remains unchanged.
+        // Keep IPv4 fragment offsets aligned.
         let mtu = mtu - ((mtu - 4) % 8);
         Self {
             rx: VecDeque::with_capacity(queue_limit.min(1_024)),
@@ -327,11 +327,11 @@ struct VirtualTxToken<'a> {
 }
 
 impl RxToken for VirtualRxToken {
-    fn consume<R, F>(mut self, f: F) -> R
+    fn consume<R, F>(self, f: F) -> R
     where
-        F: FnOnce(&mut [u8]) -> R,
+        F: FnOnce(&[u8]) -> R,
     {
-        f(&mut self.packet)
+        f(&self.packet)
     }
 }
 
@@ -703,7 +703,12 @@ impl StackShared {
             .bind(53)
             .map_err(|error| io_err(format!("wireguard test DNS listen failed: {error:?}")))?;
         let dns = state.sockets.add(dns_socket);
-        Ok(EchoServices { tcp, udp, dns })
+        Ok(EchoServices {
+            tcp,
+            udp,
+            udp_port,
+            dns,
+        })
     }
 
     #[cfg(test)]
@@ -726,6 +731,9 @@ impl StackShared {
                 socket.close();
             }
         }
+        let mut oversized_ipv6_replies = Vec::new();
+        let local_v6 = state.local_v6;
+        let configured_mtu = state.device.mtu;
         {
             let socket = state.sockets.get_mut::<udp::Socket>(services.udp);
             while socket.can_recv() && socket.can_send() {
@@ -734,6 +742,19 @@ impl StackShared {
                     break;
                 };
                 buffer.truncate(received);
+                if let (IpAddress::Ipv6(remote), Some(IpAddr::V6(local))) =
+                    (metadata.endpoint.addr, local_v6)
+                    && received + 48 > configured_mtu
+                {
+                    oversized_ipv6_replies.push(build_ipv6_udp_packet(
+                        local,
+                        services.udp_port,
+                        remote,
+                        metadata.endpoint.port,
+                        &buffer,
+                    ));
+                    continue;
+                }
                 if socket.send_slice(&buffer, metadata.endpoint).is_err() {
                     break;
                 }
@@ -755,6 +776,11 @@ impl StackShared {
                 }
             }
         }
+        for packet in oversized_ipv6_replies {
+            if state.device.tx.len() < state.device.queue_limit {
+                state.device.tx.push_back(packet);
+            }
+        }
         state.poll();
         let packets = state.device.drain_tx();
         self.epoch.fetch_add(1, Ordering::Release);
@@ -767,6 +793,7 @@ impl StackShared {
 pub(super) struct EchoServices {
     tcp: SocketHandle,
     udp: SocketHandle,
+    udp_port: u16,
     dns: SocketHandle,
 }
 
@@ -1097,6 +1124,25 @@ impl WireGuardUdpSocket {
         poll_fn(move |cx| {
             lease.ensure_active()?;
             let mut state = lease.shared.state.lock();
+            if let (SocketAddr::V6(target), Some(IpAddr::V6(source))) = (target, state.local_v6)
+                && buffer.len() + 48 > state.device.mtu
+            {
+                if state.device.tx.len() >= state.device.queue_limit {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "wireguard plaintext transmit queue is full",
+                    )));
+                }
+                state.device.tx.push_back(build_ipv6_udp_packet(
+                    source,
+                    lease.port,
+                    *target.ip(),
+                    target.port(),
+                    buffer,
+                ));
+                lease.touch();
+                return Poll::Ready(Ok(buffer.len()));
+            }
             let socket = state.sockets.get_mut::<udp::Socket>(lease.handle);
             match socket.send_slice(
                 buffer,
@@ -1162,6 +1208,41 @@ fn to_smol_ip(ip: IpAddr) -> IpAddress {
         IpAddr::V4(ip) => IpAddress::Ipv4(ip.into()),
         IpAddr::V6(ip) => IpAddress::Ipv6(ip.into()),
     }
+}
+
+fn build_ipv6_udp_packet(
+    source: std::net::Ipv6Addr,
+    source_port: u16,
+    destination: std::net::Ipv6Addr,
+    destination_port: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let source = Ipv6Address::from(source.octets());
+    let destination = Ipv6Address::from(destination.octets());
+    let udp = UdpRepr {
+        src_port: source_port,
+        dst_port: destination_port,
+    };
+    let ip = Ipv6Repr {
+        src_addr: source,
+        dst_addr: destination,
+        next_header: IpProtocol::Udp,
+        payload_len: 8 + payload.len(),
+        hop_limit: 64,
+    };
+    let mut packet = vec![0; ip.buffer_len() + 8 + payload.len()];
+    let mut ip_packet = Ipv6Packet::new_unchecked(&mut packet);
+    ip.emit(&mut ip_packet);
+    let mut udp_packet = UdpPacket::new_unchecked(ip_packet.payload_mut());
+    udp.emit(
+        &mut udp_packet,
+        &IpAddress::Ipv6(source),
+        &IpAddress::Ipv6(destination),
+        payload.len(),
+        |output| output.copy_from_slice(payload),
+        &ChecksumCapabilities::default(),
+    );
+    packet
 }
 
 fn from_smol_endpoint(endpoint: IpEndpoint) -> SocketAddr {
