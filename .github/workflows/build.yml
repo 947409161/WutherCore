@@ -214,12 +214,12 @@ jobs:
           WUTHER_BUILD_TAGS: ${{ steps.components.outputs.tags }}
         run: |
           set -euo pipefail
-          feature_args=()
           if [ -n "$WUTHER_BUILD_TAGS" ]; then
-            feature_args=(--no-default-features --features "$WUTHER_BUILD_TAGS")
+            cargo build --release --locked --target "$TARGET" \
+              -p wuther-core --no-default-features --features "$WUTHER_BUILD_TAGS"
+          else
+            cargo build --release --locked --target "$TARGET" -p wuther-core
           fi
-          cargo build --release --locked --target "$TARGET" \
-            -p wuther-core "${feature_args[@]}"
 
       - name: Build Linux binary with Cross
         if: matrix.platform.builder == 'cross'
@@ -229,12 +229,12 @@ jobs:
           WUTHER_BUILD_TAGS: ${{ steps.components.outputs.tags }}
         run: |
           set -euo pipefail
-          feature_args=()
           if [ -n "$WUTHER_BUILD_TAGS" ]; then
-            feature_args=(--no-default-features --features "$WUTHER_BUILD_TAGS")
+            cross build --release --locked --target "$TARGET" \
+              -p wuther-core --no-default-features --features "$WUTHER_BUILD_TAGS"
+          else
+            cross build --release --locked --target "$TARGET" -p wuther-core
           fi
-          cross build --release --locked --target "$TARGET" \
-            -p wuther-core "${feature_args[@]}"
 
       - name: Package artifact
         id: package
@@ -327,12 +327,14 @@ jobs:
           WUTHER_BUILD_TAGS: ${{ steps.components.outputs.tags }}
         run: |
           set -euo pipefail
-          feature_args=()
           if [ -n "$WUTHER_BUILD_TAGS" ]; then
-            feature_args=(--no-default-features --features "$WUTHER_BUILD_TAGS")
+            cargo ndk --target "$NDK_TARGET" --platform 24 \
+              build --release --locked -p wuther-core \
+              --no-default-features --features "$WUTHER_BUILD_TAGS"
+          else
+            cargo ndk --target "$NDK_TARGET" --platform 24 \
+              build --release --locked -p wuther-core
           fi
-          cargo ndk --target "$NDK_TARGET" --platform 24 \
-            build --release --locked -p wuther-core "${feature_args[@]}"
 
       - name: Package artifact
         id: package
@@ -396,12 +398,12 @@ jobs:
           WUTHER_BUILD_TAGS: ${{ needs.prepare.outputs.tags }}
         run: |
           set -euo pipefail
-          feature_args=()
           if [ -n "$WUTHER_BUILD_TAGS" ]; then
-            feature_args=(--no-default-features --features "$WUTHER_BUILD_TAGS")
+            cargo build --release --locked --target "$TARGET" \
+              -p wuther-core --no-default-features --features "$WUTHER_BUILD_TAGS"
+          else
+            cargo build --release --locked --target "$TARGET" -p wuther-core
           fi
-          cargo build --release --locked --target "$TARGET" \
-            -p wuther-core "${feature_args[@]}"
 
       - name: Smoke-test Windows binary
         shell: pwsh
@@ -472,12 +474,12 @@ jobs:
           WUTHER_BUILD_TAGS: ${{ needs.prepare.outputs.tags }}
         run: |
           set -euo pipefail
-          feature_args=()
           if [ -n "$WUTHER_BUILD_TAGS" ]; then
-            feature_args=(--no-default-features --features "$WUTHER_BUILD_TAGS")
+            cargo build --release --locked --target "$TARGET" \
+              -p wuther-core --no-default-features --features "$WUTHER_BUILD_TAGS"
+          else
+            cargo build --release --locked --target "$TARGET" -p wuther-core
           fi
-          cargo build --release --locked --target "$TARGET" \
-            -p wuther-core "${feature_args[@]}"
 
       - name: Smoke-test macOS binary
         shell: bash

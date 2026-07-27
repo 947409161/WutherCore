@@ -206,12 +206,13 @@ jobs:
           WUTHER_BUILD_TAGS: ${{ needs.prepare.outputs.tags }}
         run: |
           set -euo pipefail
-          feature_args=()
           if [ -n "$WUTHER_BUILD_TAGS" ]; then
-            feature_args=(--no-default-features --features "$WUTHER_BUILD_TAGS")
+            cargo build --profile release-fast --locked --target "$TARGET" \
+              -p wuther-core --no-default-features --features "$WUTHER_BUILD_TAGS"
+          else
+            cargo build --profile release-fast --locked --target "$TARGET" \
+              -p wuther-core
           fi
-          cargo build --profile release-fast --locked --target "$TARGET" \
-            -p wuther-core "${feature_args[@]}"
 
       - name: Smoke-test macOS binary
         shell: bash
