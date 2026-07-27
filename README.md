@@ -223,7 +223,6 @@ wuther-core store reset                          清空学习数据
 | [管理 API](docs/API.md) | 鉴权、原生 `/v1` 端点和兼容接口 |
 | [排错手册](docs/TROUBLESHOOTING.md) | 权限、TUN、DNS、订阅与日志排查 |
 | [路线图](ROADMAP.md) | 当前重点与 1.0 前的完成标准 |
-| [内核设计文档](RP内核设计文档.md) | 更详细的设计背景和实现说明 |
 | [构建性能](docs/BUILD-PERF.md) | Cargo 构建与编译性能配置 |
 | [构建脚本](scripts/README.md) | 多平台构建脚本和产物 |
 | [发版指南](docs/RELEASING.md) | 正式版、预发布、标签、校验和构建证明 |
