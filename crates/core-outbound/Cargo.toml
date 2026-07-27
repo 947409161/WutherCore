@@ -153,7 +153,6 @@ hyper-util        = { version = "0.1", features = ["client", "client-legacy", "t
 http-body-util    = "0.1"
 rand_chacha       = "0.10"
 smoltcp           = { version = "0.13", default-features = false, features = ["std", "alloc", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "proto-ipv4-fragmentation", "proto-ipv6-fragmentation", "fragmentation-buffer-size-65536", "reassembly-buffer-size-65536", "reassembly-buffer-count-4", "assembler-max-segment-count-32", "iface-max-addr-count-8", "iface-max-route-count-2", "socket-tcp", "socket-udp", "async"] }
-ggstd             = "0.1"
 rsa               = "0.9"
 num-bigint-dig    = { version = "0.9.1", features = ["prime"] }
 # socket2：在 Linux/Android 上对 outbound socket 设置 SO_MARK，配合

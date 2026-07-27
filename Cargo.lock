@@ -1485,7 +1485,6 @@ dependencies = [
  "flate2",
  "fnv",
  "futures",
- "ggstd",
  "h2",
  "h3",
  "h3-quinn",
@@ -2776,12 +2775,6 @@ dependencies = [
  "rand_core 0.10.1",
  "wasm-bindgen",
 ]
-
-[[package]]
-name = "ggstd"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e924479d38dab35ad7dae658abe8429467c5ca109a72e50ce61e8e616fd6487"
 
 [[package]]
 name = "ghash"

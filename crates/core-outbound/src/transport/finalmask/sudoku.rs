@@ -3,8 +3,8 @@ use std::{
     sync::{Arc, LazyLock},
 };
 
+use base64::Engine as _;
 use core_config::SudokuMaskConfig;
-use ggstd::math::rand::{Rand as GoRand, new_source};
 use parking_lot::Mutex;
 use rand::RngExt;
 use sha2::{Digest, Sha256};
@@ -38,6 +38,168 @@ const PERM4: [[usize; 4]; 24] = [
     [3, 2, 0, 1],
     [3, 2, 1, 0],
 ];
+
+// Go's compatibility-stable math/rand Source. The cooked state and algorithm
+// are from the Go standard library (BSD-3-Clause). Keeping this tiny local
+// implementation avoids pulling the Linux/Windows-only `ggstd` crate into
+// macOS and Android builds.
+const GO_RNG_LEN: usize = 607;
+const GO_RNG_TAP: usize = 273;
+const GO_RNG_MASK: u64 = (1 << 63) - 1;
+
+static GO_RNG_COOKED: LazyLock<[i64; GO_RNG_LEN]> = LazyLock::new(|| {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(concat!(
+            "6v+Y6zNK98VbX5a6QUp7wA+vgcsTxV4T65VDp1z7BEqOzxB3HIPop8PBN4/o5F19qYX/Q3fPIWNh+Z9qVQbLQtLX6EDRyCZuoPoR",
+            "NB9Rp0lVUKYiSXftcVwt6l/Gn1ydaEMBSjmrvT8LNJJpWTP6cAJqps5O+xCuitG8i6m8n/esgKMuscz3lxsr88qU15EBryzjJDQy",
+            "aj8rFAEfksxCxmiA80+fhiKhIDmvJxGjsaWWncK9+aQHW4YlgSk8lypq4VJ699szpGqeyYo7biGUg3yZW1HFqYDbaffL8+/ywwMM",
+            "If/uMeS1pvVTKZk0U8gO6dEQ3zIUai5JsdFZmWLkvVF5OHY4TJlnY66bVWHUFQ53oNLpxJa/vfMg2mqGYk+wv5fbRhbakCF6lTIY",
+            "PIdxUEuQ2hk6UDs+KIXH8qWI4zN36NAZrAvHvnLwG/hwaSUAhqhP9hSK0fdMc9S0ePlupI6nJzFX8S94puub1QobJAAvW+kfWUnF",
+            "2jktTIjy+pVhXTTvsL0rnFYe4oxQOWCLC7vSNVRwdhXv99jx9QqQXh031H99GC2QHnnr4I98eyJ/mLvrAWIOeThx4SJ5rI6BREDT",
+            "2lDF1lgGmpZyzJS4v4S9KbPjQVGFp0bnurFWFbOcSW9o+QSQoDxph1B+bRRQDHDJWpP/2DXN2FQVqrQYmN6g2jNk/X7zTVbgsgWt",
+            "6ZH1KT742wvrZxfymVJTknIkuOtMXlqXRea6K8M7XBV46uxu6KxXU14pTgi7rU+aapCLyWNE9moIUP381hn9rIUDrZ860eGl1Oa7",
+            "nAObtzOfCfw1WgyEJCJ42c8a1UW8OE4XPk7eVJ8v+FMO77OHCvoN4WmXQ3vs2QnqEVBMzMfDnlHV4xPED5lHC+Jbzs9+4Ac/viIZ",
+            "t7jQ0qVhx3zIH+oeRd3W8ffeXlDIBekcAI7Xbvu6aPRENgrM19ApRC7bMcIU0z2UkJrNHOLRwo8o9WlIZrWPFk5gb8Xd9vqxsKvk",
+            "UUEnuafO6EeW7N5hvn0YQqd2PA54SUCNd4AT5GzCRkRxkgtw5xnAW0dlF23YYB14CA7gcfXV6Q8Pn1duiDO/Ym5H5rROUv8McYyl",
+            "mTiepVboJJoYg1eLfJ9UFAACBpxTCJhnVFGy7ln8uBSmmYSL/4/zIlI9OucrpvU4SEwrg4KLUN74L2jHnxD1DD/FXPGtHNMmWGtA",
+            "CQVywfqWvBBScQDp+5PTNjX+BAdK+67MbptcxhlAvpIwx6+L6ol415m18AebWPq4SQreGPAPg8lxThcv3YVnooC3cLS+YrEjYbem",
+            "ICKDxc0kve+RIyazJlC3e/vQBB+arxw90CHprrwJ+fClC44cne18qkb5tmJ6nqfY/BQ/6LwFz8Q6xDegCKB5xUXQEnlSjohTQBd7",
+            "nyiyoI/42r0CIF2v+1GER8oSqAPkilCknzI3on4NCPK2Ar8EP8sz7TmKPmSWxxlkW9ee15L9rOhYssghaCEx6UZ7/zo96Wort/yM",
+            "hbA2ZxH/5588Xq6lwhw5lcP0KnZ2628H/cTmc+ftMfu171Cu/NtZMyR/bdsPDjRA55Nxkt3GpHMf9Y9mqRz6bktTlEEN1yBFcmrA",
+            "kgUSGb0WzTDc1iwMWGtFje8phGoNvGJcXjnpuKlOdEjhroRcghTvGDTicTq3Mh5KwChSxCdv7g+h5NLgOy5ORghg4YL0Z7sjJ3Mk",
+            "6EG1EQ/Xryp9DPl9rho5LBSW9OFUdEL6JfYOQB0Tns4QZpYGmdrMwdc0WUUiIJLatzlCQeZWVSf2kZCftL2KKGQ9a5GCoG8Gx6HQ",
+            "Up+h8Iz7bGYqZIOtY7AdmJ2MSn62WGGi32PfwuzrNv48zv9kU6Ur6+S20Rd3DZ4X0m/bRyI2t6JxuTvFENUlz+XbYVJzc60oD5OL",
+            "638EAd2VWlq0WHNAsa0wgxBMeHZHtH8GVAfr9OggG9nAx7ZAXyfcJw97pt34LXOFyITErzcmtjH2i4NJhslhWH8nMO4fBt9VFKwt",
+            "BSLTlemueOSGBNN6RdHOSh8iZzK4ZjUsBQeYR7mgfqdQUwKo05wW/MJ+GkIApylRsDonV/JDn3H79+S6SL+46FfYWxxZ83FpGJTV",
+            "2hRwQpytilE/GIKOzLjDQ0y335JvVrofmKzANVTFqqwHj7zLOBCIsF9zur5sVbVD8tSf5zswnxRjdSRxH0PeqvZLwsu2V6XSTHLe",
+            "acF1abwhNIF2DPSM98qfFRJKYt088T4NORsE0HPVBuitO9mL6mnyYc14Pa+LV8mdaH86qRgzNVK+vRxQpy0AErGbjERtW7Qx8mbK",
+            "ZmUD5De34ulRnrjPaJscVIdGcMk3KV2jKN8otbBEaXWy/oucTiPCQ0HCKY8GAo1Pef30feUV32jwkAUJwI2rrZit5AaklIGCsVVB",
+            "P3T/1CcwRs5FCOxoESMG0znDwIZJmAGuWg6YVjaYYcwaBT2vErK0tnrhbHBK8apwQDrelcnLRzVfVujp2bgCYjSs2x0Y6kmKQc5T",
+            "KLm8p1M6b6FGJROqomIoyUtjZsHWcaCTvM5q/5JR6mypgDJAeiRaZoGPOxhaZOTA0oBMKyKmOrpYTT2ehWPlL8uJg6K55P4SlbgM",
+            "ooO9DLNhsJHWywmfrPP4ujmIuMTR7bMD310J7YLLxJQm9mDTm4e5A8bQV2ZCgPfaWIWrMp5iG9t/yOEvhhbVOHnXAOxZJ5ZWOuPZ",
+            "kEsXL8gbBYZc0srrXTur2zWb3dBrdqiHFMqDtiZfQlP2dqBAKzxdNNb4corpZHRBeE7qPt0CL3d4UkLof5dAYh0rktQa8Psp6k6L",
+            "KpyVygI4UxChfMpp2XskV2NJNmsysqdcZAd8f3tn4wqlP8a42Ec5cHT9t6B54IzcoLEfI3duybdCM7YWJ4Dm1wmpOc3d7MoZW2gn",
+            "FE23kY7SbJycVDoNDnn7wZERthu4vdNnfhHi9okN/JbTIutJsPusfkXVTWX1m5fhHcooXVinbENdedkYMobi19NFFp3PPL6nL7DM",
+            "nnvhp7cfgsIp2c4fKysNMWReN5Ba2L19IhEWajPLzXD4uvUlaWNecYRLJdDgQ0eSIXd1xQ4Icdn7WA/kXhfhvK1bNsx4PZUykIN2",
+            "oJWEUztqOdPAiY+miNiIHKibY4GnXHecja8/kyidUT8NxOrEfd/H2DH+AdvWfTgDgG0DlwoiaPchBowHJwh6zKjWWWB1RvgqV+oq",
+            "w/n9yTYBkRzihRMR/t0+x9+Ho6aiue15+/bF3HrRVtXHoyhr+Qkn92rOjULwaS1VFsKSmr60u5xdHPTK9q43T5ip180QEUPTyh3M",
+            "s+UdfDzZq15ipxGDBCweqAy0HORe/L8d5WhbOEP/ovnUcB9q01zLsCe5zOrK5BDgY0Gu3T/gHsmoUlR/DssMl1hUMWF+dUwFEAsc",
+            "gosIBoT5Ec9ExE1rL2CntzYlf/kmodWGFzOT23KDcM2pydpRJFQHWufXBJFlKA2h5aSv5rj4y+skkCMl84AzfBMIX0JeqRgRozIe",
+            "K4BAYQtkvV8cK/HQPH6Wp7m6f+iJEANBCD66s/sb8WvTHA2tw387w1m3aNn0sr8C0gVJVnWETIP6NmIqC6jg4zqDGme4pYaN5Y/r",
+            "KIhgeRfnIVefyysD3hZ+3OUk0hKV1OBRgovmKaMIywh1SsArJZ0ySKY1+IWoGeyX95knTRDt8nbArTpEF2fkd+J9NYlsnTy2rgd5",
+            "rzVb2wTga84n2PFb2SgCv5tjs+Ele+ExriW5fZWeQukjJWh+PKtfDpUzWZ+/cTbqKiwQMjlD79Kywch/xx7Sfg1HYo70gBJf6kKu",
+            "EfPNR7cXjoP6qQ4GAeCE/MxbjFCnrGP5BD+EoKqjpdPr6KT3Sfls30H93muHInye5gdPciTBtKZaPfINR7+4kPWZIDWYKT1llVj0",
+            "kMwR0fgoq6ENVQPbNBsrXMxCeACErJQ2m7cILG75hAvVcr+Q9Qjr+HlwlHIIBYIht2xpp9U2rMlbiNThl/55tYi4bP3kBFIQgpRi",
+            "ATe5Fgh57zxWZRO+JnqnvSio3RQTho/7z1uuA7i3oghAMTLQHqnI0z7sZ7igAQCH5d2TsPnB9uR4gwu87GsIjsf8b8CXUXWe+ATy",
+            "NO4FZyRMJhbVgnWSxzwTRnWke+Gz4rSqXBsRP6NeJUMUFo49opyB0ESzKPFITSCrOfsi0WyqNo8jvxApXLqbX+AQrK6QyirkD7C2",
+            "VJ3LzQ96OGSP6Ak2RwFfIFrELci4to7taMesI/1DDZIl8mR5gYparb0lq1oBue+cvH49c+qkj+cePKQieXXRhQ7jIf6B4MU9EmFm",
+            "Tmd5EMGG3Pu5Grk/lxiJKoxtylXu1AC1tRVSbUcA1Spt6uKzaFD8hcsj3RCpXSBbd582EV6bl9fqZX10csgr553BKqqDupbVa6DT",
+            "EIcloudDkxbZ+7wCc2JrJJnN7ogCAzwtGzBLI7/sMQldCWE8mETkU+Lq+8EQiNI5btX4m3AnhXUyXgLvbbKlxjvYgTtrp1hz8ToO",
+            "dDd4IQxhkQRauntw6U7ANLIkwxLPgXTW6N8U3hIHqME9BeRlYgXNRpYj4l3+hVvtyQDKFJUw5jTAvek16qmxXKVMzxgUrF1Yg/od",
+            "53q25r/GmBWElYBq3u3TCGGmdIBHjMQBJkko+/RJuKznZZoeH2xfo6PgIPLDRH4NFqyXJ0LEFSytEVrVvqmNrFLeLL69KQz7OBbQ",
+            "bkiiWFCij90f6XtQzxghSskGbeVJtvy58hm+Aufv3dAQo21waOd/Gda0nWPrhNRt6aihFln4gv09gKJGTGTXRAoaOmKqUrWLGCUa",
+            "Eb0gxhirPvqZ6hDdTk/SM2zMNmUlOW046KEr+551fmBxYGx8Pbseki9pho8Ia7qWedL+6uoqvbKsEKvz3sIMtyvbtrCEEhwrkv+9",
+            "W9vE1NceJKCgkIFbP67PYH5F9nkbkR4YlIwxXKDV4zOwcaaANFWnuvtelXl117DG0PbJdydDLGb2wiEPKrybhkW8tIbCSdJuyLFm",
+            "4j3FQgnojkeWBRuu5i6LYdNvd+pdPjoHCD+vcW4d0Ed4Dv6q+8SvgR/NQMl4B8ZxviQhlmoE37bCHc9sD5WTTpTQB0CjHgRnx+LG",
+            "dmUgyfkbUlFecdcremuGQTZ5jDx1l3rkZUp4GazaUuv3c3wLEdMHtynEvD8na6YKVHVayC0wFt7kVgpw00DI/1vQ/ANTh9aIJeOl",
+            "Bu2+qzpqY/gmZYp1OCDm6Np6vgEK9MRbx760ycPBnwrOaXrcZKrbCjyFP/m21TmOZbhIvoXLB/OIzDNSBORGZ1aM9IGSERE+Lyvn",
+            "5tUzQ3tdreNuXuNEvwr46zssN5Yp+j1PMk8p04TVAAmmyBfg0weXs8838lYKCdE800NdYOXHeuH6GUStDm8QwMi+YCp7A6i7iX1V",
+            "phI8mJlpUWP81Imy7CkijYgIwz5O3KdWEXyMGJIkEFr4HHgCZUdEC8Gxs11djrceqTti9r8VZZzwo7soanHxMC/JB3b0162dhzR4",
+            "kASemXDblZfFEaajinUVQ8d0mjkybxFATG1T0Jeth8WaU1LDWYnydRYaHySDnmH1eG2MrffvY+XP8SodS8nlEiKdPx+2N3tGPQJ+",
+            "a+nuq612q/rRYmuS2V35z3bbciGmeKI6Z8jIGeWrgpl+hfXxjRHCNIBsE0C2dnP6L96aokzQp5h+53dNsBSfbaFH7YsErT1LMTId",
+            "k+TlnkwKPfNDpev0uibZc3Ogrzp5Mpqz5g+mbpjmYWNmTzQf48tJwETcvhzyA1Re66BS98QgBUF94pkbr93DuOWgQCdZl2xE+6VO",
+            "/ASm569Hf1huraSEg3sTLFTeXB4wew/8Dyr0il0KMEcFgnnAfQjCOcbTtiuacKh8RgreNtq0a7tC4nYDyR5TsHlg90MY3JjPjAXB",
+            "rhGwF7QXhBtk3fBP3d7sMuhJIyiHN4z76OcWiLvw1fTC2A9IULaFbQt2T3OqRX0UCNJThUJiWcTnaBmgKw5AAGD3o7kZfgcMA2Rh",
+            "j1UXHZ/F5sBIMXV5Q9g77/LSd5pv4QGHjbhuZmiGKDTO53JVB9aRVLGCjetUvusap2XCdweePm/d3UdJhlV5XGP+jWKb+T/UOT5n",
+            "IiL1jMdtCH5jZpx+n2bjN+446K+kR7vXkr234tvfq54f0cG18mrKTzIpG1tSUqHkWQ50dY0K0ZF82JXKfzpTfMzbsYZz9/tmEr3D",
+            "0Ua6ZppoGnC1JLFx1ktNwK6eCv1DLFVl4eQXMRRYI6xIErvFWIPFCuOAvXf2qo9/8KQncpn8UOGwnF3MSKhBm+SwHnEKZHg5yh2g",
+            "v/xkhMdr/y+rCphe5kKqUGdcOfTzlZZM6n8oikL2SRc2FpWUIZ+ZktV3yfhfk/bZZlHEqRxDj6ID9afsEL5Rw6PTUemWKBaA4Hn1",
+            "JCggWzjpteUMxrBZSh66+weyqilYZd6oLjiLx40E3uHX33rMllpTdDvwXnOboVd+xiXAMToKoDk="
+        ))
+        .expect("embedded Go math/rand state must be valid base64");
+    assert_eq!(bytes.len(), GO_RNG_LEN * size_of::<i64>());
+
+    let mut cooked = [0_i64; GO_RNG_LEN];
+    for (slot, bytes) in cooked.iter_mut().zip(bytes.chunks_exact(size_of::<i64>())) {
+        *slot = i64::from_le_bytes(bytes.try_into().expect("eight-byte Go RNG state"));
+    }
+    cooked
+});
+
+struct GoRng {
+    tap: usize,
+    feed: usize,
+    state: [i64; GO_RNG_LEN],
+}
+
+impl GoRng {
+    fn new(seed: i64) -> Self {
+        let mut rng = Self {
+            tap: 0,
+            feed: GO_RNG_LEN - GO_RNG_TAP,
+            state: [0; GO_RNG_LEN],
+        };
+        rng.seed(seed);
+        rng
+    }
+
+    fn seed(&mut self, seed: i64) {
+        self.tap = 0;
+        self.feed = GO_RNG_LEN - GO_RNG_TAP;
+
+        let mut seed = seed % i64::from(i32::MAX);
+        if seed < 0 {
+            seed += i64::from(i32::MAX);
+        }
+        if seed == 0 {
+            seed = 89_482_311;
+        }
+
+        let mut value = seed as i32;
+        for index in -20_isize..GO_RNG_LEN as isize {
+            value = go_seed_rand(value);
+            if index >= 0 {
+                let mut state = i64::from(value) << 40;
+                value = go_seed_rand(value);
+                state ^= i64::from(value) << 20;
+                value = go_seed_rand(value);
+                state ^= i64::from(value);
+                state ^= GO_RNG_COOKED[index as usize];
+                self.state[index as usize] = state;
+            }
+        }
+    }
+
+    fn uint32(&mut self) -> u32 {
+        ((self.uint64() & GO_RNG_MASK) >> 31) as u32
+    }
+
+    fn uint64(&mut self) -> u64 {
+        if self.tap == 0 {
+            self.tap = GO_RNG_LEN;
+        }
+        self.tap -= 1;
+        if self.feed == 0 {
+            self.feed = GO_RNG_LEN;
+        }
+        self.feed -= 1;
+
+        let value = self.state[self.feed].wrapping_add(self.state[self.tap]);
+        self.state[self.feed] = value;
+        value as u64
+    }
+}
+
+fn go_seed_rand(value: i32) -> i32 {
+    const A: i32 = 48_271;
+    const Q: i32 = 44_488;
+    const R: i32 = 3_399;
+
+    let high = value / Q;
+    let low = value % Q;
+    let next = A * low - R * high;
+    if next < 0 { next + i32::MAX } else { next }
+}
 
 #[derive(Clone)]
 enum LayoutKind {
@@ -721,11 +883,11 @@ fn build_table(password: &str, layout: Arc<Layout>) -> std::io::Result<Table> {
     let mut order = (0..patterns.len()).collect::<Vec<_>>();
     let hash = Sha256::digest(password.as_bytes());
     let seed = i64::from_be_bytes(hash[..8].try_into().expect("sha prefix"));
-    let mut go_rng = GoRand::new(new_source(seed));
+    let mut go_rng = GoRng::new(seed);
     for index in (1..order.len()).rev() {
         // Go's Shuffle uses its private Lemire `int31n`, deliberately not the
         // public compatibility-preserving `Int31n`. Copy that reduction over
-        // the exact Go Source stream exposed by `ggstd`.
+        // the exact Go Source stream implemented above.
         let n = (index + 1) as u32;
         let mut value = go_rng.uint32();
         let mut product = u64::from(value) * u64::from(n);
@@ -856,7 +1018,7 @@ mod tests {
         };
         let tables = get_tables(&config).unwrap();
         let table = &tables[0];
-        // This table is derived using Go math/rand via `ggstd`, not Rust's
+        // This table is derived using Go math/rand, not Rust's
         // ChaCha RNG. Every official hint tuple must decode to its byte.
         for byte in [0u8, 1, 42, 127, 255] {
             let mut hints = table.encode[byte as usize][0];
