@@ -11,7 +11,13 @@ use parking_lot::Mutex;
 
 use crate::{NetworkProto, ProcessFinder, ProcessInfo};
 
-type Key = (NetworkProto, IpAddr, u16);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Key {
+    proto: NetworkProto,
+    src_ip: IpAddr,
+    src_port: u16,
+    dst: Option<(IpAddr, u16)>,
+}
 
 #[derive(Debug, Clone)]
 struct Entry {
@@ -177,7 +183,12 @@ impl CachedFinder {
 
 impl ProcessFinder for CachedFinder {
     fn find(&self, proto: NetworkProto, src_ip: IpAddr, src_port: u16) -> Option<ProcessInfo> {
-        let key = (proto, src_ip, src_port);
+        let key = Key {
+            proto,
+            src_ip,
+            src_port,
+            dst: None,
+        };
         if let Some(cached) = self.state.lock().get(&key) {
             return cached;
         }
@@ -195,9 +206,15 @@ impl ProcessFinder for CachedFinder {
         dst_ip: IpAddr,
         dst_port: u16,
     ) -> Option<ProcessInfo> {
-        // (src_ip, src_port) 唯一对应一个 socket → 一个进程；dst 不影响归属。
-        // 因此 cache key 仍按 src 维度，dst 只在 miss 时透传给 inner。
-        let key = (proto, src_ip, src_port);
+        // Android's framework API is a true 5-tuple lookup. Keeping the
+        // destination in the cache key also avoids stale collisions when a
+        // source port is rapidly reused.
+        let key = Key {
+            proto,
+            src_ip,
+            src_port,
+            dst: Some((dst_ip, dst_port)),
+        };
         if let Some(cached) = self.state.lock().get(&key) {
             return cached;
         }
@@ -239,6 +256,7 @@ mod tests {
                 name: "x".into(),
                 path: "/x".into(),
                 uid: 1000,
+                package_names: Vec::new(),
             }),
         });
         let cached = CachedFinder::new(inner.clone(), 4, Duration::from_secs(10));
@@ -283,5 +301,18 @@ mod tests {
         let _ = cached.find(NetworkProto::Tcp, ip("10.0.0.1"), 2);
         let after = inner.calls.load(Ordering::SeqCst);
         assert_eq!(after - before, 1, "key2 should have been evicted");
+    }
+
+    #[test]
+    fn destination_tuple_is_part_of_cache_identity() {
+        let inner = Arc::new(CountingFinder {
+            calls: AtomicUsize::new(0),
+            result: None,
+        });
+        let cached = CachedFinder::new(inner.clone(), 4, Duration::from_secs(10));
+        let source = ip("10.0.0.1");
+        let _ = cached.find_with_dst(NetworkProto::Tcp, source, 12345, ip("203.0.113.1"), 443);
+        let _ = cached.find_with_dst(NetworkProto::Tcp, source, 12345, ip("203.0.113.2"), 443);
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 2);
     }
 }

@@ -34,14 +34,14 @@
 //!   后者要 `CAP_NET_ADMIN`，VpnService app 拿不到；
 //! - 用 `InetAddress.getByAddress(byte[])` 而非 `InetSocketAddress(String, int)`：
 //!   后者会 DNS 解析 IP 字面量也照走，hot-path 不稳定；
-//! - 用 `getNameForUid` 而非 `getPackagesForUid`：单调用足够拿包名；返回
-//!   "package:uid" 形式时去掉冒号后缀。
+//! - 用 `PackageManager.getPackagesForUid` 返回真实包名列表；Android shared UID
+//!   会保留所有关联包，而不是用展示名称代替包名。
 
 use std::{net::IpAddr, sync::Arc};
 
 use jni::{
-    JNIEnv, JavaVM,
-    objects::{GlobalRef, JByteArray, JObject, JString, JValue},
+    Env, JavaVM, jni_sig, jni_str,
+    objects::{Global, JByteArray, JObject, JObjectArray, JString, JValue},
 };
 use once_cell::sync::OnceCell;
 
@@ -58,9 +58,9 @@ const IPPROTO_UDP: i32 = 17;
 struct JniBridge {
     vm: JavaVM,
     /// `android.net.ConnectivityManager` 实例 —— 用来调 `getConnectionOwnerUid`。
-    connectivity_manager: GlobalRef,
-    /// `android.content.pm.PackageManager` 实例 —— 用来 `getNameForUid` 拿包名。
-    package_manager: GlobalRef,
+    connectivity_manager: Global<JObject<'static>>,
+    /// `android.content.pm.PackageManager` 实例 —— 用来拿 UID 对应的包名列表。
+    package_manager: Global<JObject<'static>>,
 }
 
 static JNI_BRIDGE: OnceCell<Arc<JniBridge>> = OnceCell::new();
@@ -70,7 +70,7 @@ static JNI_BRIDGE: OnceCell<Arc<JniBridge>> = OnceCell::new();
 /// 重复调用静默失败 —— 这与 mihomo `MMDB::set_globals` 行为一致：进程级单例。
 ///
 /// 调用线程不必是 finder 调用线程；内部派生的 `GlobalRef` 跨线程合法。
-pub fn set_jni_bridge(env: &mut JNIEnv<'_>, context: &JObject<'_>) -> jni::errors::Result<()> {
+pub fn set_jni_bridge(env: &mut Env<'_>, context: &JObject<'_>) -> jni::errors::Result<()> {
     if JNI_BRIDGE.get().is_some() {
         return Ok(());
     }
@@ -81,8 +81,8 @@ pub fn set_jni_bridge(env: &mut JNIEnv<'_>, context: &JObject<'_>) -> jni::error
     let cm_obj = env
         .call_method(
             context,
-            "getSystemService",
-            "(Ljava/lang/String;)Ljava/lang/Object;",
+            jni_str!("getSystemService"),
+            jni_sig!("(Ljava/lang/String;)Ljava/lang/Object;"),
             &[JValue::Object(&svc_name)],
         )?
         .l()?;
@@ -97,8 +97,8 @@ pub fn set_jni_bridge(env: &mut JNIEnv<'_>, context: &JObject<'_>) -> jni::error
     let pm_obj = env
         .call_method(
             context,
-            "getPackageManager",
-            "()Landroid/content/pm/PackageManager;",
+            jni_str!("getPackageManager"),
+            jni_sig!("()Landroid/content/pm/PackageManager;"),
             &[],
         )?
         .l()?;
@@ -149,9 +149,9 @@ impl Default for AndroidFinder {
 
 impl ProcessFinder for AndroidFinder {
     fn find(&self, proto: NetworkProto, src_ip: IpAddr, src_port: u16) -> Option<ProcessInfo> {
-        // /proc 路径覆盖 root 全部 + 非 root 自家进程。
-        // 内部已用 spawn_blocking 调度，不再额外 offload。
-        LinuxFinder::new().find(proto, src_ip, src_port)
+        let mut info = LinuxFinder::new().find(proto, src_ip, src_port)?;
+        populate_packages(&mut info);
+        Some(info)
     }
 
     fn find_with_dst(
@@ -163,7 +163,10 @@ impl ProcessFinder for AndroidFinder {
         dst_port: u16,
     ) -> Option<ProcessInfo> {
         // 1) 先 /proc —— root 全开；非 root 命中自家进程
-        if let Some(info) = LinuxFinder::new().find(proto, src_ip, src_port) {
+        if let Some(mut info) =
+            LinuxFinder::new().find_with_dst(proto, src_ip, src_port, dst_ip, dst_port)
+        {
+            populate_packages(&mut info);
             return Some(info);
         }
         // 2) 非 root + 别 app socket → JNI ConnectivityManager
@@ -196,9 +199,20 @@ fn jni_lookup(
     dst_ip: IpAddr,
     dst_port: u16,
 ) -> jni::errors::Result<Option<ProcessInfo>> {
-    let mut guard = bridge.vm.attach_current_thread()?;
-    let env = &mut *guard;
+    bridge.vm.attach_current_thread(|env| {
+        jni_lookup_attached(bridge, env, proto, src_ip, src_port, dst_ip, dst_port)
+    })
+}
 
+fn jni_lookup_attached(
+    bridge: &JniBridge,
+    env: &mut Env<'_>,
+    proto: NetworkProto,
+    src_ip: IpAddr,
+    src_port: u16,
+    dst_ip: IpAddr,
+    dst_port: u16,
+) -> jni::errors::Result<Option<ProcessInfo>> {
     let proto_int = match proto {
         NetworkProto::Tcp => IPPROTO_TCP,
         NetworkProto::Udp => IPPROTO_UDP,
@@ -209,8 +223,8 @@ fn jni_lookup(
     let uid_int = env
         .call_method(
             &bridge.connectivity_manager,
-            "getConnectionOwnerUid",
-            "(ILjava/net/InetSocketAddress;Ljava/net/InetSocketAddress;)I",
+            jni_str!("getConnectionOwnerUid"),
+            jni_sig!("(ILjava/net/InetSocketAddress;Ljava/net/InetSocketAddress;)I"),
             &[
                 JValue::Int(proto_int),
                 JValue::Object(&local),
@@ -222,18 +236,23 @@ fn jni_lookup(
         return Ok(None);
     }
     let uid = uid_int as u32;
-    let name = jni_name_for_uid(env, &bridge.package_manager, uid)?;
+    let package_names = jni_packages_for_uid(env, &bridge.package_manager, uid)?;
+    let name = package_names
+        .first()
+        .cloned()
+        .unwrap_or_else(|| format!("uid:{uid}"));
     Ok(Some(ProcessInfo {
         name,
         path: String::new(),
         uid,
+        package_names,
     }))
 }
 
 /// `InetAddress.getByAddress(byte[])` + `new InetSocketAddress(InetAddress, int)`。
 /// 用 byte 数组而非主机名字符串，规避 Java DNS 解析路径。
 fn make_inet_socket_addr<'local>(
-    env: &mut JNIEnv<'local>,
+    env: &mut Env<'local>,
     ip: IpAddr,
     port: u16,
 ) -> jni::errors::Result<JObject<'local>> {
@@ -244,45 +263,64 @@ fn make_inet_socket_addr<'local>(
     let arr: JByteArray<'local> = env.byte_array_from_slice(&bytes)?;
     let inet_addr = env
         .call_static_method(
-            "java/net/InetAddress",
-            "getByAddress",
-            "([B)Ljava/net/InetAddress;",
+            jni_str!("java/net/InetAddress"),
+            jni_str!("getByAddress"),
+            jni_sig!("([B)Ljava/net/InetAddress;"),
             &[JValue::Object(&arr)],
         )?
         .l()?;
     let sock = env.new_object(
-        "java/net/InetSocketAddress",
-        "(Ljava/net/InetAddress;I)V",
+        jni_str!("java/net/InetSocketAddress"),
+        jni_sig!("(Ljava/net/InetAddress;I)V"),
         &[JValue::Object(&inet_addr), JValue::Int(port as i32)],
     )?;
     Ok(sock)
 }
 
-/// `PackageManager.getNameForUid(int) -> String?`。
-/// API 26+ 返回 `"package_name:uid"` 形式 —— 用 `:` 切断只取前缀。
-/// 老 API 直接返回 `package_name`。
-fn jni_name_for_uid(env: &mut JNIEnv<'_>, pm: &GlobalRef, uid: u32) -> jni::errors::Result<String> {
+fn populate_packages(info: &mut ProcessInfo) {
+    let Some(bridge) = JNI_BRIDGE.get() else {
+        return;
+    };
+    if let Ok(packages) = bridge
+        .vm
+        .attach_current_thread(|env| jni_packages_for_uid(env, &bridge.package_manager, info.uid))
+    {
+        if let Some(package) = packages.first() {
+            info.name = package.clone();
+        }
+        info.package_names = packages;
+    }
+}
+
+/// `PackageManager.getPackagesForUid(int) -> String[]?`.
+fn jni_packages_for_uid(
+    env: &mut Env<'_>,
+    pm: &Global<JObject<'static>>,
+    uid: u32,
+) -> jni::errors::Result<Vec<String>> {
     let result = env
         .call_method(
             pm,
-            "getNameForUid",
-            "(I)Ljava/lang/String;",
+            jni_str!("getPackagesForUid"),
+            jni_sig!("(I)[Ljava/lang/String;"),
             &[JValue::Int(uid as i32)],
         )?
         .l()?;
     if result.is_null() {
-        return Ok(format!("uid:{uid}"));
+        return Ok(Vec::new());
     }
-    let jstr = JString::from(result);
-    let java_str = env.get_string(&jstr)?;
-    let raw: String = java_str.into();
-    // 把 ":<digits>" 后缀剥掉
-    let head = raw.split(':').next().unwrap_or(&raw);
-    if head.is_empty() {
-        Ok(format!("uid:{uid}"))
-    } else {
-        Ok(head.to_string())
+    let array = JObjectArray::<JString>::cast_local(env, result)?;
+    let mut packages = Vec::with_capacity(array.len(env)?);
+    for index in 0..array.len(env)? {
+        let package = array.get_element(env, index)?;
+        let package = package.try_to_string(env)?;
+        if !package.is_empty() {
+            packages.push(package);
+        }
     }
+    packages.sort_unstable();
+    packages.dedup();
+    Ok(packages)
 }
 
 #[cfg(test)]

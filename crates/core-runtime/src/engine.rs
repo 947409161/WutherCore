@@ -1964,8 +1964,8 @@ route:
     }
 
     #[test]
-    fn process_finder_disabled_by_default() {
-        // 与 mihomo 一致：未配置 find-process-mode 默认 off，process_finder 不构建。
+    fn process_finder_enabled_by_default_for_strict_mode() {
+        // 与 mihomo 一致：未配置时默认 strict，按规则遍历惰性触发 finder。
         let plan = load_plan(
             r#"
 version: 1
@@ -1976,8 +1976,8 @@ listen:
         );
         let runtime = Runtime::build(plan).unwrap();
         assert!(
-            runtime.process_finder.is_none(),
-            "find-process-mode 默认 off → finder 不应构建"
+            runtime.process_finder.is_some(),
+            "find-process-mode 默认 strict → finder 必须可用"
         );
     }
 

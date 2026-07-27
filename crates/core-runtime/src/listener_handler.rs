@@ -12,7 +12,6 @@ use std::{
 };
 
 use compact_str::ToCompactString;
-use core_config::runtime_plan::RouteMatcher;
 use core_observe::{ConnectionGuard, ConnectionMeta, copy_bidirectional_tracked};
 use core_route::{FlowContext, FlowRulesetMetadata, L7Proto, NetworkKind};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -47,6 +46,9 @@ pub struct InboundMetadata {
     pub sniff_host: String,
     pub process: Option<String>,
     pub process_path: Option<String>,
+    /// Android package names associated with the owning UID. Shared UIDs may
+    /// legitimately map to more than one package.
+    pub package_names: Vec<String>,
     pub uid: u32,
     pub inbound_user: String,
     pub protocol: Option<L7Proto>,
@@ -122,6 +124,7 @@ impl InboundMetadata {
             sniff_host: String::new(),
             process: None,
             process_path: None,
+            package_names: Vec::new(),
             uid: 0,
             inbound_user: String::new(),
             protocol: None,
@@ -154,6 +157,11 @@ impl InboundMetadata {
     pub fn with_process(mut self, process: Option<String>, process_path: Option<String>) -> Self {
         self.process = process;
         self.process_path = process_path;
+        self
+    }
+
+    pub fn with_package_names(mut self, package_names: Vec<String>) -> Self {
+        self.package_names = package_names;
         self
     }
 
@@ -205,10 +213,6 @@ impl InboundMetadata {
     pub fn flow_context(&self) -> FlowContext {
         let host = self.route_host();
         let ip = self.route_ip.or_else(|| host.parse::<IpAddr>().ok());
-        #[cfg(target_os = "android")]
-        let package_names = self.process.iter().cloned().collect();
-        #[cfg(not(target_os = "android"))]
-        let package_names = Vec::new();
         FlowContext {
             host,
             ip,
@@ -219,7 +223,7 @@ impl InboundMetadata {
                 source_ip: Some(self.source.ip()),
                 source_port: Some(self.source.port()),
                 process_path: self.process_path.clone(),
-                package_names,
+                package_names: self.package_names.clone(),
                 ..FlowRulesetMetadata::default()
             },
             protocol: self.protocol.clone(),
@@ -423,8 +427,9 @@ impl ListenerHandler {
     /// 分支等价：根据全局开关 + 路由规则需求决定是否反查发起进程。结果填进
     /// [`InboundMetadata::process`] / `process_path`，向下穿透到 ConnectionMeta。
     ///
-    /// 反查 API 是同步阻塞调用（Linux `/proc` 扫描、Windows `GetExtendedTcpTable`、
-    /// macOS `proc_pidfdinfo`），全部走 `spawn_blocking` 防止抢 reactor 线程。
+    /// 反查 API 是同步阻塞调用（桌面端由 netstat2/sysinfo 调用平台 API，
+    /// Android 由 ConnectivityManager/PackageManager 调用 framework API），
+    /// 全部走 `spawn_blocking` 防止抢 reactor 线程。
     /// 已在 finder 上层加了 LRU+TTL cache，绝大多数命中走 cache 路径直接返回。
     async fn enrich_with_process(
         &self,
@@ -437,7 +442,14 @@ impl ListenerHandler {
         if metadata.is_inner {
             return metadata;
         }
-        if !should_lookup_process(&self.runtime) {
+        let should_lookup = match self.runtime.plan.find_process_mode {
+            core_config::model::FindProcessMode::Off => false,
+            core_config::model::FindProcessMode::Always => true,
+            core_config::model::FindProcessMode::Strict => {
+                self.runtime.route.needs_process(&metadata.flow_context())
+            }
+        };
+        if !should_lookup {
             return metadata;
         }
         let finder = match self.runtime.process_finder.as_ref() {
@@ -482,6 +494,7 @@ impl ListenerHandler {
         if let Some(info) = info {
             metadata.process = Some(info.name);
             metadata.process_path = Some(info.path);
+            metadata.package_names = info.package_names;
             metadata.uid = info.uid;
         }
         metadata
@@ -548,29 +561,6 @@ impl ListenerHandler {
             ),
         }
         result.map(|_| ())
-    }
-}
-
-fn should_lookup_process(runtime: &Runtime) -> bool {
-    match runtime.plan.find_process_mode {
-        core_config::model::FindProcessMode::Off => false,
-        core_config::model::FindProcessMode::Always => true,
-        core_config::model::FindProcessMode::Strict => runtime
-            .plan
-            .route
-            .steps
-            .iter()
-            .any(|step| matcher_needs_process(&step.matcher)),
-    }
-}
-
-fn matcher_needs_process(matcher: &RouteMatcher) -> bool {
-    match matcher {
-        RouteMatcher::Process(_) | RouteMatcher::Set(_) => true,
-        RouteMatcher::And(parts) | RouteMatcher::Or(parts) => {
-            parts.iter().any(matcher_needs_process)
-        }
-        _ => false,
     }
 }
 
@@ -667,7 +657,8 @@ mod tests {
             .with_process(
                 Some("com.example.client".into()),
                 Some("/usr/bin/example-client".into()),
-            );
+            )
+            .with_package_names(vec!["com.example.client".into()]);
 
         let flow = metadata.flow_context();
         assert_eq!(flow.ruleset.source_ip, Some(source.ip()));
@@ -676,9 +667,6 @@ mod tests {
             flow.ruleset.process_path.as_deref(),
             Some("/usr/bin/example-client")
         );
-        #[cfg(target_os = "android")]
         assert_eq!(flow.ruleset.package_names, ["com.example.client"]);
-        #[cfg(not(target_os = "android"))]
-        assert!(flow.ruleset.package_names.is_empty());
     }
 }

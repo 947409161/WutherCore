@@ -6,7 +6,9 @@
 use std::{collections::BTreeSet, net::IpAddr, sync::Arc};
 
 use core_config::runtime_plan::{RouteAction, RouteMatcher, RoutePlan};
-use core_ruleset::{RulesetIndex, RulesetInterfaceAddress, RulesetMatchContext};
+use core_ruleset::{
+    RulesetIndex, RulesetInterfaceAddress, RulesetMatchContext, RulesetMatchOutcome,
+};
 use ipnet::IpNet;
 
 use crate::builtin;
@@ -229,6 +231,39 @@ impl RouteEngine {
         }
         (RouteDecision::Direct, "fallback", "implicit-direct".into())
     }
+
+    /// Return whether route evaluation has actually reached a rule whose
+    /// answer depends on process/package metadata.
+    ///
+    /// This mirrors mihomo's Strict mode: rules before the first process rule
+    /// retain normal first-match and logical short-circuit behavior.
+    pub fn needs_process(&self, ctx: &FlowContext) -> bool {
+        let disabled = self.disabled_rules.read();
+        for (index, step) in self.plan.steps.iter().enumerate() {
+            if disabled.contains(&index) {
+                continue;
+            }
+            match step_match_state(
+                &step.matcher,
+                ctx,
+                &self.extra_cidrs,
+                self.rulesets.as_ref(),
+                false,
+            ) {
+                MatchState::Matched => return false,
+                MatchState::NeedsProcess => return true,
+                MatchState::NotMatched => {}
+            }
+        }
+        false
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatchState {
+    Matched,
+    NotMatched,
+    NeedsProcess,
 }
 
 fn matcher_kind(m: &RouteMatcher) -> &'static str {
@@ -259,48 +294,99 @@ fn step_matches(
     extra_cidrs: &[IpNet],
     rulesets: Option<&Arc<RulesetIndex>>,
 ) -> bool {
+    step_match_state(m, ctx, extra_cidrs, rulesets, true) == MatchState::Matched
+}
+
+fn step_match_state(
+    m: &RouteMatcher,
+    ctx: &FlowContext,
+    extra_cidrs: &[IpNet],
+    rulesets: Option<&Arc<RulesetIndex>>,
+    process_resolved: bool,
+) -> MatchState {
+    use MatchState::{Matched, NeedsProcess, NotMatched};
+
     match m {
-        RouteMatcher::Any => true,
-        RouteMatcher::Home => match_home(ctx),
-        RouteMatcher::Cn => match_cn(ctx),
-        RouteMatcher::Ads => match_suffix_list(&ctx.host, builtin::ADS_SUFFIXES),
-        RouteMatcher::Service(name) => {
-            match_suffix_list(&ctx.host, builtin::service_suffixes(name))
-        }
-        RouteMatcher::Domain(d) => host_eq(&ctx.host, d),
-        RouteMatcher::Suffix(s) => host_suffix(&ctx.host, s),
-        RouteMatcher::Keyword(k) => host_contains(&ctx.host, k),
-        RouteMatcher::Cidr(s) => match_cidr(ctx, s, extra_cidrs),
-        RouteMatcher::Port(p) => ctx.port == *p,
-        RouteMatcher::PortRange(lo, hi) => ctx.port >= *lo && ctx.port <= *hi,
-        RouteMatcher::Network(n) => n.eq_ignore_ascii_case(ctx.network.as_str()),
-        RouteMatcher::Process(name) => ctx
-            .process
-            .as_ref()
-            .map(|p| p.eq_ignore_ascii_case(name))
-            .unwrap_or(false),
+        RouteMatcher::Any => Matched,
+        RouteMatcher::Home => bool_state(match_home(ctx)),
+        RouteMatcher::Cn => bool_state(match_cn(ctx)),
+        RouteMatcher::Ads => bool_state(match_suffix_list(&ctx.host, builtin::ADS_SUFFIXES)),
+        RouteMatcher::Service(name) => bool_state(match_suffix_list(
+            &ctx.host,
+            builtin::service_suffixes(name),
+        )),
+        RouteMatcher::Domain(d) => bool_state(host_eq(&ctx.host, d)),
+        RouteMatcher::Suffix(s) => bool_state(host_suffix(&ctx.host, s)),
+        RouteMatcher::Keyword(k) => bool_state(host_contains(&ctx.host, k)),
+        RouteMatcher::Cidr(s) => bool_state(match_cidr(ctx, s, extra_cidrs)),
+        RouteMatcher::Port(p) => bool_state(ctx.port == *p),
+        RouteMatcher::PortRange(lo, hi) => bool_state(ctx.port >= *lo && ctx.port <= *hi),
+        RouteMatcher::Network(n) => bool_state(n.eq_ignore_ascii_case(ctx.network.as_str())),
+        RouteMatcher::Process(_) if !process_resolved => NeedsProcess,
+        RouteMatcher::Process(name) => bool_state(
+            ctx.process
+                .as_ref()
+                .map(|p| p.eq_ignore_ascii_case(name))
+                .unwrap_or(false)
+                || ctx
+                    .ruleset
+                    .package_names
+                    .iter()
+                    .any(|package| package.eq_ignore_ascii_case(name)),
+        ),
         RouteMatcher::Set(name) => match rulesets {
             Some(idx) => idx
                 .get(name)
-                .map(|m| m.matches_context(&ctx.ruleset_match_context()))
-                .unwrap_or(false),
-            None => false,
+                .map(|m| {
+                    match m.matches_context_lazy(&ctx.ruleset_match_context(), process_resolved) {
+                        RulesetMatchOutcome::Matched => Matched,
+                        RulesetMatchOutcome::NotMatched => NotMatched,
+                        RulesetMatchOutcome::NeedsProcess => NeedsProcess,
+                    }
+                })
+                .unwrap_or(NotMatched),
+            None => NotMatched,
         },
-        RouteMatcher::Proto(name) => ctx
-            .protocol
-            .as_ref()
-            .map(|p| crate::sniff::proto_name_matches(name, p))
-            .unwrap_or(false),
-        // `.all` / `.any` 都是短路求值 —— 任一 child 决定结果就立刻退出，
-        // 不会把整个 children 列表跑完。这是 typed-key object 形式相对"展开为
-        // 多条独立规则"的主要性能优势：N 条 OR 写法只产生 1 条 RouteStep，
-        // step_matches 这一层只调一次。
-        RouteMatcher::And(parts) => parts
-            .iter()
-            .all(|m| step_matches(m, ctx, extra_cidrs, rulesets)),
-        RouteMatcher::Or(parts) => parts
-            .iter()
-            .any(|m| step_matches(m, ctx, extra_cidrs, rulesets)),
+        RouteMatcher::Proto(name) => bool_state(
+            ctx.protocol
+                .as_ref()
+                .map(|p| crate::sniff::proto_name_matches(name, p))
+                .unwrap_or(false),
+        ),
+        RouteMatcher::And(parts) => {
+            let mut needs_process = false;
+            for part in parts {
+                match step_match_state(part, ctx, extra_cidrs, rulesets, process_resolved) {
+                    NotMatched => return NotMatched,
+                    NeedsProcess => needs_process = true,
+                    Matched => {}
+                }
+            }
+            if needs_process { NeedsProcess } else { Matched }
+        }
+        RouteMatcher::Or(parts) => {
+            let mut needs_process = false;
+            for part in parts {
+                match step_match_state(part, ctx, extra_cidrs, rulesets, process_resolved) {
+                    Matched => return Matched,
+                    NeedsProcess => needs_process = true,
+                    NotMatched => {}
+                }
+            }
+            if needs_process {
+                NeedsProcess
+            } else {
+                NotMatched
+            }
+        }
+    }
+}
+
+fn bool_state(value: bool) -> MatchState {
+    if value {
+        MatchState::Matched
+    } else {
+        MatchState::NotMatched
     }
 }
 
@@ -537,6 +623,85 @@ mod tests {
         // 80/udp 不命中（网络对，端口不对）
         let (d_other, _, _) = eng.decide(&FlowContext::for_domain("a.com", 80, NetworkKind::Udp));
         assert_eq!(d_other, RouteDecision::Group("main".into()));
+    }
+
+    #[test]
+    fn strict_process_lookup_follows_first_match_order_and_short_circuiting() {
+        let plan = RoutePlan {
+            preset: "custom".into(),
+            r#final: "main".into(),
+            steps: vec![
+                RouteStep {
+                    matcher: RouteMatcher::Domain("already.example".into()),
+                    action: RouteAction::Direct,
+                    source: "domain-first".into(),
+                },
+                RouteStep {
+                    matcher: RouteMatcher::And(vec![
+                        RouteMatcher::Port(443),
+                        RouteMatcher::Process("browser".into()),
+                    ]),
+                    action: RouteAction::Group("proxy".into()),
+                    source: "process".into(),
+                },
+                RouteStep {
+                    matcher: RouteMatcher::Any,
+                    action: RouteAction::Direct,
+                    source: "fallback".into(),
+                },
+            ],
+            sets: Default::default(),
+        };
+        let engine = RouteEngine::new(plan);
+
+        assert!(!engine.needs_process(&FlowContext::for_domain(
+            "already.example",
+            443,
+            NetworkKind::Tcp,
+        )));
+        assert!(!engine.needs_process(&FlowContext::for_domain(
+            "other.example",
+            80,
+            NetworkKind::Tcp,
+        )));
+        assert!(engine.needs_process(&FlowContext::for_domain(
+            "other.example",
+            443,
+            NetworkKind::Tcp,
+        )));
+    }
+
+    #[test]
+    fn strict_ruleset_lookup_preserves_not_semantics() {
+        use core_ruleset::{RulesetExpr, RulesetPredicate, RulesetProgram};
+
+        let index = RulesetIndex::new();
+        index.insert(Arc::new(RulesetMatcher::compile_semantic(
+            "not-browser",
+            RulesetProgram::new(
+                1,
+                1,
+                RulesetExpr::Not(Box::new(RulesetExpr::Predicate(
+                    RulesetPredicate::ProcessName(vec!["browser".into()]),
+                ))),
+            ),
+        )));
+        let plan = RoutePlan {
+            preset: "custom".into(),
+            r#final: "main".into(),
+            steps: vec![RouteStep {
+                matcher: RouteMatcher::Set("not-browser".into()),
+                action: RouteAction::Direct,
+                source: "set".into(),
+            }],
+            sets: Default::default(),
+        };
+        let engine = RouteEngine::with_rulesets(plan, index);
+        assert!(engine.needs_process(&FlowContext::for_domain(
+            "example.com",
+            443,
+            NetworkKind::Tcp,
+        )));
     }
 
     #[test]

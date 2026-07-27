@@ -12,7 +12,7 @@ use regex::RegexSet;
 use thiserror::Error;
 use tokio::sync::watch;
 
-use crate::ir::{RulesetMatchContext, RulesetProgram};
+use crate::ir::{RulesetMatchContext, RulesetMatchOutcome, RulesetProgram};
 
 const MAX_IP_PREFIX_SNAPSHOT_ITEMS: usize = 4 * 1024 * 1024;
 
@@ -538,6 +538,28 @@ impl RulesetMatcher {
             }
         }
         false
+    }
+
+    /// Evaluate without eagerly resolving process metadata.
+    ///
+    /// Classical rules are a union, while semantic JSON/SRS rules preserve
+    /// their full logical tree (including NOT), so the latter delegates to the
+    /// program's tri-state evaluator.
+    pub fn matches_context_lazy(
+        &self,
+        ctx: &RulesetMatchContext<'_>,
+        process_resolved: bool,
+    ) -> RulesetMatchOutcome {
+        if let Some(program) = &self.semantic_program {
+            return program.matches_lazy(ctx, process_resolved);
+        }
+        if self.matches_context(ctx) {
+            RulesetMatchOutcome::Matched
+        } else if !process_resolved && !self.processes.is_empty() {
+            RulesetMatchOutcome::NeedsProcess
+        } else {
+            RulesetMatchOutcome::NotMatched
+        }
     }
 
     pub fn stats(&self) -> RulesetStats {

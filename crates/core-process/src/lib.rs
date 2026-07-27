@@ -9,9 +9,10 @@
 //!
 //! | 平台 | API | 备注 |
 //! |------|-----|------|
-//! | Windows | `iphlpapi::GetExtendedTcpTable` / `GetExtendedUdpTable` | 含 PID；OpenProcess + QueryFullProcessImageName 拿路径 |
-//! | Linux | 解析 `/proc/net/tcp{,6}` / `udp{,6}` → inode → walk `/proc/*/fd/` | 全 safe；Android 同源（受权限限制） |
-//! | macOS | `libproc::proc_listpids` + `proc_pidinfo(PROC_PIDLISTFDS)` + `proc_pidpath` | unsafe FFI，跟 sing-box 一致 |
+//! | Windows | `netstat2` (IP Helper API) + `sysinfo` | PID、进程名与可执行路径 |
+//! | Linux | `netstat2` (INET_DIAG/procfs) + `sysinfo` | PID、UID、进程名与可执行路径 |
+//! | macOS | `netstat2` (libproc) + `sysinfo` | PID、UID、进程名与可执行路径 |
+//! | Android | `ConnectivityManager` + `PackageManager`；root/本 UID 回退 `netstat2` | 按真实包名匹配，支持 shared UID 多包 |
 //! | 其他 | NoopFinder | 永远返回 None |
 //!
 //! ## 调用契约
@@ -20,7 +21,7 @@
 //!
 //! 1. Windows / macOS 的底层 API 是 blocking 系统调用，async wrapper 也只是
 //!    `spawn_blocking` 的别名；
-//! 2. Linux `/proc` 解析涉及多个 syscall，单次 call 1-10ms，hot-path 上必须
+//! 2. Linux/Android socket 表与进程表查询涉及多个 syscall，hot-path 上必须
 //!    `spawn_blocking` 否则抢 reactor 线程；
 //! 3. 把 async 决策下放给调用方而不是 trait —— 调用方知道 cache 是否命中、是否
 //!    已经在 blocking pool 上下文里。
@@ -28,12 +29,20 @@
 //! ## 缓存
 //!
 //! `CachedFinder` 给任何 `ProcessFinder` 加 LRU + TTL 包装。默认 1024 条 / 10s。
-//! TTL 不能太长 —— 同一 (proto, ip, port) 在 10s 内可能被另一个进程重用（apps
-//! 关闭后 socket 进入 TIME_WAIT，30s 后端口可重用；mihomo 也用 ~10s）。
+//! TTL 不能太长 —— 同一端口可能被另一个进程重用。带目的地址的查询使用完整
+//! 5-tuple cache key，避免 Android 及快速端口复用场景串线。
 
 use std::{net::IpAddr, sync::Arc};
 
 pub mod cache;
+
+#[cfg(any(
+    target_os = "windows",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos"
+))]
+mod system;
 
 #[cfg(target_os = "windows")]
 mod windows;
@@ -72,6 +81,8 @@ pub struct ProcessInfo {
     pub path: String,
     /// owning user id —— Windows 不可靠 (=0)；Linux / macOS 真值。
     pub uid: u32,
+    /// Android packages associated with `uid`. Empty on desktop platforms.
+    pub package_names: Vec<String>,
 }
 
 impl ProcessInfo {

@@ -37,8 +37,8 @@ use std::{
 };
 
 use jni::{
-    JNIEnv, JavaVM,
-    objects::{GlobalRef, JClass, JObject, JString, JValue},
+    Env, EnvUnowned, JavaVM, jni_sig, jni_str,
+    objects::{Global, JClass, JObject, JString, JValue},
     sys::jstring,
 };
 use parking_lot::Mutex;
@@ -49,7 +49,7 @@ static VPN_PROTECTOR: Mutex<Option<Arc<AndroidVpnServiceProtector>>> = Mutex::ne
 
 struct AndroidVpnServiceProtector {
     vm: JavaVM,
-    service: GlobalRef,
+    service: Global<JObject<'static>>,
 }
 
 impl AndroidVpnServiceProtector {
@@ -66,14 +66,18 @@ impl core_outbound::SocketProtector for AndroidVpnServiceProtector {
                 format!("android protect fd out of range: {}", socket.raw()),
             )
         })?;
-        let mut env = self
+        let ok = self
             .vm
-            .attach_current_thread()
-            .map_err(|e| Self::io_error("attach JVM", e))?;
-        let ret = env
-            .call_method(self.service.as_obj(), "protect", "(I)Z", &[JValue::Int(fd)])
+            .attach_current_thread(|env| -> jni::errors::Result<bool> {
+                env.call_method(
+                    &self.service,
+                    jni_str!("protect"),
+                    jni_sig!("(I)Z"),
+                    &[JValue::Int(fd)],
+                )?
+                .z()
+            })
             .map_err(|e| Self::io_error("VpnService.protect", e))?;
-        let ok = ret.z().map_err(|e| Self::io_error("protect return", e))?;
         if ok {
             debug!(target: "capture::android", fd, "protected outbound socket from VPN");
             Ok(())
@@ -106,32 +110,32 @@ pub extern "system" fn Java_org_wuthercore_VpnBridge_setVpnFd(
 /// 进入 TUN，形成自循环。
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_wuthercore_VpnBridge_setVpnService(
-    env: JNIEnv<'_>,
+    mut unowned_env: EnvUnowned<'_>,
     _class: JClass<'_>,
     service: JObject<'_>,
 ) {
-    if service.is_null() {
-        *VPN_PROTECTOR.lock() = None;
-        core_outbound::set_socket_protector(None);
-        return;
-    }
-    let vm = match env.get_java_vm() {
-        Ok(vm) => vm,
-        Err(e) => {
-            warn!(target: "capture::android", error = %e, "get JavaVM failed");
-            return;
-        }
-    };
-    let service = match env.new_global_ref(service) {
-        Ok(service) => service,
-        Err(e) => {
-            warn!(target: "capture::android", error = %e, "create VpnService global ref failed");
-            return;
-        }
-    };
-    let protector = Arc::new(AndroidVpnServiceProtector { vm, service });
-    *VPN_PROTECTOR.lock() = Some(protector.clone());
-    core_outbound::set_socket_protector(Some(protector));
+    unowned_env
+        .with_env(|env| -> jni::errors::Result<()> {
+            if service.is_null() {
+                *VPN_PROTECTOR.lock() = None;
+                core_outbound::set_socket_protector(None);
+                return Ok(());
+            }
+            if let Err(error) = core_process::android::set_jni_bridge(env, &service) {
+                warn!(
+                    target: "capture::android",
+                    %error,
+                    "install process lookup JNI bridge failed"
+                );
+            }
+            let vm = env.get_java_vm()?;
+            let service = env.new_global_ref(&service)?;
+            let protector = Arc::new(AndroidVpnServiceProtector { vm, service });
+            *VPN_PROTECTOR.lock() = Some(protector.clone());
+            core_outbound::set_socket_protector(Some(protector));
+            Ok(())
+        })
+        .resolve::<jni::errors::LogContextErrorAndDefault>();
 }
 
 /// `String vpnServiceConfigJson(String configPath)` —— 从 YAML 导出 Android
@@ -143,25 +147,28 @@ pub extern "system" fn Java_org_wuthercore_VpnBridge_setVpnService(
 /// 如果没有这些 Builder 路由，native 侧即使拿到 fd 也不会有真实应用流量进入。
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_wuthercore_VpnBridge_vpnServiceConfigJson(
-    mut env: JNIEnv<'_>,
+    mut unowned_env: EnvUnowned<'_>,
     _class: JClass<'_>,
     config_path: JString<'_>,
 ) -> jstring {
-    let json = match vpn_service_config_json_from_path(&mut env, config_path) {
-        Ok(json) => json,
-        Err(error) => serde_json::json!({ "error": error }).to_string(),
-    };
-    new_jstring(&mut env, json)
+    unowned_env
+        .with_env(|env| -> jni::errors::Result<jstring> {
+            let json = match vpn_service_config_json_from_path(env, config_path) {
+                Ok(json) => json,
+                Err(error) => serde_json::json!({ "error": error }).to_string(),
+            };
+            Ok(new_jstring(env, json))
+        })
+        .resolve::<jni::errors::LogContextErrorAndDefault>()
 }
 
 fn vpn_service_config_json_from_path(
-    env: &mut JNIEnv<'_>,
+    env: &mut Env<'_>,
     config_path: JString<'_>,
 ) -> Result<String, String> {
-    let path: String = env
-        .get_string(&config_path)
-        .map_err(|e| format!("read config path from JNI: {e}"))?
-        .into();
+    let path = config_path
+        .try_to_string(env)
+        .map_err(|e| format!("read config path from JNI: {e}"))?;
     let runtime_plan =
         core_config::load_from_path(&path).map_err(|e| format!("load config {path}: {e}"))?;
     let capture_plan = crate::CapturePlan::from_config(&runtime_plan.capture)
@@ -170,8 +177,8 @@ fn vpn_service_config_json_from_path(
         .map_err(|e| format!("encode vpn service config: {e}"))
 }
 
-fn new_jstring(env: &mut JNIEnv<'_>, value: String) -> jstring {
-    match env.new_string(value) {
+fn new_jstring(env: &mut Env<'_>, value: String) -> jstring {
+    match JString::from_str(env, value) {
         Ok(value) => value.into_raw(),
         Err(e) => {
             warn!(target: "capture::android", error = %e, "create Java string failed");
@@ -182,7 +189,7 @@ fn new_jstring(env: &mut JNIEnv<'_>, value: String) -> jstring {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_wuthercore_VpnBridge_clearVpnService(
-    _env: JNIEnv<'_>,
+    _env: EnvUnowned<'_>,
     _class: JClass<'_>,
 ) {
     *VPN_PROTECTOR.lock() = None;
@@ -225,16 +232,21 @@ pub extern "system" fn Java_org_wuthercore_VpnBridge_nativeStop(
 /// ```
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_wuthercore_VpnBridge_notifyNetworkChanged(
-    mut env: JNIEnv<'_>,
+    mut unowned_env: EnvUnowned<'_>,
     _class: JClass<'_>,
     interface_name: JString<'_>,
 ) {
-    let iface: Option<String> = if interface_name.is_null() {
-        None
-    } else {
-        env.get_string(&interface_name).ok().map(|s| s.into())
-    };
-    crate::net_monitor::notify_network_changed(iface);
+    unowned_env
+        .with_env(|env| -> jni::errors::Result<()> {
+            let iface = if interface_name.is_null() {
+                None
+            } else {
+                interface_name.try_to_string(env).ok()
+            };
+            crate::net_monitor::notify_network_changed(iface);
+            Ok(())
+        })
+        .resolve::<jni::errors::LogContextErrorAndDefault>();
 }
 
 /// `void setDefaultInterface(String interfaceName)` —— 设置出站绑定的物理接口名。
@@ -243,16 +255,21 @@ pub extern "system" fn Java_org_wuthercore_VpnBridge_notifyNetworkChanged(
 /// 设置后，所有新建 outbound 连接会优先 bind 到该接口。
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_wuthercore_VpnBridge_setDefaultInterface(
-    mut env: JNIEnv<'_>,
+    mut unowned_env: EnvUnowned<'_>,
     _class: JClass<'_>,
     interface_name: JString<'_>,
 ) {
-    let iface: Option<String> = if interface_name.is_null() {
-        None
-    } else {
-        env.get_string(&interface_name).ok().map(|s| s.into())
-    };
-    core_outbound::set_outbound_interface(iface);
+    unowned_env
+        .with_env(|env| -> jni::errors::Result<()> {
+            let iface = if interface_name.is_null() {
+                None
+            } else {
+                interface_name.try_to_string(env).ok()
+            };
+            core_outbound::set_outbound_interface(iface);
+            Ok(())
+        })
+        .resolve::<jni::errors::LogContextErrorAndDefault>();
 }
 
 pub fn is_started() -> bool {

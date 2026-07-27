@@ -44,8 +44,8 @@ pub mod spec;
 pub use fetch::{FetchError, fetch_ruleset};
 pub use format::{RulesetFormat, detect_format};
 pub use ir::{
-    PortRange, RulesetExpr, RulesetInterfaceAddress, RulesetMatchContext, RulesetPredicate,
-    RulesetProgram,
+    PortRange, RulesetExpr, RulesetInterfaceAddress, RulesetMatchContext, RulesetMatchOutcome,
+    RulesetPredicate, RulesetProgram,
 };
 pub use manager::{
     RulesetManager, RulesetRefreshReport, RulesetSink, RulesetStatus, RulesetUpdate,

@@ -374,6 +374,17 @@ impl RulesetPredicate {
         }
     }
 
+    fn requires_process_metadata(&self) -> bool {
+        matches!(
+            self,
+            Self::ProcessName(_)
+                | Self::ProcessPath(_)
+                | Self::ProcessPathRegex(_)
+                | Self::PackageName(_)
+                | Self::PackageNameRegex(_)
+        )
+    }
+
     fn item_count(&self) -> usize {
         match self {
             Self::Domain(items)
@@ -416,6 +427,14 @@ pub enum RulesetExpr {
     Predicate(RulesetPredicate),
 }
 
+/// Tri-state result used while process metadata may still be unresolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RulesetMatchOutcome {
+    Matched,
+    NotMatched,
+    NeedsProcess,
+}
+
 impl RulesetExpr {
     pub fn matches(&self, ctx: &RulesetMatchContext<'_>) -> bool {
         match self {
@@ -434,6 +453,57 @@ impl RulesetExpr {
             }
             Self::Not(child) => child.item_count(),
             Self::Predicate(predicate) => predicate.item_count(),
+        }
+    }
+
+    pub(crate) fn matches_lazy(
+        &self,
+        ctx: &RulesetMatchContext<'_>,
+        process_resolved: bool,
+    ) -> RulesetMatchOutcome {
+        use RulesetMatchOutcome::{Matched, NeedsProcess, NotMatched};
+
+        match self {
+            Self::Any(children) => {
+                let mut needs_process = false;
+                for child in children {
+                    match child.matches_lazy(ctx, process_resolved) {
+                        Matched => return Matched,
+                        NeedsProcess => needs_process = true,
+                        NotMatched => {}
+                    }
+                }
+                if needs_process {
+                    NeedsProcess
+                } else {
+                    NotMatched
+                }
+            }
+            Self::All(children) => {
+                let mut needs_process = false;
+                for child in children {
+                    match child.matches_lazy(ctx, process_resolved) {
+                        NotMatched => return NotMatched,
+                        NeedsProcess => needs_process = true,
+                        Matched => {}
+                    }
+                }
+                if needs_process { NeedsProcess } else { Matched }
+            }
+            Self::Not(child) => match child.matches_lazy(ctx, process_resolved) {
+                Matched => NotMatched,
+                NotMatched => Matched,
+                NeedsProcess => NeedsProcess,
+            },
+            Self::Predicate(predicate) => {
+                if !process_resolved && predicate.requires_process_metadata() {
+                    NeedsProcess
+                } else if predicate.matches(ctx) {
+                    Matched
+                } else {
+                    NotMatched
+                }
+            }
         }
     }
 
@@ -499,6 +569,14 @@ impl RulesetProgram {
 
     pub fn matches(&self, ctx: &RulesetMatchContext<'_>) -> bool {
         self.root.matches(ctx)
+    }
+
+    pub fn matches_lazy(
+        &self,
+        ctx: &RulesetMatchContext<'_>,
+        process_resolved: bool,
+    ) -> RulesetMatchOutcome {
+        self.root.matches_lazy(ctx, process_resolved)
     }
 
     /// Return every destination `ip_cidr` item embedded in this program.
