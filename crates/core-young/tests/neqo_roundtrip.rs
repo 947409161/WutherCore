@@ -50,6 +50,9 @@ async fn neqo_webtransport_tcp_and_udp_round_trip() {
         max_streams: 32,
         max_sessions: 8,
         max_flows_per_session: 16,
+        padding_min: 17,
+        padding_max: 79,
+        padding_scheme_length: 32,
         decoy_status: 404,
         decoy_body: b"<html>not found</html>".to_vec(),
     })

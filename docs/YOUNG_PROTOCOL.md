@@ -27,6 +27,7 @@ Neqo 的 TLS 实现通过 `nss-rs` 使用 Mozilla NSS；WutherCore 不包含手�
 - 未认证请求表现为普通 HTTP/3 响应，不暴露 Young 错误、版本或认证状态。
 - TCP 支持双向传输和半关闭；UDP 支持最大 65507 字节报文、分片和乱序重组。
 - 配置限制会话数、每会话流数、QUIC 流数、重放缓存和重组缓存。
+- FlowOpen padding 使用服务端下发的每会话 scheme，热路径不调用随机数生成器。
 
 ## 2. 密钥和证书
 
@@ -115,6 +116,51 @@ session_key = HMAC-SHA256(
 
 因此，截获的 Young Authorization 不能脱离原 TLS 会话复用为内层流量密钥。
 
+### 3.1 每会话 padding scheme
+
+支持 padding scheme 的客户端在 Capabilities 中设置 `0x00000004`。服务端为每个
+通过认证的 WebTransport 会话生成一份独立的长度表，并通过
+`sec-young-padding` 响应头下发。该头为无填充 base64url，解码布局如下：
+
+| 字段 | 长度 | 说明 |
+| --- | ---: | --- |
+| Scheme version | 1 | `0x01` |
+| Entry count | 2 | 网络字节序，范围 `1..=256` |
+| Padding lengths | `count * 2` | 每项为网络字节序 `u16`，最大 4096 |
+| Tag | 32 | HMAC-SHA-256 |
+
+Tag 覆盖：
+
+```text
+"young/padding-scheme/v1" || client_nonce || all_fields_before_tag
+```
+
+客户端必须在打开第一个代理流前验证 Tag、条目数量、编码总长度和每个 padding
+长度。验证失败会终止会话，不静默使用未认证的 scheme。第 `i` 个 FlowOpen 使用：
+
+```text
+padding_length = scheme[i mod entry_count]
+```
+
+服务端生成 scheme 时只从线程本地 CSPRNG 取得一次 256-bit seed，再使用
+`rand_chacha::ChaCha8Rng` 扩展整张表。默认生成 64 项，每项在 `64..=512`
+字节之间。客户端热路径只做数组读取、计数器递增和到表尾后的条件归零，不做整数
+除法，也不为每条流调用 RNG。
+默认 64 项存放于 `smallvec::SmallVec` 的内联空间，不产生额外堆分配。
+
+scheme 的生命周期等于 WebTransport 会话；新会话会自动得到新表。因此正常重连、
+空闲超时重连以及运营侧主动重建会话都会轮换 scheme。v1 不在同一 WebTransport
+会话中发送中途更新，以免引入更新帧乱序和双方计数器不同步问题。
+
+兼容规则如下：
+
+- 新客户端对旧服务端：若响应中没有 `sec-young-padding`，客户端在连接建立时生成
+  一次本地兼容 scheme；仍不会在每条 FlowOpen 上调用 RNG。
+- 旧客户端对新服务端：旧客户端未声明 `0x00000004`，服务端不发送 scheme，
+  并继续接受合法的旧式 FlowOpen。
+- 中间设备不能从响应中剥离 scheme：HTTP/3 头部受 QUIC TLS 保护；scheme 自身
+  还绑定预共享密钥和本次 `client_nonce`。
+
 ## 4. TCP 流
 
 每个 TCP 代理流使用一条 WebTransport 双向流。第一个帧为 FlowOpen：
@@ -124,10 +170,10 @@ session_key = HMAC-SHA256(
 | Magic | 2 | `YF` |
 | Version | 1 | `0x01` |
 | Kind | 1 | `1=TCP`，`2=UDP association` |
-| Flow ID | 8 | 随机会话内标识 |
+| Flow ID | 8 | 每会话随机起点后递增的非零标识 |
 | Target | 可变 | IPv4、IPv6 或域名及端口 |
 | Padding length | 2 | `0..=4096` |
-| Random padding | 可变 | CSPRNG 字节 |
+| Padding | 可变 | scheme 指定长度；当前编码为零字节 |
 | Tag | 16 | 截断 HMAC-SHA-256 |
 
 Tag 覆盖：
@@ -135,6 +181,11 @@ Tag 覆盖：
 ```text
 "young/flow-open/v1" || all_fields_before_tag
 ```
+
+padding 明文内容不承担保密或熵来源职责：整个 FlowOpen 已位于 QUIC AEAD 加密层
+内，线上观察者只能看到加密后的 QUIC payload。当前实现直接零初始化 padding，
+避免逐字节生成随机内容；padding 长度和内容仍全部纳入 FlowOpen HMAC，不能被
+篡改。此优化只改变密文前的无语义字节，不降低线上密文的机密性。
 
 服务端响应固定长度 FlowResponse：
 
@@ -181,7 +232,24 @@ Tag 覆盖：
 分片数量、总长度或 Tag 不一致时丢弃整份报文，避免把不同 UDP 报文拼接在一起。
 每份原始报文最多 256 个分片，未知 association 不进入重组缓存。
 
-## 6. 主动探测和封锁对抗
+## 6. 性能设计
+
+Young 将高成本随机工作放在低频会话建立路径：
+
+- 每个会话一次线程本地 CSPRNG 取种和一次 ChaCha8 scheme 展开；
+- 每条流的 padding 选择为 O(1) 数组读取和条件归零，无锁、无整数除法、无系统
+  调用、无 RNG；
+- Flow ID 使用连接建立时随机化的起点后顺序递增，避免每流生成和碰撞检查；
+- padding 使用 `Vec::resize` 的零初始化结果，不再调用 RNG 填满 padding；
+- 一个 QUIC/WebTransport 会话复用多条 TCP/UDP 流，摊薄 TLS、HTTP/3 和 scheme
+  协商成本。
+
+scheme 优化针对大量短连接时频繁建立 FlowOpen 的成本。TCP 应用数据和 UDP
+Datagram 不附加此 padding，因此不会按数据包消耗额外带宽或调用 scheme。
+`paddingSchemeLength` 增大会延长长度序列的周期，但也会增加一次性的响应头大小；
+推荐保持默认 64，仅在经过基准测试后调整。
+
+## 7. 主动探测和封锁对抗
 
 Young v1 实现以下防护：
 
@@ -192,7 +260,8 @@ Young v1 实现以下防护：
 - 内层 FlowOpen、FlowResponse 和每个 UDP 分片都用 TLS-exporter 派生密钥认证。
 - 无效认证、错误路径和普通 HTTP/3 请求返回可配置的普通网页，不返回 Young
   专用错误；并在验证认证前不连接任意目标。
-- 随机 FlowOpen padding 降低固定长度特征；一个连接复用多个流，减少逐流握手。
+- 每会话随机且带认证的 FlowOpen padding scheme 降低固定长度特征；一个连接
+  复用多个流，减少逐流握手。
 - 会话、流、缓存和报文尺寸均有限制；每流待发送队列上限为 1 MiB，流结束或
   重置时会取消对应 relay task，降低慢连接和探测造成的资源消耗。
 - 已认证会话中的非法流帧只重置该流，非法 UDP 分片只丢弃该报文，不会终止
@@ -203,7 +272,11 @@ Young v1 实现以下防护：
 尚未实现的 ECH、域前置或 TCP fallback。需要运营侧配合轮换 IP、证书、密钥和
 伪装内容，并监控 QUIC 可达性。
 
-## 7. 服务端配置
+padding scheme 只扰动 FlowOpen 长度，不对后续应用数据做恒定速率整形、时序
+抖动或 cover traffic。因此它缓解高频短流的固定开流特征，但不宣称彻底解决
+TLS-in-TLS（TIT）或长期流量相关性分析。
+
+## 8. 服务端配置
 
 NSS 数据库中必须存在可用于 `authority` 的证书及私钥。一个进程只能初始化一份
 NSS 数据库，因此同一配置中的所有 Young listener 必须使用相同的
@@ -235,6 +308,9 @@ listen:
       maxStreams: 1024
       maxSessions: 4096
       maxFlowsPerSession: 256
+      paddingMin: 64
+      paddingMax: 512
+      paddingSchemeLength: 64
       decoyStatus: 404
       decoyBody: "<!doctype html><title>Not Found</title>"
 
@@ -243,10 +319,12 @@ route:
 ```
 
 `wuther-core check` 会验证端口冲突、密钥长度和 key id 重复、NSS 数据库一致性、
-路径、状态码及所有资源上限。`run` 会先启动 Young UDP listener，再启动本地
-Mixed listener；出站客户端延迟初始化，从而避免 NSS 全局初始化顺序冲突。
+路径、状态码、padding 范围、scheme 长度及所有资源上限。`paddingMin` 与
+`paddingMax` 必须满足 `0 <= min <= max <= 4096`，`paddingSchemeLength`
+必须在 `1..=256`。`run` 会先启动 Young UDP listener，再启动本地 Mixed
+listener；出站客户端延迟初始化，从而避免 NSS 全局初始化顺序冲突。
 
-## 8. 客户端 URI
+## 9. 客户端 URI
 
 ```text
 young://<base64url-key>@<server-ip-or-host>:443\
@@ -264,8 +342,10 @@ young://<base64url-key>@<server-ip-or-host>:443\
 
 必填项是 32 字节 base64url key、服务器地址、端口、`security=tls`、SNI 和
 `pin-sha256`。`authority` 默认等于 SNI，`path` 默认 `/assets`。
+`padding-min` 与 `padding-max` 只用于连接不支持服务端 scheme 的旧服务端；
+成功协商 `sec-young-padding` 后，以服务端表为准。
 
-## 9. 构建依赖
+## 10. 构建依赖
 
 Linux（Debian/Ubuntu）：
 
@@ -294,14 +374,15 @@ cargo test -p core-young --features firefox-stack --test neqo_roundtrip
 ```
 
 该测试覆盖错误用户密钥拒绝后服务端继续可用、真实 WebTransport 会话、TCP
-半关闭后回包，以及 5000 字节 UDP 报文的分片和乱序安全重组路径。
+半关闭后回包、服务端 padding scheme 协商，以及 5000 字节 UDP 报文的分片和
+乱序安全重组路径。
 
-## 10. 实现状态与上游边界
+## 11. 实现状态与上游边界
 
 Young v1 已接入配置解析、运行计划、内核 listener、出站注册、TCP、UDP、
-半关闭、证书固定、重放防护、伪装响应和真实 Neqo 互操作测试。Mozilla 当前仍将
-Neqo 服务端能力标记为实验性；部署前应进行容量、升级和异常网络回归，不应把
-上游实验性服务端当作无风险的长期兼容承诺。
+半关闭、证书固定、重放防护、伪装响应、每会话 padding scheme 和真实 Neqo
+互操作测试。Mozilla 当前仍将 Neqo 服务端能力标记为实验性；部署前应进行容量、
+升级和异常网络回归，不应把上游实验性服务端当作无风险的长期兼容承诺。
 
 参考：
 

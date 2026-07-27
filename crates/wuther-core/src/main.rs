@@ -1155,6 +1155,9 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
             max_streams: listener.max_streams,
             max_sessions: listener.max_sessions,
             max_flows_per_session: listener.max_flows_per_session,
+            padding_min: listener.padding_min,
+            padding_max: listener.padding_max,
+            padding_scheme_length: listener.padding_scheme_length,
             decoy_status: listener.decoy_status,
             decoy_body: listener.decoy_body.as_bytes().to_vec(),
         })?;

@@ -18,7 +18,7 @@ use neqo_transport::{
     ConnectionParameters, Output, RandomConnectionIdGenerator, StreamId, StreamType,
 };
 use nss::AuthenticationStatus;
-use rand::{Rng, RngExt};
+use rand::Rng;
 use sha2::{Digest as _, Sha256};
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _, DuplexStream},
@@ -28,9 +28,10 @@ use tokio::{
 use tracing::{debug, warn};
 
 use crate::codec::{
-    FlowKind, FlowOpen, SessionKey, Status, Target, UdpReassembler, YoungKey, create_authorization,
-    decode_flow_response, decode_udp_fragment, derive_rotating_path, derive_session_key,
-    encode_flow_open, encode_udp_fragments, unix_time_secs, verify_server_accept_proof,
+    DEFAULT_PADDING_SCHEME_LENGTH, FlowKind, FlowOpen, PaddingScheme, SessionKey, Status, Target,
+    UdpReassembler, YoungKey, create_authorization, decode_flow_response, decode_padding_scheme,
+    decode_udp_fragment, derive_rotating_path, derive_session_key, encode_flow_open,
+    encode_udp_fragments, generate_padding_scheme, unix_time_secs, verify_server_accept_proof,
 };
 
 const STREAM_BUFFER_BYTES: usize = 256 * 1024;
@@ -40,6 +41,7 @@ const EXPORTER_LABEL: &[u8] = b"young-session-v1";
 const EXPORTER_CONTEXT: &[u8] = b"wuther-core";
 const CAP_TCP: u32 = 1;
 const CAP_UDP: u32 = 2;
+const CAP_PADDING_SCHEME: u32 = 4;
 
 #[derive(Clone)]
 pub struct YoungClientConfig {
@@ -313,12 +315,15 @@ struct ClientDriver {
     remote_addr: Option<SocketAddr>,
     session_id: Option<StreamId>,
     session_key: Option<SessionKey>,
+    padding_scheme: PaddingScheme,
+    next_padding_index: usize,
     client_nonce: Option<[u8; 16]>,
     session_started: bool,
     pending: VecDeque<ClientCommand>,
     flows: HashMap<StreamId, ClientFlow>,
     udp_streams: HashMap<u64, StreamId>,
     udp_reassembler: UdpReassembler,
+    next_flow_id: u64,
     next_packet_id: u32,
 }
 
@@ -328,6 +333,15 @@ impl ClientDriver {
         receiver: mpsc::UnboundedReceiver<ClientCommand>,
         commands: mpsc::UnboundedSender<ClientCommand>,
     ) -> Self {
+        // This local table is used only when talking to an older Young server
+        // that does not advertise a server-selected scheme.
+        let padding_scheme = generate_padding_scheme(
+            config.padding_min,
+            config.padding_max,
+            DEFAULT_PADDING_SCHEME_LENGTH,
+        )
+        .expect("YoungClientConfig padding was validated");
+        let next_flow_id = rand::rng().next_u64().max(1);
         Self {
             config,
             receiver,
@@ -338,12 +352,15 @@ impl ClientDriver {
             remote_addr: None,
             session_id: None,
             session_key: None,
+            padding_scheme,
+            next_padding_index: 0,
             client_nonce: None,
             session_started: false,
             pending: VecDeque::new(),
             flows: HashMap::new(),
             udp_streams: HashMap::new(),
             udp_reassembler: UdpReassembler::default(),
+            next_flow_id,
             next_packet_id: rand::rng().next_u32(),
         }
     }
@@ -564,7 +581,7 @@ impl ClientDriver {
             &self.config.key,
             &self.config.authority,
             &path,
-            CAP_TCP | CAP_UDP,
+            CAP_TCP | CAP_UDP | CAP_PADDING_SCHEME,
         )?;
         let headers = [
             Header::new("authorization", format!("Bearer {authorization}")),
@@ -613,6 +630,13 @@ impl ClientDriver {
             })?;
         let nonce = self.client_nonce.expect("session started");
         verify_server_accept_proof(&self.config.key, nonce, proof)?;
+        if let Some(encoded_scheme) = headers
+            .find_header("sec-young-padding")
+            .and_then(|header| header.value_utf8().ok())
+        {
+            self.padding_scheme = decode_padding_scheme(&self.config.key, nonce, encoded_scheme)?;
+            self.next_padding_index = 0;
+        }
         let mut exporter = [0; 32];
         self.client
             .as_ref()
@@ -720,15 +744,13 @@ impl ClientDriver {
             .expect("initialized")
             .webtransport_create_stream(session_id, StreamType::BiDi)
             .map_err(neqo_error)?;
-        let mut flow_id = rand::rng().next_u64();
-        while flow_id == 0 || self.udp_streams.contains_key(&flow_id) {
-            flow_id = rand::rng().next_u64();
+        let flow_id = self.next_flow_id;
+        self.next_flow_id = self.next_flow_id.wrapping_add(1).max(1);
+        let padding = self.padding_scheme.entries()[self.next_padding_index];
+        self.next_padding_index += 1;
+        if self.next_padding_index == self.padding_scheme.len() {
+            self.next_padding_index = 0;
         }
-        let padding = if self.config.padding_min == self.config.padding_max {
-            self.config.padding_min
-        } else {
-            rand::rng().random_range(self.config.padding_min..=self.config.padding_max)
-        };
         let frame = encode_flow_open(
             self.session_key.as_ref().expect("ready"),
             &FlowOpen {

@@ -30,14 +30,15 @@ use tracing::{debug, warn};
 use crate::codec::{
     FlowKind, FlowResponse, KeyRing, ReplayCache, SessionKey, Status, Target, UdpReassembler,
     decode_flow_open, decode_udp_fragment, derive_rotating_path, derive_session_key,
-    encode_flow_response, encode_udp_fragments, server_accept_proof, unix_time_secs,
-    verify_authorization,
+    encode_flow_response, encode_padding_scheme, encode_udp_fragments, generate_padding_scheme,
+    server_accept_proof, unix_time_secs, verify_authorization,
 };
 
 const STREAM_CHUNK_BYTES: usize = 32 * 1024;
 const MAX_FLOW_WRITE_BUFFER_BYTES: usize = 1024 * 1024;
 const EXPORTER_LABEL: &[u8] = b"young-session-v1";
 const EXPORTER_CONTEXT: &[u8] = b"wuther-core";
+const CAP_PADDING_SCHEME: u32 = 4;
 const NSS_ANTI_REPLAY_WINDOW: Duration = Duration::from_secs(10);
 static NSS_DATABASE: OnceLock<PathBuf> = OnceLock::new();
 
@@ -54,6 +55,9 @@ pub struct YoungServerConfig {
     pub max_streams: u64,
     pub max_sessions: usize,
     pub max_flows_per_session: usize,
+    pub padding_min: u16,
+    pub padding_max: u16,
+    pub padding_scheme_length: u16,
     pub decoy_status: u16,
     pub decoy_body: Vec<u8>,
 }
@@ -73,6 +77,9 @@ impl fmt::Debug for YoungServerConfig {
             .field("max_streams", &self.max_streams)
             .field("max_sessions", &self.max_sessions)
             .field("max_flows_per_session", &self.max_flows_per_session)
+            .field("padding_min", &self.padding_min)
+            .field("padding_max", &self.padding_max)
+            .field("padding_scheme_length", &self.padding_scheme_length)
             .field("decoy_status", &self.decoy_status)
             .field("decoy_body_bytes", &self.decoy_body.len())
             .finish()
@@ -97,6 +104,13 @@ impl YoungServerConfig {
         }
         if self.max_streams == 0 || self.max_sessions == 0 || self.max_flows_per_session == 0 {
             return Err(invalid_input("Young server 资源上限必须大于 0"));
+        }
+        if self.padding_min > self.padding_max
+            || usize::from(self.padding_max) > crate::codec::MAX_PADDING_BYTES
+            || self.padding_scheme_length == 0
+            || usize::from(self.padding_scheme_length) > crate::codec::MAX_PADDING_SCHEME_LENGTH
+        {
+            return Err(invalid_input("Young server padding scheme 参数无效"));
         }
         if !(100..=599).contains(&self.decoy_status) {
             return Err(invalid_input(
@@ -451,7 +465,7 @@ impl ServerDriver {
             now,
             self.config.clock_skew.as_secs(),
         );
-        let Ok((key, nonce, _capabilities)) = verified else {
+        let Ok((key, nonce, capabilities)) = verified else {
             return self.reject_session(&session);
         };
         let path_valid = [now.saturating_sub(86_400), now, now.saturating_add(86_400)]
@@ -461,9 +475,21 @@ impl ServerDriver {
             return self.reject_session(&session);
         }
         let proof = server_accept_proof(&key, nonce);
+        let mut response_headers = vec![Header::new("sec-young-accept", proof)];
+        if capabilities & CAP_PADDING_SCHEME != 0 {
+            let scheme = generate_padding_scheme(
+                self.config.padding_min,
+                self.config.padding_max,
+                self.config.padding_scheme_length,
+            )?;
+            response_headers.push(Header::new(
+                "sec-young-padding",
+                encode_padding_scheme(&key, nonce, &scheme),
+            ));
+        }
         session
             .response(
-                &SessionAcceptAction::AcceptWith(vec![Header::new("sec-young-accept", proof)]),
+                &SessionAcceptAction::AcceptWith(response_headers),
                 Instant::now(),
             )
             .map_err(neqo_error)?;

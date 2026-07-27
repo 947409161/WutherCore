@@ -879,6 +879,16 @@ fn compile_young_listeners(listeners: &[YoungListen]) -> ConfigResult<Vec<YoungL
         {
             return Err(ConfigError::invalid("Young idleTimeout/资源上限无效").at(location));
         }
+        if listener.padding_min > listener.padding_max
+            || usize::from(listener.padding_max) > core_young::MAX_PADDING_BYTES
+            || listener.padding_scheme_length == 0
+            || usize::from(listener.padding_scheme_length) > core_young::MAX_PADDING_SCHEME_LENGTH
+        {
+            return Err(ConfigError::invalid(
+                "Young paddingMin/paddingMax/paddingSchemeLength 无效",
+            )
+            .at(location));
+        }
         if !(100..=599).contains(&listener.decoy_status) || listener.decoy_body.len() > 1024 * 1024
         {
             return Err(ConfigError::invalid("Young decoyStatus/decoyBody 无效").at(location));
@@ -4835,6 +4845,46 @@ listen:
             plan.listen.young[0].socket_addr().unwrap(),
             "[::1]:2443".parse::<SocketAddr>().unwrap()
         );
+        assert_eq!(
+            plan.listen.young[0].padding_min,
+            core_young::DEFAULT_PADDING_MIN
+        );
+        assert_eq!(
+            plan.listen.young[0].padding_max,
+            core_young::DEFAULT_PADDING_MAX
+        );
+        assert_eq!(
+            plan.listen.young[0].padding_scheme_length,
+            core_young::DEFAULT_PADDING_SCHEME_LENGTH
+        );
+    }
+
+    #[test]
+    fn young_listener_rejects_invalid_padding_scheme() {
+        for padding in [
+            "paddingMin: 513\n      paddingMax: 512",
+            "paddingMax: 4097",
+            "paddingSchemeLength: 0",
+            "paddingSchemeLength: 257",
+        ] {
+            let error = crate::loader::load_from_str(&format!(
+                r#"
+version: 1
+profile: server
+listen:
+  young:
+    - port: 2443
+      nssDatabase: data/nss
+      certificateNickname: young.example
+      authority: young.example
+      users: [{}]
+      {padding}
+"#,
+                base64url_bytes(9, 32)
+            ))
+            .unwrap_err();
+            assert!(error.to_string().contains("padding"));
+        }
     }
 
     #[test]

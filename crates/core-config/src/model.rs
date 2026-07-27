@@ -512,6 +512,27 @@ pub struct YoungListen {
     )]
     pub max_flows_per_session: usize,
     #[serde(
+        default = "default_young_padding_min",
+        rename = "paddingMin",
+        alias = "padding_min",
+        alias = "padding-min"
+    )]
+    pub padding_min: u16,
+    #[serde(
+        default = "default_young_padding_max",
+        rename = "paddingMax",
+        alias = "padding_max",
+        alias = "padding-max"
+    )]
+    pub padding_max: u16,
+    #[serde(
+        default = "default_young_padding_scheme_length",
+        rename = "paddingSchemeLength",
+        alias = "padding_scheme_length",
+        alias = "padding-scheme-length"
+    )]
+    pub padding_scheme_length: u16,
+    #[serde(
         default = "default_young_decoy_status",
         rename = "decoyStatus",
         alias = "decoy_status",
@@ -543,6 +564,9 @@ impl std::fmt::Debug for YoungListen {
             .field("max_streams", &self.max_streams)
             .field("max_sessions", &self.max_sessions)
             .field("max_flows_per_session", &self.max_flows_per_session)
+            .field("padding_min", &self.padding_min)
+            .field("padding_max", &self.padding_max)
+            .field("padding_scheme_length", &self.padding_scheme_length)
             .field("decoy_status", &self.decoy_status)
             .field("decoy_body_bytes", &self.decoy_body.len())
             .finish()
@@ -5208,6 +5232,15 @@ fn default_young_max_sessions() -> usize {
 }
 fn default_young_max_flows() -> usize {
     1024
+}
+fn default_young_padding_min() -> u16 {
+    core_young::DEFAULT_PADDING_MIN
+}
+fn default_young_padding_max() -> u16 {
+    core_young::DEFAULT_PADDING_MAX
+}
+fn default_young_padding_scheme_length() -> u16 {
+    core_young::DEFAULT_PADDING_SCHEME_LENGTH
 }
 fn default_young_decoy_status() -> u16 {
     404

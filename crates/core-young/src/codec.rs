@@ -8,8 +8,10 @@ use std::{
 
 use base64::Engine as _;
 use hmac::{Hmac, KeyInit, Mac};
-use rand::Rng;
+use rand::{Rng, RngExt, SeedableRng};
+use rand_chacha::ChaCha8Rng;
 use sha2::{Digest, Sha256};
+use smallvec::SmallVec;
 use zeroize::Zeroizing;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -17,6 +19,10 @@ type HmacSha256 = Hmac<Sha256>;
 pub const VERSION: u8 = 1;
 pub const DEFAULT_CLOCK_SKEW_SECS: u64 = 120;
 pub const MAX_PADDING_BYTES: usize = 4096;
+pub const DEFAULT_PADDING_MIN: u16 = 64;
+pub const DEFAULT_PADDING_MAX: u16 = 512;
+pub const DEFAULT_PADDING_SCHEME_LENGTH: u16 = 64;
+pub const MAX_PADDING_SCHEME_LENGTH: usize = 256;
 pub const MAX_UDP_PAYLOAD_BYTES: usize = 65_507;
 const MAX_UDP_FRAGMENTS: usize = 256;
 const AUTH_TOKEN_BYTES: usize = 1 + 8 + 8 + 16 + 4 + 32;
@@ -24,6 +30,59 @@ const FLOW_TAG_BYTES: usize = 16;
 const FLOW_RESPONSE_BYTES: usize = 2 + 1 + 1 + 8 + FLOW_TAG_BYTES;
 const UDP_HEADER_BYTES: usize = 2 + 1 + 1 + 8 + 4 + 2 + 2 + 2;
 const UDP_TAG_BYTES: usize = 16;
+const PADDING_SCHEME_TAG_BYTES: usize = 32;
+const PADDING_SCHEME_VERSION: u8 = 1;
+const PADDING_SCHEME_MAX_ENCODED_BYTES: usize =
+    (1 + 2 + MAX_PADDING_SCHEME_LENGTH * size_of::<u16>() + PADDING_SCHEME_TAG_BYTES).div_ceil(3)
+        * 4;
+
+/// Per-WebTransport-session FlowOpen padding lengths.
+///
+/// The server generates this table once during session authentication. Each
+/// The flow-open hot path performs only a counter increment, conditional wrap
+/// and array lookup; no random generator or integer division is used.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaddingScheme {
+    entries: SmallVec<[u16; 64]>,
+}
+
+impl PaddingScheme {
+    pub fn new(entries: impl IntoIterator<Item = u16>) -> io::Result<Self> {
+        let entries = entries.into_iter().collect::<SmallVec<[u16; 64]>>();
+        if entries.is_empty() || entries.len() > MAX_PADDING_SCHEME_LENGTH {
+            return Err(invalid_input(format!(
+                "Young padding scheme 长度必须在 1..={MAX_PADDING_SCHEME_LENGTH}"
+            )));
+        }
+        if entries
+            .iter()
+            .any(|length| usize::from(*length) > MAX_PADDING_BYTES)
+        {
+            return Err(invalid_input("Young padding scheme 包含超限长度"));
+        }
+        Ok(Self { entries })
+    }
+
+    #[must_use]
+    pub fn padding_for(&self, flow_index: u64) -> u16 {
+        self.entries[(flow_index % self.entries.len() as u64) as usize]
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    #[must_use]
+    pub fn entries(&self) -> &[u16] {
+        &self.entries
+    }
+}
 
 #[derive(Clone)]
 pub struct YoungKey(Arc<Zeroizing<[u8; 32]>>);
@@ -406,6 +465,99 @@ pub fn verify_server_accept_proof(
     )
 }
 
+/// Generate a connection-local padding table with one thread-local CSPRNG seed
+/// and a fast userspace ChaCha8 expansion.
+pub fn generate_padding_scheme(
+    padding_min: u16,
+    padding_max: u16,
+    scheme_length: u16,
+) -> io::Result<PaddingScheme> {
+    if padding_min > padding_max || usize::from(padding_max) > MAX_PADDING_BYTES {
+        return Err(invalid_input("Young padding scheme 范围无效"));
+    }
+    if scheme_length == 0 || usize::from(scheme_length) > MAX_PADDING_SCHEME_LENGTH {
+        return Err(invalid_input(format!(
+            "Young padding scheme 长度必须在 1..={MAX_PADDING_SCHEME_LENGTH}"
+        )));
+    }
+    let mut seed = [0; 32];
+    rand::rng().fill_bytes(&mut seed);
+    let mut rng = ChaCha8Rng::from_seed(seed);
+    let entries = (0..scheme_length).map(|_| {
+        if padding_min == padding_max {
+            padding_min
+        } else {
+            rng.random_range(padding_min..=padding_max)
+        }
+    });
+    PaddingScheme::new(entries)
+}
+
+/// Serialize and authenticate a server-selected padding scheme for the
+/// `sec-young-padding` WebTransport response header.
+#[must_use]
+pub fn encode_padding_scheme(
+    key: &YoungKey,
+    client_nonce: [u8; 16],
+    scheme: &PaddingScheme,
+) -> String {
+    let mut payload =
+        Vec::with_capacity(1 + 2 + scheme.len() * size_of::<u16>() + PADDING_SCHEME_TAG_BYTES);
+    payload.push(PADDING_SCHEME_VERSION);
+    payload.extend_from_slice(&(scheme.len() as u16).to_be_bytes());
+    for length in scheme.entries() {
+        payload.extend_from_slice(&length.to_be_bytes());
+    }
+    let tag = hmac_tag(
+        key.as_bytes(),
+        &[b"young/padding-scheme/v1", &client_nonce, &payload],
+    );
+    payload.extend_from_slice(&tag);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
+}
+
+pub fn decode_padding_scheme(
+    key: &YoungKey,
+    client_nonce: [u8; 16],
+    encoded: &str,
+) -> io::Result<PaddingScheme> {
+    if encoded.len() > PADDING_SCHEME_MAX_ENCODED_BYTES {
+        return Err(permission_denied("Young padding scheme 编码超过长度上限"));
+    }
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| permission_denied("Young padding scheme 编码无效"))?;
+    if payload.len() < 1 + 2 + 2 + PADDING_SCHEME_TAG_BYTES || payload[0] != PADDING_SCHEME_VERSION
+    {
+        return Err(permission_denied("Young padding scheme 版本或长度无效"));
+    }
+    let count = usize::from(u16::from_be_bytes(
+        payload[1..3].try_into().expect("checked length"),
+    ));
+    if count == 0 || count > MAX_PADDING_SCHEME_LENGTH {
+        return Err(permission_denied("Young padding scheme 条目数量无效"));
+    }
+    let authenticated_len = 1 + 2 + count * size_of::<u16>();
+    if payload.len() != authenticated_len + PADDING_SCHEME_TAG_BYTES {
+        return Err(permission_denied("Young padding scheme 长度不一致"));
+    }
+    verify_hmac(
+        key.as_bytes(),
+        &[
+            b"young/padding-scheme/v1",
+            &client_nonce,
+            &payload[..authenticated_len],
+        ],
+        &payload[authenticated_len..],
+    )?;
+    PaddingScheme::new(
+        payload[3..authenticated_len]
+            .chunks_exact(2)
+            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]])),
+    )
+    .map_err(|_| permission_denied("Young padding scheme 包含非法长度"))
+}
+
 #[must_use]
 pub fn derive_session_key(key: &YoungKey, exporter: &[u8], client_nonce: [u8; 16]) -> SessionKey {
     SessionKey::new(hmac_tag(
@@ -435,7 +587,6 @@ pub fn encode_flow_open(
     );
     let padding_start = frame.len();
     frame.resize(padding_start + padding_len, 0);
-    rand::rng().fill_bytes(&mut frame[padding_start..]);
     let tag = hmac_tag(session_key.as_bytes(), &[b"young/flow-open/v1", &frame]);
     frame.extend_from_slice(&tag[..FLOW_TAG_BYTES]);
     Ok(frame)
@@ -887,6 +1038,7 @@ mod tests {
             target: Target::new("example.com", 443).unwrap(),
         };
         let encoded = encode_flow_open(&session, &open, 127).unwrap();
+        assert_eq!(encoded, encode_flow_open(&session, &open, 127).unwrap());
         assert!(
             decode_flow_open(&session, &encoded[..20])
                 .unwrap()
@@ -898,6 +1050,44 @@ mod tests {
         let mut tampered = encoded;
         tampered[15] ^= 1;
         assert!(decode_flow_open(&session, &tampered).is_err());
+    }
+
+    #[test]
+    fn padding_scheme_is_bounded_indexed_and_authenticated() {
+        let key = key(11);
+        let nonce = [7; 16];
+        let scheme = generate_padding_scheme(17, 79, 64).unwrap();
+        assert_eq!(scheme.len(), 64);
+        assert!(
+            scheme
+                .entries()
+                .iter()
+                .all(|length| (17..=79).contains(length))
+        );
+        assert_eq!(scheme.padding_for(0), scheme.padding_for(64));
+
+        let encoded = encode_padding_scheme(&key, nonce, &scheme);
+        assert_eq!(
+            decode_padding_scheme(&key, nonce, &encoded).unwrap(),
+            scheme
+        );
+        assert!(decode_padding_scheme(&key, [8; 16], &encoded).is_err());
+
+        let mut tampered = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .unwrap();
+        tampered[3] ^= 1;
+        let tampered = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(tampered);
+        assert!(decode_padding_scheme(&key, nonce, &tampered).is_err());
+    }
+
+    #[test]
+    fn padding_scheme_rejects_invalid_limits() {
+        assert!(generate_padding_scheme(80, 17, 64).is_err());
+        assert!(generate_padding_scheme(0, (MAX_PADDING_BYTES + 1) as u16, 64).is_err());
+        assert!(generate_padding_scheme(0, 1, 0).is_err());
+        assert!(generate_padding_scheme(0, 1, (MAX_PADDING_SCHEME_LENGTH + 1) as u16).is_err());
+        assert!(decode_padding_scheme(&key(1), [0; 16], &"A".repeat(1024)).is_err());
     }
 
     #[test]
