@@ -661,8 +661,13 @@ impl CaptureSupervisor {
                 || self.plan.auto_redirect
                 || self.plan.strict_route)
         {
+            let mode = match self.plan.kind {
+                EngineKind::Tproxy => crate::platform::linux_recovery::RecoveryMode::Tproxy,
+                EngineKind::Redirect => crate::platform::linux_recovery::RecoveryMode::Redirect,
+                EngineKind::Tun | EngineKind::None => unreachable!(),
+            };
             transaction.resources_mut().crash_recovery = Some(
-                crate::platform::linux_recovery::LinuxCaptureGuard::acquire(&self.plan)?,
+                crate::platform::linux_recovery::LinuxCaptureGuard::acquire(&self.plan, mode)?,
             );
         }
         transaction.mark_engine_started();
