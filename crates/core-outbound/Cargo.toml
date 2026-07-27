@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# NaiveProxy depends on the separately distributed SagerNet Cronet native
+# library. Keep it opt-in so ordinary MIT builds do not silently acquire a
+# GPL-3.0 runtime dependency.
+naive = ["dep:cronet"]
+
 [dependencies]
 core-config = { workspace = true }
 core-reality = { workspace = true }
@@ -25,6 +32,8 @@ pin-project-lite = { workspace = true }
 tokio-util  = { workspace = true }
 ipnet       = { workspace = true }
 if-addrs    = "0.15"
+cronet      = { workspace = true, optional = true }
+hickory-proto = { workspace = true }
 
 # 协议层依赖
 aes-gcm           = { workspace = true }
@@ -68,7 +77,6 @@ pbkdf2            = "0.12"
 hyper             = { version = "1", features = ["client", "http2"] }
 hyper-util        = { version = "0.1", features = ["client", "client-legacy", "tokio", "http2"] }
 http-body-util    = "0.1"
-hickory-proto     = "=0.24.4"
 rand_chacha       = "0.3"
 smoltcp           = { version = "0.11", default-features = false, features = ["std", "alloc", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "proto-ipv4-fragmentation", "proto-ipv6-fragmentation", "fragmentation-buffer-size-65536", "reassembly-buffer-size-65536", "reassembly-buffer-count-4", "assembler-max-segment-count-32", "iface-max-addr-count-8", "iface-max-route-count-2", "socket-tcp", "socket-udp", "async"] }
 # socket2：在 Linux/Android 上对 outbound socket 设置 SO_MARK，配合
@@ -92,3 +100,8 @@ windows-sys = { version = "0.59", features = [
 # IP_BOUND_IF / IPV6_BOUND_IF setsockopt —— 同 Windows 思路，darwin 平台
 # 出站 socket 必须按 ifindex 绑定。
 libc = "0.2"
+
+[dev-dependencies]
+h2 = "0.4"
+rcgen = "0.14"
+time = "0.3"
