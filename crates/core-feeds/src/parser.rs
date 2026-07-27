@@ -494,7 +494,8 @@ proxies:
             nodes[0].params.get("udp-over-tcp").map(String::as_str),
             Some("1")
         );
-        assert_eq!(nodes[0].params.get("quic").map(String::as_str), Some("1"));    }
+        assert_eq!(nodes[0].params.get("quic").map(String::as_str), Some("1"));
+    }
 
     #[test]
     fn parse_clash_wireguard_preserves_lists_and_multi_peer_objects() {
