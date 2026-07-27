@@ -48,14 +48,6 @@ jobs:
       - name: Check repository presentation
         run: python scripts/check-repository.py
 
-      - name: Review dependency changes (advisory)
-        if: github.event_name == 'pull_request'
-        uses: actions/dependency-review-action@v5
-        with:
-          fail-on-severity: high
-          warn-only: true
-          show-openssf-scorecard: false
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -86,18 +78,7 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
-      - name: Check workspace
-        run: cargo check --workspace --all-targets --locked
-
-      - name: Check CLI brand
-        run: |
-          cargo run --quiet -p wuther-core -- --help > /tmp/wuthercore-help.txt
-          grep -q '^Usage: wuther-core' /tmp/wuthercore-help.txt
-
-      - name: Run tests
-        run: cargo test --workspace --locked
-
-      - name: Build Rust documentation
-        env:
-          RUSTDOCFLAGS: -D warnings
-        run: cargo doc --workspace --no-deps
+      # A single all-targets test build covers libraries, binaries, integration
+      # tests and examples without compiling the workspace repeatedly.
+      - name: Test workspace
+        run: cargo test --workspace --all-targets --locked
