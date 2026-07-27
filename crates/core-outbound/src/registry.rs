@@ -163,7 +163,7 @@ pub fn build_outbound(node: &ParsedNode) -> Result<SharedOutbound, String> {
         NodeProtocol::Trojan => Arc::new(build_trojan(node)?),
         NodeProtocol::Naive => build_naive(node),
         NodeProtocol::Snell => build_snell(node)?,
-        NodeProtocol::AnyTls => build_anytls(node),
+        NodeProtocol::AnyTls => build_anytls(node)?,
         NodeProtocol::Ssh => build_ssh(node)?,
         NodeProtocol::Hysteria => build_hysteria_v1(node),
         NodeProtocol::Hysteria2 => build_hysteria2(node),
@@ -2177,8 +2177,12 @@ fn build_snell(node: &ParsedNode) -> Result<SharedOutbound, String> {
     Ok(Arc::new(ob))
 }
 
-fn build_anytls(node: &ParsedNode) -> SharedOutbound {
-    let pwd = node.password.clone().unwrap_or_default();
+fn build_anytls(node: &ParsedNode) -> Result<SharedOutbound, String> {
+    let pwd = node
+        .password
+        .clone()
+        .filter(|password| !password.is_empty())
+        .ok_or_else(|| "AnyTLS password must not be empty".to_string())?;
     let mut ob = AnyTlsOutbound::new(&node.name, &node.host, node.port, pwd);
     let disable_sni = node
         .params
@@ -2195,13 +2199,72 @@ fn build_anytls(node: &ParsedNode) -> SharedOutbound {
     };
     ob.insecure = node
         .params
-        .get("allowInsecure")
-        .map(|v| v == "1" || v == "true")
+        .get("insecure")
+        .or_else(|| node.params.get("allowInsecure"))
+        .or_else(|| node.params.get("allow-insecure"))
+        .or_else(|| node.params.get("allow_insecure"))
+        .map(|value| parse_bool_param("AnyTLS insecure", value))
+        .transpose()?
         .unwrap_or(false);
     if let Some(alpn) = node.params.get("alpn") {
-        ob.alpn = alpn.split(',').map(|s| s.trim().to_string()).collect();
+        ob.alpn = alpn
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .collect();
     }
-    Arc::new(ob)
+    if let Some(fingerprint) = first_param(node, &["fingerprint", "fp"]) {
+        ob.fingerprint = fingerprint.to_owned();
+    }
+    if let Some(value) = first_param(
+        node,
+        &[
+            "enableSessionResumption",
+            "enable-session-resumption",
+            "enable_session_resumption",
+        ],
+    ) {
+        ob.enable_session_resumption = parse_bool_param("AnyTLS enableSessionResumption", value)?;
+    }
+    if let Some(value) = first_param(
+        node,
+        &[
+            "idleSessionCheckInterval",
+            "idle-session-check-interval",
+            "idle_session_check_interval",
+        ],
+    ) {
+        ob.options.idle_session_check_interval = parse_tuic_duration(value)
+            .ok_or_else(|| format!("invalid AnyTLS idleSessionCheckInterval `{value}`"))?;
+    }
+    if let Some(value) = first_param(
+        node,
+        &[
+            "idleSessionTimeout",
+            "idle-session-timeout",
+            "idle_session_timeout",
+        ],
+    ) {
+        ob.options.idle_session_timeout = parse_tuic_duration(value)
+            .ok_or_else(|| format!("invalid AnyTLS idleSessionTimeout `{value}`"))?;
+    }
+    if let Some(value) = first_param(
+        node,
+        &["minIdleSession", "min-idle-session", "min_idle_session"],
+    ) {
+        ob.options.min_idle_session = value
+            .parse::<usize>()
+            .map_err(|_| format!("invalid AnyTLS minIdleSession `{value}`"))?;
+    }
+    if let Some(value) = first_param(node, &["disableReuse", "disable-reuse", "disable_reuse"]) {
+        ob.options.disable_reuse = parse_bool_param("AnyTLS disableReuse", value)?;
+    }
+    ob.options.udp_over_tcp = node.udp;
+    if let Some(value) = first_param(node, &["udp-over-tcp", "udp_over_tcp"]) {
+        ob.options.udp_over_tcp = parse_bool_param("AnyTLS udp-over-tcp", value)?;
+    }
+    Ok(Arc::new(ob))
 }
 
 fn build_ssh(node: &ParsedNode) -> Result<SharedOutbound, String> {
@@ -3284,6 +3347,10 @@ mod tests {
                 "ShadowsocksR password must not be empty",
             ),
             (node(NodeProtocol::Snell), "Snell PSK must not be empty"),
+            (
+                node(NodeProtocol::AnyTls),
+                "AnyTLS password must not be empty",
+            ),
             (node(NodeProtocol::Wireguard), "missing-private-key"),
             (node(NodeProtocol::Sudoku), "Sudoku key must not be empty"),
         ];
@@ -3292,6 +3359,31 @@ mod tests {
             let error = build_error(&node);
             assert!(error.contains(expected), "error={error:?}");
         }
+    }
+
+    #[test]
+    fn anytls_registry_enables_official_v2_features_and_validates_options() {
+        let mut anytls = node(NodeProtocol::AnyTls);
+        anytls.password = Some("secret".into());
+        anytls.udp = true;
+        anytls.params.insert("insecure".into(), "0".into());
+        anytls
+            .params
+            .insert("idleSessionCheckInterval".into(), "31s".into());
+        anytls
+            .params
+            .insert("idle-session-timeout".into(), "45s".into());
+        anytls.params.insert("min_idle_session".into(), "2".into());
+        let outbound = build_outbound(&anytls).unwrap();
+        assert_eq!(outbound.protocol(), "anytls");
+        assert!(outbound.capabilities().tcp);
+        assert!(outbound.capabilities().udp);
+        assert!(outbound.capabilities().multiplex);
+
+        anytls
+            .params
+            .insert("disable-reuse".into(), "sometimes".into());
+        assert!(build_error(&anytls).contains("invalid boolean"));
     }
 
     #[test]

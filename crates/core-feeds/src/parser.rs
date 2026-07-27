@@ -146,6 +146,7 @@ fn clash_proxy_to_node(m: &serde_yaml::Mapping) -> Option<ParsedNode> {
                 | NodeProtocol::Naive
                 | NodeProtocol::Hysteria2
                 | NodeProtocol::Tuic
+                | NodeProtocol::AnyTls
         );
     node.sni = str_g("sni").or_else(|| str_g("servername"));
     if let Some(net) = str_g("network") {
@@ -513,6 +514,44 @@ proxies:
             Some("1")
         );
         assert_eq!(nodes[0].params.get("quic").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn parse_anytls_clash_session_options() {
+        let yaml = r#"
+proxies:
+  - name: AnyTLS-v2
+    type: anytls
+    server: proxy.example.com
+    port: 443
+    password: secret
+    sni: edge.example.com
+    udp: true
+    idle-session-check-interval: 31s
+    idle-session-timeout: 45s
+    min-idle-session: 2
+    disable-reuse: false
+"#;
+        let nodes = parse_feed_payload(yaml.as_bytes(), FormatHint::Auto);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].protocol, NodeProtocol::AnyTls);
+        assert_eq!(nodes[0].password.as_deref(), Some("secret"));
+        assert!(nodes[0].tls);
+        assert_eq!(
+            nodes[0]
+                .params
+                .get("idle-session-check-interval")
+                .map(String::as_str),
+            Some("31s")
+        );
+        assert_eq!(
+            nodes[0].params.get("min-idle-session").map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            nodes[0].params.get("disable-reuse").map(String::as_str),
+            Some("0")
+        );
     }
 
     #[test]

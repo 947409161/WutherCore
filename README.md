@@ -103,6 +103,8 @@ WutherCore 负责节点接入、订阅更新、DNS、规则分流、透明代理
 
 协议名称出现在列表中表示仓库内存在可执行实现和测试路径。UDP、复用、传输层和服务端版本仍需按照具体协议配置验证。
 
+AnyTLS 已按官方协议 v2 实现认证、动态 padding scheme、会话复用、SYNACK 与 UDP-over-TCP v2，配置和线格式说明见 [AnyTLS 指南](docs/ANYTLS.md)。
+
 ### Young
 
 Young 是 WutherCore 的原生代理协议，客户端和服务端都使用 Mozilla Neqo 与 NSS：

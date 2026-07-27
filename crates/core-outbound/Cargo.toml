@@ -74,6 +74,7 @@ shake             = { workspace = true }
 rc4               = { workspace = true }
 chacha20          = { workspace = true }
 shadowsocks       = { workspace = true }
+anytls            = { workspace = true }
 chrono            = { version = "0.4", default-features = false, features = ["clock"] }
 russh             = { workspace = true }
 quinn             = { workspace = true }

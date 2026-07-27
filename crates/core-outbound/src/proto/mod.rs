@@ -8,7 +8,7 @@
 //! * [`trojan`]      —— Trojan over TLS
 //! * [`vless`]       —— VLESS over TLS / TCP / WebSocket
 //! * [`vmess`]       —— VMess AEAD (aes-128-gcm / chacha20-poly1305 / none)
-//! * [`anytls`]      —— AnyTLS single-stream
+//! * [`anytls`]      —— AnyTLS v2（动态 padding、会话池、SYNACK、UoT v2）
 //! * [`wireguard`]   —— 用户态 WireGuard（多 peer、TCP/UDP、IPv4/IPv6、服务端 API）
 
 pub mod addr;

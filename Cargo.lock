@@ -207,6 +207,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "anytls"
+version = "0.3.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9fec9cbe2e6c024f061ee340f8c3357f2f61fc9a5e9884ffdca1395bcf480f18"
+dependencies = [
+ "bytes",
+ "log",
+ "md5",
+ "parking_lot",
+ "percent-encoding",
+ "rand 0.10.2",
+]
+
+[[package]]
 name = "arc-swap"
 version = "1.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1344,6 +1358,7 @@ dependencies = [
  "aes 0.9.2",
  "aes-gcm 0.11.0",
  "anyhow",
+ "anytls",
  "async-trait",
  "base64 0.23.0",
  "blake2 0.10.6",

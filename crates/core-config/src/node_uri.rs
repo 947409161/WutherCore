@@ -247,12 +247,13 @@ fn collect_params(url: &Url) -> std::collections::BTreeMap<String, String> {
         .collect()
 }
 
-fn require_host_port(url: &Url) -> ConfigResult<(String, u16)> {
+fn require_host_port(url: &Url, protocol_default: Option<u16>) -> ConfigResult<(String, u16)> {
     let host = url
         .host_str()
         .ok_or_else(|| ConfigError::bad_node(format!("URI 缺少主机: {url}")))?;
     let port = url
         .port_or_known_default()
+        .or(protocol_default)
         .ok_or_else(|| ConfigError::bad_node(format!("URI 缺少端口: {url}")))?;
     Ok((
         host.strip_prefix('[')
@@ -265,7 +266,8 @@ fn require_host_port(url: &Url) -> ConfigResult<(String, u16)> {
 
 fn parse_url_like(uri: &str, proto: NodeProtocol) -> ConfigResult<ParsedNode> {
     let url = Url::parse(uri).map_err(|e| ConfigError::bad_node(format!("非法 URI: {e}")))?;
-    let (host, port) = require_host_port(&url)?;
+    let default_port = matches!(proto, NodeProtocol::AnyTls).then_some(443);
+    let (host, port) = require_host_port(&url, default_port)?;
     let name = fragment_name(&url, &format!("{}-{}", proto.as_str(), host));
     let mut params = collect_params(&url);
     if scheme_is_naive_quic(uri) {
@@ -280,6 +282,7 @@ fn parse_url_like(uri: &str, proto: NodeProtocol) -> ConfigResult<ParsedNode> {
             | NodeProtocol::Naive
             | NodeProtocol::Hysteria2
             | NodeProtocol::Tuic
+            | NodeProtocol::AnyTls
             | NodeProtocol::Young
     ) || params
         .get("security")
@@ -302,6 +305,17 @@ fn parse_url_like(uri: &str, proto: NodeProtocol) -> ConfigResult<ParsedNode> {
         match proto {
             NodeProtocol::Trojan | NodeProtocol::Hysteria2 => {
                 node.password = Some(decoded);
+            }
+            NodeProtocol::AnyTls => {
+                // The official URI grammar calls the entire userinfo `auth`
+                // and uses it verbatim as the protocol password. The common
+                // form has no colon; preserve an explicit `user:password`
+                // spelling as one password as well.
+                let auth = match url.password() {
+                    Some(password) => format!("{decoded}:{}", pct_decode(password)),
+                    None => decoded,
+                };
+                node.password = Some(auth);
             }
             NodeProtocol::Tuic => {
                 // TUIC v5 share links use `tuic://uuid:password@host:port`.
@@ -513,7 +527,7 @@ pub(crate) fn validate_reality_client_settings(
 
 fn parse_http_socks(uri: &str, proto: NodeProtocol) -> ConfigResult<ParsedNode> {
     let url = Url::parse(uri).map_err(|e| ConfigError::bad_node(format!("非法 URI: {e}")))?;
-    let (host, port) = require_host_port(&url)?;
+    let (host, port) = require_host_port(&url, None)?;
     let name = fragment_name(&url, &format!("{}-{}", proto.as_str(), host));
     let mut node = ParsedNode::new(name, proto, host, port);
     node.raw = uri.to_string();
@@ -757,6 +771,29 @@ mod tests {
         assert_eq!(quic.protocol, NodeProtocol::Naive);
         assert_eq!(quic.host, "2001:db8::1");
         assert_eq!(quic.params.get("quic").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn parse_official_anytls_uri_defaults_and_auth() {
+        let node =
+            parse_uri("anytls://let%3Amein@example.com/?sni=real.example.com&insecure=1#Official")
+                .unwrap();
+        assert_eq!(node.protocol, NodeProtocol::AnyTls);
+        assert_eq!(node.host, "example.com");
+        assert_eq!(node.port, 443);
+        assert_eq!(node.password.as_deref(), Some("let:mein"));
+        assert_eq!(node.sni.as_deref(), Some("real.example.com"));
+        assert_eq!(node.params.get("insecure").map(String::as_str), Some("1"));
+        assert!(node.tls);
+        assert_eq!(node.name, "Official");
+    }
+
+    #[test]
+    fn parse_anytls_ipv6_and_explicit_port() {
+        let node = parse_uri("anytls://uuid@[2409:8a71:6a00:1953::615]:8964/?insecure=1").unwrap();
+        assert_eq!(node.host, "2409:8a71:6a00:1953::615");
+        assert_eq!(node.port, 8964);
+        assert_eq!(node.password.as_deref(), Some("uuid"));
     }
 
     #[test]
