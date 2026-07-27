@@ -39,7 +39,7 @@
 | 通用代理 | HTTP、SOCKS5 | 支持认证；UDP 能力由具体实现决定 |
 | Shadowsocks | Shadowsocks、Shadowsocks 2022、SSR | 全加密族 TCP/UDP 客户端与服务端、SIP003 插件、SIP022 EIH 多用户；SSR 保持独立实现 |
 | 经典 TLS | Trojan、VLESS、VMess | 支持对应 TLS、UUID 与安全参数 |
-| 现代隧道 | AnyTLS、Hysteria、Hysteria 2、TUIC、Naive | AnyTLS v2 包含官方认证、动态 padding scheme、会话池、SYNACK 与 UoT v2，见 [AnyTLS 指南](ANYTLS.md)；Naive 为可选 feature，见 [Naive 指南](NAIVE.md) |
+| 现代隧道 | AnyTLS、Hysteria、Hysteria 2、TUIC、Naive | AnyTLS v2 包含官方认证、动态 padding scheme、会话池、SYNACK 与 UoT v2，见 [AnyTLS 指南](ANYTLS.md)；Hysteria 1/2 包含官方 TCP/UDP、packet obfs、端口跳跃与两代 Brutal，见 [Hysteria 指南](HYSTERIA.md)；Naive 为可选 feature，见 [Naive 指南](NAIVE.md) |
 | 专用协议 | Snell、Mieru、Sudoku、TrustTunnel | 按各自握手、加密和复用模型实现 |
 | 系统隧道 | WireGuard、SSH | WireGuard 支持用户态 TCP/UDP、双栈、多 Peer 与服务端；密钥或主机校验需要单独配置 |
 

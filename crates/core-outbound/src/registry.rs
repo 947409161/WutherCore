@@ -6,9 +6,10 @@ use std::{collections::BTreeMap, net::IpAddr, sync::Arc};
 
 use base64::Engine as _;
 use core_config::{
+    I32Range, PortListValue, QuicParamsConfig,
     model::{
         XhttpConfig as TypedXhttpConfig, XhttpDownloadSettings as TypedDownloadSettings,
-        XhttpRange as TypedRange,
+        XhttpDownloadTlsCertificate, XhttpRange as TypedRange, XhttpTlsCertificateUsage,
     },
     node_uri::{NodeProtocol, ParsedNode},
 };
@@ -28,7 +29,7 @@ use crate::{
     proto::{
         anytls::AnyTlsOutbound,
         hysteria::HysteriaOutbound,
-        hysteria2::Hysteria2Outbound,
+        hysteria2::{Hysteria2Obfs, Hysteria2Outbound},
         mieru::{MieruCipher, MieruOutbound},
         shadowsocks::ShadowsocksOutbound,
         snell::{SnellCipher, SnellOutbound},
@@ -98,7 +99,14 @@ impl OutboundRegistry {
 /// 把 [`ParsedNode`] 数组注册为一组出站。
 pub fn register_nodes(reg: &mut OutboundRegistry, nodes: &[ParsedNode]) -> Result<(), String> {
     let mut pending_proxies = Vec::new();
-    for node in nodes {
+    for source_node in nodes {
+        let expanded;
+        let node = if source_node.protocol == NodeProtocol::Hysteria2 {
+            expanded = expand_hysteria2_official_objects(source_node)?;
+            &expanded
+        } else {
+            source_node
+        };
         let mut ob = build_outbound(node)
             .map_err(|error| format!("node `{}` outbound config invalid: {error}", node.name))?;
         if let Some(settings) = node.stream_settings.clone() {
@@ -165,8 +173,8 @@ pub fn build_outbound(node: &ParsedNode) -> Result<SharedOutbound, String> {
         NodeProtocol::Snell => build_snell(node)?,
         NodeProtocol::AnyTls => build_anytls(node)?,
         NodeProtocol::Ssh => build_ssh(node)?,
-        NodeProtocol::Hysteria => build_hysteria_v1(node),
-        NodeProtocol::Hysteria2 => build_hysteria2(node),
+        NodeProtocol::Hysteria => build_hysteria_v1(node)?,
+        NodeProtocol::Hysteria2 => build_hysteria2(node)?,
         NodeProtocol::Tuic => build_tuic(node)?,
         NodeProtocol::Wireguard => build_wireguard(node)?,
         NodeProtocol::Mieru => build_mieru(node),
@@ -930,6 +938,9 @@ fn build_node_tls_options(
         "pinnedPeerCertSha256",
         "pinned-peer-cert-sha256",
         "pinned_peer_cert_sha256",
+        "pinSHA256",
+        "pin-sha256",
+        "pin_sha256",
         "verifyPeerCertByName",
         "verify-peer-cert-by-name",
         "verify_peer_cert_by_name",
@@ -937,9 +948,21 @@ fn build_node_tls_options(
         "ech-config-list",
         "ech_config_list",
     ];
-    let ech_toggle = first_param(node, &["ech"])
-        .map(|value| parse_bool_param("ech", value))
-        .transpose()?;
+    let (ech_toggle, ech_inline_config) = match first_param(node, &["ech"]) {
+        None => (None, None),
+        Some(value)
+            if matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on" | "0" | "false" | "no" | "off"
+            ) =>
+        {
+            (Some(parse_bool_param("ech", value)?), None)
+        }
+        // The official Hysteria 2 URI puts the base64 ECHConfigList directly
+        // in `ech`; Xray names the same bytes `echConfigList`.
+        Some(value) if !value.trim().is_empty() => (Some(true), Some(value.to_owned())),
+        Some(_) => return Err("ech cannot be empty".into()),
+    };
     let has_complete_settings = node.tls_settings.is_some()
         || ech_toggle == Some(true)
         || ADVANCED_KEYS
@@ -959,6 +982,16 @@ fn build_node_tls_options(
     }
 
     let mut settings = node.tls_settings.clone().unwrap_or_default();
+    if let Some(value) = ech_inline_config {
+        if settings
+            .ech_config_list
+            .as_ref()
+            .is_some_and(|typed| typed != &value)
+        {
+            return Err("typed TLS echConfigList conflicts with protocol ech".into());
+        }
+        settings.ech_config_list = Some(value);
+    }
     let fingerprint = first_param(node, &["fingerprint", "fp"]);
     let utls = first_param(node, &["utls"]);
     if fingerprint
@@ -1073,6 +1106,9 @@ fn build_node_tls_options(
             "pinnedPeerCertSha256",
             "pinned-peer-cert-sha256",
             "pinned_peer_cert_sha256",
+            "pinSHA256",
+            "pin-sha256",
+            "pin_sha256",
         ],
         "pinnedPeerCertSha256",
         settings.pinned_peer_cert_sha256,
@@ -2325,55 +2361,881 @@ fn build_ssh(node: &ParsedNode) -> Result<SharedOutbound, String> {
     Ok(Arc::new(ob))
 }
 
-fn build_hysteria_v1(node: &ParsedNode) -> SharedOutbound {
-    let auth_b = node
-        .params
-        .get("auth")
-        .cloned()
-        .unwrap_or_default()
-        .into_bytes();
-    let mut ob = HysteriaOutbound::new(&node.name, &node.host, node.port, auth_b);
-    if let Some(s) = node.sni.clone() {
-        ob.sni = Some(s);
+fn build_hysteria_v1(node: &ParsedNode) -> Result<SharedOutbound, String> {
+    if let Some(protocol) = first_param(node, &["protocol"])
+        && !protocol.eq_ignore_ascii_case("udp")
+    {
+        return Err(format!(
+            "Hysteria 1 packet transport `{protocol}` is unsupported; the official UDP carrier is required"
+        ));
     }
-    ob.insecure = node
-        .params
-        .get("insecure")
-        .map(|v| v == "1" || v == "true")
+    let auth = first_param(node, &["auth", "auth-str", "auth_str"])
+        .or(node.password.as_deref())
+        .or(node.user.as_deref())
+        .ok_or_else(|| "Hysteria 1 requires auth/auth-str".to_owned())?
+        .as_bytes()
+        .to_vec();
+    let tx_bps = parse_hysteria_bandwidth(
+        node,
+        &["up", "upmbps", "up-mbps", "up_mbps"],
+        "Hysteria 1 upload bandwidth",
+        true,
+        HysteriaBandwidthSyntax::V1,
+    )?;
+    let rx_bps = parse_hysteria_bandwidth(
+        node,
+        &["down", "downmbps", "down-mbps", "down_mbps"],
+        "Hysteria 1 download bandwidth",
+        true,
+        HysteriaBandwidthSyntax::V1,
+    )?;
+    let mut outbound =
+        HysteriaOutbound::new(&node.name, &node.host, node.port, auth, tx_bps, rx_bps)
+            .map_err(|error| error.to_string())?;
+    outbound.udp = node.udp;
+    outbound.fast_open = first_param(node, &["fastOpen", "fast-open", "fast_open"])
+        .map(|value| parse_bool_param("Hysteria 1 fastOpen", value))
+        .transpose()?
         .unwrap_or(false);
-    if let Some(up) = node.params.get("up").and_then(|s| s.parse::<u32>().ok()) {
-        ob.up_mbps = up;
+    reject_eager_hysteria_start(node, "Hysteria 1")?;
+    let insecure = first_param(
+        node,
+        &[
+            "insecure",
+            "skip-cert-verify",
+            "skip_cert_verify",
+            "allowInsecure",
+        ],
+    )
+    .map(|value| parse_bool_param("Hysteria 1 insecure", value))
+    .transpose()?
+    .unwrap_or(false);
+    let alpn = first_param(node, &["alpn"])
+        .map(parse_hysteria_alpn)
+        .transpose()?
+        .unwrap_or_else(|| vec!["hysteria".into()]);
+    outbound.tls = build_node_tls_options(
+        node,
+        true,
+        node.sni.clone().or_else(|| Some(node.host.clone())),
+        insecure,
+        alpn,
+    )?;
+    outbound.quic_params = hysteria1_quic_params(node)?;
+    if outbound.quic_params.brutal_disable_loss_compensation {
+        return Err(
+            "Hysteria 1 does not define Brutal disableLossCompensation; this field is Hysteria 2-only"
+                .into(),
+        );
     }
-    if let Some(down) = node.params.get("down").and_then(|s| s.parse::<u32>().ok()) {
-        ob.down_mbps = down;
+    outbound.handshake_timeout = first_param(
+        node,
+        &["handshakeTimeout", "handshake-timeout", "handshake_timeout"],
+    )
+    .map(|value| {
+        parse_tuic_duration(value)
+            .filter(|duration| duration.as_secs_f64() >= 2.0)
+            .ok_or_else(|| {
+                format!("Hysteria 1 handshake timeout `{value}` must be at least 2 seconds")
+            })
+    })
+    .transpose()?;
+    if let Some(password) = first_param(node, &["obfs", "obfs-password", "obfs_password"]) {
+        outbound = outbound
+            .with_obfs(password.as_bytes().to_vec())
+            .map_err(|error| error.to_string())?;
     }
-    if let Some(obfs) = node.params.get("obfs") {
-        ob = ob.with_obfs(obfs.as_bytes().to_vec());
-    }
-    Arc::new(ob)
+    Ok(Arc::new(outbound))
 }
 
-fn build_hysteria2(node: &ParsedNode) -> SharedOutbound {
-    let pwd = node.password.clone().unwrap_or_default();
-    let mut ob = Hysteria2Outbound::new(&node.name, &node.host, node.port, pwd);
-    if let Some(s) = node.sni.clone() {
-        ob.sni = Some(s);
+fn build_hysteria2(node: &ParsedNode) -> Result<SharedOutbound, String> {
+    let expanded = expand_hysteria2_official_objects(node)?;
+    let node = &expanded;
+    let password = first_param(node, &["auth", "password"])
+        .or(node.password.as_deref())
+        .or(node.user.as_deref())
+        .ok_or_else(|| "Hysteria 2 requires auth/password".to_owned())?;
+    if password.is_empty() {
+        return Err("Hysteria 2 auth/password cannot be empty".into());
     }
-    ob.insecure = node
-        .params
-        .get("insecure")
-        .map(|v| v == "1" || v == "true")
+    let mut outbound = Hysteria2Outbound::new(&node.name, &node.host, node.port, password);
+    outbound.udp = node.udp;
+    outbound.tx_bps = parse_hysteria_bandwidth(
+        node,
+        &["up", "upmbps", "up-mbps", "up_mbps"],
+        "Hysteria 2 upload bandwidth",
+        false,
+        HysteriaBandwidthSyntax::V2,
+    )?;
+    outbound.rx_bps = parse_hysteria_bandwidth(
+        node,
+        &["down", "downmbps", "down-mbps", "down_mbps"],
+        "Hysteria 2 download bandwidth",
+        false,
+        HysteriaBandwidthSyntax::V2,
+    )?;
+    outbound.fast_open = first_param(node, &["fastOpen", "fast-open", "fast_open"])
+        .map(|value| parse_bool_param("Hysteria 2 fastOpen", value))
+        .transpose()?
         .unwrap_or(false);
-    if let Some(obfs_pwd) = node.params.get("obfs-password") {
-        ob = ob.with_obfs(obfs_pwd);
+    reject_eager_hysteria_start(node, "Hysteria 2")?;
+    outbound.disable_loss_compensation = first_param(
+        node,
+        &[
+            "disableLossCompensation",
+            "disable-loss-compensation",
+            "disable_loss_compensation",
+        ],
+    )
+    .map(|value| parse_bool_param("Hysteria 2 disableLossCompensation", value))
+    .transpose()?
+    .unwrap_or(false);
+    let insecure = first_param(
+        node,
+        &[
+            "insecure",
+            "skip-cert-verify",
+            "skip_cert_verify",
+            "allowInsecure",
+        ],
+    )
+    .map(|value| parse_bool_param("Hysteria 2 insecure", value))
+    .transpose()?
+    .unwrap_or(false);
+    outbound.tls = build_node_tls_options(
+        node,
+        true,
+        node.sni.clone().or_else(|| Some(node.host.clone())),
+        insecure,
+        vec!["h3".into()],
+    )?;
+    outbound.quic_params = hysteria_quic_params(node)?;
+    outbound.quic_params.brutal_disable_loss_compensation = outbound.disable_loss_compensation;
+
+    let obfs_kind = first_param(node, &["obfs"]).map(str::trim).filter(|value| {
+        !value.is_empty()
+            && !value.eq_ignore_ascii_case("none")
+            && !value.eq_ignore_ascii_case("plain")
+    });
+    let obfs_password = first_param(node, &["obfs-password", "obfs_password", "obfsPassword"]);
+    outbound.obfs = match (obfs_kind, obfs_password) {
+        (None, None) => Hysteria2Obfs::None,
+        (None, Some(_)) => {
+            return Err("Hysteria 2 obfs-password requires obfs=salamander or obfs=gecko".into());
+        }
+        (Some(_), None) => return Err("Hysteria 2 obfs requires obfs-password".into()),
+        (Some(kind), Some(password)) if kind.eq_ignore_ascii_case("salamander") => {
+            Hysteria2Obfs::Salamander {
+                password: password.to_owned(),
+            }
+        }
+        (Some(kind), Some(password)) if kind.eq_ignore_ascii_case("gecko") => {
+            let minimum = parse_i32_param(
+                node,
+                &[
+                    "obfs-min-packet-size",
+                    "obfs_min_packet_size",
+                    "obfsMinPacketSize",
+                ],
+                512,
+            )?;
+            let maximum = parse_i32_param(
+                node,
+                &[
+                    "obfs-max-packet-size",
+                    "obfs_max_packet_size",
+                    "obfsMaxPacketSize",
+                ],
+                1200,
+            )?;
+            Hysteria2Obfs::Gecko {
+                password: password.to_owned(),
+                min_packet_size: minimum,
+                max_packet_size: maximum,
+            }
+        }
+        (Some(kind), Some(_)) => {
+            return Err(format!("unsupported Hysteria 2 obfs `{kind}`"));
+        }
+    };
+    Ok(Arc::new(outbound))
+}
+
+fn expand_hysteria2_official_objects(node: &ParsedNode) -> Result<ParsedNode, String> {
+    let mut node = node.clone();
+
+    if let Some(object) = remove_json_object(&mut node, "bandwidth", false)? {
+        reject_unknown_object_fields(
+            &object,
+            &["up", "down", "disableLossCompensation"],
+            "Hysteria 2 bandwidth",
+        )?;
+        merge_json_scalar_param(&mut node, &object, "up", "up", "bandwidth.up")?;
+        merge_json_scalar_param(&mut node, &object, "down", "down", "bandwidth.down")?;
+        merge_json_scalar_param(
+            &mut node,
+            &object,
+            "disableLossCompensation",
+            "disableLossCompensation",
+            "bandwidth.disableLossCompensation",
+        )?;
     }
-    if let Some(up) = node.params.get("up").and_then(|s| s.parse::<u32>().ok()) {
-        ob.up_mbps = up;
+
+    if let Some(object) = remove_json_object(&mut node, "congestion", true)? {
+        reject_unknown_object_fields(&object, &["type", "bbrProfile"], "Hysteria 2 congestion")?;
+        merge_json_scalar_param(&mut node, &object, "type", "congestion", "congestion.type")?;
+        merge_json_scalar_param(
+            &mut node,
+            &object,
+            "bbrProfile",
+            "bbrProfile",
+            "congestion.bbrProfile",
+        )?;
     }
-    if let Some(down) = node.params.get("down").and_then(|s| s.parse::<u32>().ok()) {
-        ob.down_mbps = down;
+
+    if let Some(object) = remove_json_object(&mut node, "obfs", true)? {
+        reject_unknown_object_fields(&object, &["type", "salamander", "gecko"], "Hysteria 2 obfs")?;
+        let kind = object
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "Hysteria 2 obfs.type must be a string".to_owned())?;
+        insert_expanded_param(&mut node, "obfs", kind.to_owned(), "obfs.type")?;
+        let section_name = kind.to_ascii_lowercase();
+        if matches!(section_name.as_str(), "" | "plain" | "none") {
+            if object.get("salamander").is_some() || object.get("gecko").is_some() {
+                return Err("Hysteria 2 plain obfs cannot contain an obfs section".into());
+            }
+        } else if matches!(section_name.as_str(), "salamander" | "gecko") {
+            let section = object
+                .get(&section_name)
+                .and_then(serde_json::Value::as_object)
+                .ok_or_else(|| format!("Hysteria 2 obfs.{section_name} must be an object"))?;
+            let allowed = if section_name == "gecko" {
+                &["password", "minPacketSize", "maxPacketSize"][..]
+            } else {
+                &["password"][..]
+            };
+            reject_unknown_object_fields(
+                section,
+                allowed,
+                &format!("Hysteria 2 obfs.{section_name}"),
+            )?;
+            merge_json_scalar_param(
+                &mut node,
+                section,
+                "password",
+                "obfs-password",
+                &format!("obfs.{section_name}.password"),
+            )?;
+            if section_name == "gecko" {
+                merge_json_scalar_param(
+                    &mut node,
+                    section,
+                    "minPacketSize",
+                    "obfsMinPacketSize",
+                    "obfs.gecko.minPacketSize",
+                )?;
+                merge_json_scalar_param(
+                    &mut node,
+                    section,
+                    "maxPacketSize",
+                    "obfsMaxPacketSize",
+                    "obfs.gecko.maxPacketSize",
+                )?;
+            }
+        }
     }
-    Arc::new(ob)
+
+    if let Some(object) = remove_json_object(&mut node, "quic", false)? {
+        reject_unknown_object_fields(
+            &object,
+            &[
+                "initStreamReceiveWindow",
+                "maxStreamReceiveWindow",
+                "initConnReceiveWindow",
+                "maxConnReceiveWindow",
+                "maxIdleTimeout",
+                "keepAlivePeriod",
+                "disablePathMTUDiscovery",
+                "sockopts",
+            ],
+            "Hysteria 2 quic",
+        )?;
+        for key in [
+            "initStreamReceiveWindow",
+            "maxStreamReceiveWindow",
+            "initConnReceiveWindow",
+            "maxConnReceiveWindow",
+            "maxIdleTimeout",
+            "keepAlivePeriod",
+            "disablePathMTUDiscovery",
+        ] {
+            merge_json_scalar_param(&mut node, &object, key, key, &format!("quic.{key}"))?;
+        }
+        if let Some(sockopts) = object.get("sockopts") {
+            let sockopts = sockopts
+                .as_object()
+                .ok_or_else(|| "Hysteria 2 quic.sockopts must be an object".to_owned())?;
+            reject_unknown_object_fields(
+                sockopts,
+                &["bindInterface", "fwmark", "fdControlUnixSocket"],
+                "Hysteria 2 quic.sockopts",
+            )?;
+            if sockopts.get("fdControlUnixSocket").is_some() {
+                return Err(
+                    "Hysteria 2 quic.sockopts.fdControlUnixSocket is not available in the Rust socket backend"
+                        .into(),
+                );
+            }
+            let settings = node.stream_settings.get_or_insert_with(Default::default);
+            let socket = settings.sockopt.get_or_insert_with(Default::default);
+            if let Some(interface) = sockopts.get("bindInterface") {
+                let interface = interface.as_str().ok_or_else(|| {
+                    "Hysteria 2 quic.sockopts.bindInterface must be a string".to_owned()
+                })?;
+                if !socket.interface.is_empty() && socket.interface != interface {
+                    return Err(
+                        "Hysteria 2 quic.sockopts.bindInterface conflicts with streamSettings.sockopt.interface"
+                            .into(),
+                    );
+                }
+                socket.interface = interface.to_owned();
+            }
+            if let Some(mark) = sockopts.get("fwmark") {
+                let mark = mark
+                    .as_u64()
+                    .and_then(|value| u32::try_from(value).ok())
+                    .ok_or_else(|| "Hysteria 2 quic.sockopts.fwmark must be a uint32".to_owned())?
+                    as i32;
+                if socket.mark != 0 && socket.mark != mark {
+                    return Err(
+                        "Hysteria 2 quic.sockopts.fwmark conflicts with streamSettings.sockopt.mark"
+                            .into(),
+                    );
+                }
+                socket.mark = mark;
+            }
+        }
+    }
+
+    if let Some(object) = remove_json_object(&mut node, "tls", false)? {
+        reject_unknown_object_fields(
+            &object,
+            &[
+                "sni",
+                "insecure",
+                "pinSHA256",
+                "ca",
+                "clientCertificate",
+                "clientKey",
+                "ech",
+            ],
+            "Hysteria 2 tls",
+        )?;
+        for (source, target) in [
+            ("sni", "sni"),
+            ("insecure", "insecure"),
+            ("pinSHA256", "pinSHA256"),
+            ("ech", "ech"),
+        ] {
+            merge_json_scalar_param(&mut node, &object, source, target, &format!("tls.{source}"))?;
+        }
+        let ca = object.get("ca").map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "Hysteria 2 tls.ca must be a non-empty path".to_owned())
+        });
+        let client_certificate = object.get("clientCertificate").map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    "Hysteria 2 tls.clientCertificate must be a non-empty path".to_owned()
+                })
+        });
+        let client_key = object.get("clientKey").map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "Hysteria 2 tls.clientKey must be a non-empty path".to_owned())
+        });
+        let ca = ca.transpose()?;
+        let client_certificate = client_certificate.transpose()?;
+        let client_key = client_key.transpose()?;
+        if client_certificate.is_some() != client_key.is_some() {
+            return Err(
+                "Hysteria 2 tls.clientCertificate and tls.clientKey must be configured together"
+                    .into(),
+            );
+        }
+        if ca.is_some() || client_certificate.is_some() {
+            let settings = node.tls_settings.get_or_insert_with(Default::default);
+            if let Some(ca) = ca {
+                settings.certificates.push(XhttpDownloadTlsCertificate {
+                    certificate_file: Some(ca.to_owned()),
+                    usage: Some(XhttpTlsCertificateUsage::Verify),
+                    ..Default::default()
+                });
+            }
+            if let (Some(certificate), Some(key)) = (client_certificate, client_key) {
+                settings.certificates.push(XhttpDownloadTlsCertificate {
+                    certificate_file: Some(certificate.to_owned()),
+                    key_file: Some(key.to_owned()),
+                    usage: Some(XhttpTlsCertificateUsage::Encipherment),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
+    if let Some(object) = remove_json_object(&mut node, "transport", false)? {
+        reject_unknown_object_fields(&object, &["type", "udp"], "Hysteria 2 transport")?;
+        if let Some(kind) = object.get("type") {
+            let kind = kind
+                .as_str()
+                .ok_or_else(|| "Hysteria 2 transport.type must be a string".to_owned())?;
+            if !kind.is_empty() && !kind.eq_ignore_ascii_case("udp") {
+                return Err(format!("unsupported Hysteria 2 transport.type `{kind}`"));
+            }
+        }
+        if let Some(udp) = object.get("udp") {
+            let udp = udp
+                .as_object()
+                .ok_or_else(|| "Hysteria 2 transport.udp must be an object".to_owned())?;
+            reject_unknown_object_fields(
+                udp,
+                &["hopInterval", "minHopInterval", "maxHopInterval"],
+                "Hysteria 2 transport.udp",
+            )?;
+            let fixed = json_duration_seconds(udp.get("hopInterval"), "transport.udp.hopInterval")?;
+            let minimum =
+                json_duration_seconds(udp.get("minHopInterval"), "transport.udp.minHopInterval")?;
+            let maximum =
+                json_duration_seconds(udp.get("maxHopInterval"), "transport.udp.maxHopInterval")?;
+            if fixed.is_some() && (minimum.is_some() || maximum.is_some()) {
+                return Err(
+                    "Hysteria 2 hopInterval conflicts with minHopInterval/maxHopInterval".into(),
+                );
+            }
+            let interval = match (fixed, minimum, maximum) {
+                (Some(value), None, None) => Some(I32Range::fixed(value)),
+                (None, Some(minimum), Some(maximum)) => {
+                    if minimum > maximum {
+                        return Err("Hysteria 2 minHopInterval cannot exceed maxHopInterval".into());
+                    }
+                    Some(I32Range::new(minimum, maximum))
+                }
+                (None, None, None) => None,
+                _ => {
+                    return Err(
+                        "Hysteria 2 minHopInterval and maxHopInterval must be configured together"
+                            .into(),
+                    );
+                }
+            };
+            if let Some(interval) = interval {
+                let settings = node.stream_settings.get_or_insert_with(Default::default);
+                let finalmask = settings.finalmask.get_or_insert_with(Default::default);
+                let params = finalmask.quic_params.get_or_insert_with(Default::default);
+                if params.udp_hop.interval != I32Range::default()
+                    && params.udp_hop.interval != interval
+                {
+                    return Err(
+                        "Hysteria 2 transport.udp hop interval conflicts with finalmask.quicParams.udpHop.interval"
+                            .into(),
+                    );
+                }
+                params.udp_hop.interval = interval;
+            }
+        }
+    }
+
+    Ok(node)
+}
+
+fn remove_json_object(
+    node: &mut ParsedNode,
+    key: &str,
+    allow_plain_string: bool,
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>, String> {
+    let Some(raw) = node.params.get(key).cloned() else {
+        return Ok(None);
+    };
+    if allow_plain_string && !raw.trim_start().starts_with('{') {
+        return Ok(None);
+    }
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|error| format!("Hysteria 2 {key} object is invalid JSON: {error}"))?;
+    let object = value
+        .as_object()
+        .cloned()
+        .ok_or_else(|| format!("Hysteria 2 {key} must be an object"))?;
+    node.params.remove(key);
+    Ok(Some(object))
+}
+
+fn reject_unknown_object_fields(
+    object: &serde_json::Map<String, serde_json::Value>,
+    allowed: &[&str],
+    context: &str,
+) -> Result<(), String> {
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed.iter().any(|allowed| field.as_str() == *allowed))
+    {
+        Err(format!("{context} contains unsupported field `{field}`"))
+    } else {
+        Ok(())
+    }
+}
+
+fn merge_json_scalar_param(
+    node: &mut ParsedNode,
+    object: &serde_json::Map<String, serde_json::Value>,
+    source: &str,
+    target: &str,
+    context: &str,
+) -> Result<(), String> {
+    let Some(value) = object.get(source) else {
+        return Ok(());
+    };
+    let value = match value {
+        serde_json::Value::String(value) => value.clone(),
+        serde_json::Value::Bool(value) => value.to_string(),
+        serde_json::Value::Number(value) => value.to_string(),
+        _ => return Err(format!("Hysteria 2 {context} must be a scalar value")),
+    };
+    insert_expanded_param(node, target, value, context)
+}
+
+fn insert_expanded_param(
+    node: &mut ParsedNode,
+    target: &str,
+    value: String,
+    context: &str,
+) -> Result<(), String> {
+    if let Some(existing) = node.params.get(target) {
+        if existing != &value {
+            return Err(format!(
+                "Hysteria 2 {context} conflicts with params.{target}"
+            ));
+        }
+    } else {
+        node.params.insert(target.to_owned(), value);
+    }
+    Ok(())
+}
+
+fn json_duration_seconds(
+    value: Option<&serde_json::Value>,
+    context: &str,
+) -> Result<Option<i32>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let duration = match value {
+        serde_json::Value::String(value) => parse_tuic_duration(value),
+        serde_json::Value::Number(value) => value.as_u64().map(std::time::Duration::from_secs),
+        _ => None,
+    }
+    .ok_or_else(|| format!("Hysteria 2 {context} is not a valid duration"))?;
+    if duration.subsec_nanos() != 0 {
+        return Err(format!(
+            "Hysteria 2 {context} must resolve to whole seconds"
+        ));
+    }
+    let seconds = i32::try_from(duration.as_secs())
+        .map_err(|_| format!("Hysteria 2 {context} exceeds i32 seconds"))?;
+    Ok(Some(seconds))
+}
+
+#[derive(Clone, Copy)]
+enum HysteriaBandwidthSyntax {
+    V1,
+    V2,
+}
+
+fn parse_hysteria_bandwidth(
+    node: &ParsedNode,
+    keys: &[&str],
+    field: &str,
+    required: bool,
+    syntax: HysteriaBandwidthSyntax,
+) -> Result<u64, String> {
+    let Some(raw) = first_param(node, keys) else {
+        return if required {
+            Err(format!("{field} is required"))
+        } else {
+            Ok(0)
+        };
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(format!("{field} cannot be empty"));
+    }
+    let bps = match syntax {
+        HysteriaBandwidthSyntax::V1 => parse_hysteria1_bandwidth(raw),
+        HysteriaBandwidthSyntax::V2 => parse_hysteria2_bandwidth(raw),
+    }
+    .map_err(|error| format!("{field}: {error}"))?;
+    if required && bps == 0 {
+        return Err(format!("{field} must be non-zero"));
+    }
+    Ok(bps)
+}
+
+fn parse_hysteria1_bandwidth(raw: &str) -> Result<u64, String> {
+    if raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return raw
+            .parse::<u64>()
+            .map_err(|_| "invalid Mbps integer".to_owned())?
+            .checked_mul(125_000)
+            .ok_or_else(|| "bandwidth overflows bytes per second".to_owned());
+    }
+    let Some(unit_start) = raw.bytes().position(|byte| !byte.is_ascii_digit()) else {
+        return Err("invalid bandwidth format".into());
+    };
+    if unit_start == 0 {
+        return Err("invalid bandwidth format".into());
+    }
+    let value = raw[..unit_start]
+        .parse::<u64>()
+        .map_err(|_| "invalid bandwidth integer".to_owned())?;
+    let unit = raw[unit_start..].trim_start();
+    let (prefix, bytes) = match unit.as_bytes() {
+        [letter @ (b'B' | b'b'), b'p', b's'] => (None, *letter == b'B'),
+        [
+            prefix @ (b'K' | b'M' | b'G' | b'T'),
+            letter @ (b'B' | b'b'),
+            b'p',
+            b's',
+        ] => (Some(*prefix), *letter == b'B'),
+        _ => return Err("unsupported Hysteria 1 bandwidth unit".into()),
+    };
+    let multiplier = match prefix {
+        None => 1_u64,
+        Some(b'K') => 1_u64 << 10,
+        Some(b'M') => 1_u64 << 20,
+        Some(b'G') => 1_u64 << 30,
+        Some(b'T') => 1_u64 << 40,
+        _ => unreachable!("validated Hysteria 1 unit"),
+    };
+    value
+        .checked_mul(multiplier)
+        .map(|value| if bytes { value } else { value / 8 })
+        .ok_or_else(|| "bandwidth overflows bytes per second".to_owned())
+}
+
+fn parse_hysteria2_bandwidth(raw: &str) -> Result<u64, String> {
+    // Official ConvBandwidth accepts integer values as bytes/second. Structured
+    // JSON numbers reach this representation as bare decimal strings.
+    if raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return raw
+            .parse::<u64>()
+            .map_err(|_| "invalid bytes-per-second integer".to_owned());
+    }
+    let normalized = raw.trim().to_ascii_lowercase();
+    let split = normalized
+        .bytes()
+        .position(|byte| !byte.is_ascii_digit())
+        .ok_or_else(|| "bandwidth string requires a unit".to_owned())?;
+    if split == 0 {
+        return Err("invalid bandwidth format".into());
+    }
+    let value = normalized[..split]
+        .parse::<u64>()
+        .map_err(|_| "invalid bandwidth integer".to_owned())?;
+    let multiplier = match normalized[split..].trim() {
+        "b" | "bps" => 1_u64,
+        "k" | "kb" | "kbps" => 1_000,
+        "m" | "mb" | "mbps" => 1_000_000,
+        "g" | "gb" | "gbps" => 1_000_000_000,
+        "t" | "tb" | "tbps" => 1_000_000_000_000,
+        _ => return Err("unsupported Hysteria 2 bandwidth unit".into()),
+    };
+    value
+        .checked_mul(multiplier)
+        .map(|bits| bits / 8)
+        .ok_or_else(|| "bandwidth overflows bytes per second".to_owned())
+}
+
+fn reject_eager_hysteria_start(node: &ParsedNode, protocol: &str) -> Result<(), String> {
+    if first_param(node, &["lazy"])
+        .map(|value| parse_bool_param(&format!("{protocol} lazy"), value))
+        .transpose()?
+        == Some(false)
+    {
+        return Err(format!(
+            "{protocol} lazy=false is incompatible with WutherCore's on-demand outbound lifecycle"
+        ));
+    }
+    Ok(())
+}
+
+fn parse_hysteria_alpn(raw: &str) -> Result<Vec<String>, String> {
+    let values = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        Err("Hysteria ALPN cannot be empty".into())
+    } else {
+        Ok(values)
+    }
+}
+
+fn parse_i32_param(node: &ParsedNode, keys: &[&str], default: i32) -> Result<i32, String> {
+    first_param(node, keys)
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|_| format!("invalid integer `{value}` for {}", keys[0]))
+        })
+        .transpose()
+        .map(|value| value.unwrap_or(default))
+}
+
+fn hysteria_quic_params(node: &ParsedNode) -> Result<QuicParamsConfig, String> {
+    let mut params = node
+        .stream_settings
+        .as_ref()
+        .and_then(|settings| settings.finalmask.as_ref())
+        .and_then(|finalmask| finalmask.quic_params.clone())
+        .unwrap_or_default();
+    if let Some(value) = first_param(node, &["congestion"]) {
+        params.congestion = value.to_owned();
+    }
+    if let Some(value) = first_param(node, &["bbrProfile", "bbr-profile", "bbr_profile"]) {
+        params.bbr_profile = value.to_owned();
+    }
+    overlay_u64_param(
+        node,
+        &["initialStreamReceiveWindow", "initStreamReceiveWindow"],
+        &mut params.init_stream_receive_window,
+    )?;
+    overlay_u64_param(
+        node,
+        &["maxStreamReceiveWindow"],
+        &mut params.max_stream_receive_window,
+    )?;
+    overlay_u64_param(
+        node,
+        &[
+            "initialConnectionReceiveWindow",
+            "initConnectionReceiveWindow",
+            "initConnReceiveWindow",
+        ],
+        &mut params.init_connection_receive_window,
+    )?;
+    overlay_u64_param(
+        node,
+        &["maxConnectionReceiveWindow", "maxConnReceiveWindow"],
+        &mut params.max_connection_receive_window,
+    )?;
+    overlay_i64_param(
+        node,
+        &["maxIdleTimeout", "max-idle-timeout", "max_idle_timeout"],
+        &mut params.max_idle_timeout,
+    )?;
+    overlay_i64_param(
+        node,
+        &["keepAlivePeriod", "keep-alive-period", "keep_alive_period"],
+        &mut params.keep_alive_period,
+    )?;
+    if let Some(value) = first_param(
+        node,
+        &[
+            "disablePathMTUDiscovery",
+            "disable-path-mtu-discovery",
+            "disable_mtu_discovery",
+        ],
+    ) {
+        params.disable_path_mtu_discovery =
+            parse_bool_param("Hysteria disablePathMTUDiscovery", value)?;
+    }
+    if let Some(value) = first_param(node, &["hopPorts", "hop-ports", "hop_ports"]) {
+        params.udp_hop.ports = PortListValue::Text(value.to_owned());
+    }
+    if let Some(value) = first_param(node, &["hopInterval", "hop-interval", "hop_interval"]) {
+        let seconds = parse_tuic_duration(value)
+            .filter(|duration| duration.subsec_nanos() == 0)
+            .and_then(|duration| i32::try_from(duration.as_secs()).ok())
+            .ok_or_else(|| format!("invalid Hysteria hop interval `{value}`"))?;
+        params.udp_hop.interval = I32Range::fixed(seconds);
+    }
+    Ok(params)
+}
+
+fn hysteria1_quic_params(node: &ParsedNode) -> Result<QuicParamsConfig, String> {
+    let mut params = hysteria_quic_params(node)?;
+    overlay_hysteria1_window(
+        node,
+        &["recvWindowConn", "recv-window-conn", "recv_window_conn"],
+        "recv_window_conn",
+        &mut params.init_stream_receive_window,
+        &mut params.max_stream_receive_window,
+    )?;
+    overlay_hysteria1_window(
+        node,
+        &["recvWindow", "recv-window", "recv_window"],
+        "recv_window",
+        &mut params.init_connection_receive_window,
+        &mut params.max_connection_receive_window,
+    )?;
+    overlay_i64_param(
+        node,
+        &["idleTimeout", "idle-timeout", "idle_timeout"],
+        &mut params.max_idle_timeout,
+    )?;
+    Ok(params)
+}
+
+fn overlay_hysteria1_window(
+    node: &ParsedNode,
+    keys: &[&str],
+    field: &str,
+    initial: &mut u64,
+    maximum: &mut u64,
+) -> Result<(), String> {
+    let Some(raw) = first_param(node, keys) else {
+        return Ok(());
+    };
+    let value = raw
+        .parse::<u64>()
+        .map_err(|_| format!("invalid integer `{raw}` for {}", keys[0]))?;
+    if (*initial != 0 && *initial != value) || (*maximum != 0 && *maximum != value) {
+        return Err(format!(
+            "Hysteria 1 {field} conflicts with explicit initial/max QUIC receive windows"
+        ));
+    }
+    *initial = value;
+    *maximum = value;
+    Ok(())
+}
+
+fn overlay_u64_param(node: &ParsedNode, keys: &[&str], target: &mut u64) -> Result<(), String> {
+    if let Some(value) = first_param(node, keys) {
+        *target = value
+            .parse::<u64>()
+            .map_err(|_| format!("invalid integer `{value}` for {}", keys[0]))?;
+    }
+    Ok(())
+}
+
+fn overlay_i64_param(node: &ParsedNode, keys: &[&str], target: &mut i64) -> Result<(), String> {
+    if let Some(value) = first_param(node, keys) {
+        *target = match value.parse::<i64>() {
+            Ok(value) => value,
+            Err(_) => parse_tuic_duration(value)
+                .filter(|duration| duration.subsec_nanos() == 0)
+                .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+                .ok_or_else(|| format!("invalid duration `{value}` for {}", keys[0]))?,
+        };
+    }
+    Ok(())
 }
 
 fn build_tuic(node: &ParsedNode) -> Result<SharedOutbound, String> {
@@ -3273,6 +4135,7 @@ fn decode_b64_32(s: &str) -> Option<[u8; 32]> {
 mod tests {
     use base64::Engine;
     use core_config::{
+        I32Range, PortListValue,
         model::{XhttpConfig as TypedXhttpConfig, XhttpDownloadTlsSettings},
         node_uri::{NodeProtocol, ParsedNode},
     };
@@ -3281,10 +4144,14 @@ mod tests {
     #[cfg(feature = "naive")]
     use super::decode_config_blob;
     use super::{
-        DownloadTlsSettings, build_outbound, build_trojan, build_xhttp_options, tuic_from_node,
-        wireguard_from_node,
+        DownloadTlsSettings, build_node_tls_options, build_outbound, build_trojan,
+        build_xhttp_options, expand_hysteria2_official_objects, hysteria_quic_params,
+        tuic_from_node, wireguard_from_node,
     };
     use crate::proto::tuic::TuicUdpMode;
+
+    const VALID_ECH_CONFIG_LIST: &str =
+        "AD7+DQA6AAAgACC7Lynj4wV+BBnVL8X0QRh3b422HOpP33YHm5NgbFpiSAAIAAEAAQABAAMAB2VjaC5jb20AAA==";
 
     #[cfg(feature = "naive")]
     #[test]
@@ -3559,6 +4426,209 @@ mod tests {
         assert_eq!(options.user_agent, "golang");
         assert_eq!(options.max_message_size, 8_388_608);
         assert_eq!(options.queue_capacity, 32);
+    }
+
+    #[test]
+    fn hysteria1_requires_real_bandwidth_and_exposes_udp_only_when_enabled() {
+        let mut node = ParsedNode::new("hy1", NodeProtocol::Hysteria, "hy.example", 443);
+        node.params.insert("auth".into(), "secret".into());
+        assert_eq!(
+            build_outbound(&node).err().as_deref(),
+            Some("Hysteria 1 upload bandwidth is required")
+        );
+        node.params.insert("up".into(), "100".into());
+        node.params.insert("down".into(), "200 Mbps".into());
+        node.params.insert("obfs".into(), "xplus-secret".into());
+        let outbound = build_outbound(&node).unwrap();
+        assert_eq!(outbound.protocol(), "hysteria");
+        assert!(outbound.capabilities().udp);
+
+        node.udp = false;
+        let outbound = build_outbound(&node).unwrap();
+        assert!(!outbound.capabilities().udp);
+    }
+
+    #[test]
+    fn hysteria_bandwidth_parsers_match_each_official_generation() {
+        assert_eq!(super::parse_hysteria1_bandwidth("10").unwrap(), 1_250_000);
+        assert_eq!(
+            super::parse_hysteria1_bandwidth("10 Mbps").unwrap(),
+            10 * 1024 * 1024 / 8
+        );
+        assert_eq!(
+            super::parse_hysteria1_bandwidth("10 MBps").unwrap(),
+            10 * 1024 * 1024
+        );
+        assert!(super::parse_hysteria1_bandwidth("1.5 Mbps").is_err());
+
+        assert_eq!(
+            super::parse_hysteria2_bandwidth("100 Mbps").unwrap(),
+            12_500_000
+        );
+        assert_eq!(super::parse_hysteria2_bandwidth("125000").unwrap(), 125_000);
+        assert!(super::parse_hysteria2_bandwidth("1.5 Mbps").is_err());
+    }
+
+    #[test]
+    fn hysteria1_official_windows_and_timers_map_to_runtime_fields() {
+        let mut node = ParsedNode::new("hy1", NodeProtocol::Hysteria, "hy.example", 443);
+        node.params
+            .insert("recv_window_conn".into(), "65536".into());
+        node.params.insert("recv_window".into(), "131072".into());
+        node.params.insert("idle_timeout".into(), "25".into());
+        node.params.insert("hop_interval".into(), "9".into());
+        let params = super::hysteria1_quic_params(&node).unwrap();
+        assert_eq!(params.init_stream_receive_window, 65_536);
+        assert_eq!(params.max_stream_receive_window, 65_536);
+        assert_eq!(params.init_connection_receive_window, 131_072);
+        assert_eq!(params.max_connection_receive_window, 131_072);
+        assert_eq!(params.max_idle_timeout, 25);
+        assert_eq!(params.udp_hop.interval, I32Range::fixed(9));
+
+        node.params
+            .insert("initStreamReceiveWindow".into(), "262144".into());
+        assert!(
+            super::hysteria1_quic_params(&node)
+                .unwrap_err()
+                .contains("conflicts")
+        );
+    }
+
+    #[test]
+    fn hysteria2_rejects_orphan_obfs_and_consumes_quic_fields() {
+        let mut node = ParsedNode::new("hy2", NodeProtocol::Hysteria2, "hy.example", 443);
+        node.password = Some("secret".into());
+        node.params
+            .insert("obfs-password".into(), "mask-secret".into());
+        assert_eq!(
+            build_outbound(&node).err().as_deref(),
+            Some("Hysteria 2 obfs-password requires obfs=salamander or obfs=gecko")
+        );
+        node.params.insert("obfs".into(), "gecko".into());
+        node.params.insert("obfsMinPacketSize".into(), "600".into());
+        node.params
+            .insert("obfsMaxPacketSize".into(), "1300".into());
+        node.params.insert("up".into(), "100 Mbps".into());
+        node.params.insert("down".into(), "200".into());
+        node.params.insert("congestion".into(), "brutal".into());
+        node.params
+            .insert("disableLossCompensation".into(), "true".into());
+        node.params
+            .insert("maxStreamReceiveWindow".into(), "1048576".into());
+        node.params
+            .insert("hopPorts".into(), "2000,3000-3002".into());
+        node.params.insert("hopInterval".into(), "8s".into());
+        let params = hysteria_quic_params(&node).unwrap();
+        assert_eq!(params.congestion, "brutal");
+        assert_eq!(params.max_stream_receive_window, 1_048_576);
+        assert_eq!(
+            params.udp_hop.ports,
+            PortListValue::Text("2000,3000-3002".into())
+        );
+        assert_eq!(params.udp_hop.interval, I32Range::fixed(8));
+        let outbound = build_outbound(&node).unwrap();
+        assert_eq!(outbound.protocol(), "hysteria2");
+        assert!(outbound.capabilities().udp);
+    }
+
+    #[test]
+    fn hysteria2_official_tls_aliases_reach_shared_tls_executor() {
+        let mut node = ParsedNode::new("hy2", NodeProtocol::Hysteria2, "hy.example", 443);
+        node.password = Some("secret".into());
+        node.params.insert("pinSHA256".into(), "11".repeat(32));
+        node.params
+            .insert("ech".into(), VALID_ECH_CONFIG_LIST.into());
+        let tls = build_node_tls_options(
+            &node,
+            true,
+            Some("hy.example".into()),
+            false,
+            vec!["h3".into()],
+        )
+        .unwrap();
+        assert_eq!(tls.pinned_peer_cert_sha256, [[0x11; 32]]);
+        assert_eq!(
+            tls.xray_settings
+                .as_ref()
+                .and_then(|settings| settings.ech_config_list.as_deref()),
+            Some(VALID_ECH_CONFIG_LIST)
+        );
+    }
+
+    #[test]
+    fn hysteria2_official_nested_objects_are_expanded_without_field_loss() {
+        let mut node = ParsedNode::new("hy2", NodeProtocol::Hysteria2, "hy.example", 443);
+        node.password = Some("secret".into());
+        node.params.insert(
+            "bandwidth".into(),
+            r#"{"up":"100 mbps","down":"200 mbps","disableLossCompensation":true}"#.into(),
+        );
+        node.params.insert(
+            "congestion".into(),
+            r#"{"type":"bbr","bbrProfile":"aggressive"}"#.into(),
+        );
+        node.params.insert(
+            "obfs".into(),
+            r#"{"type":"gecko","gecko":{"password":"mask-secret","minPacketSize":600,"maxPacketSize":1300}}"#
+                .into(),
+        );
+        node.params.insert(
+            "quic".into(),
+            r#"{"initStreamReceiveWindow":65536,"maxStreamReceiveWindow":131072,"initConnReceiveWindow":262144,"maxConnReceiveWindow":524288,"maxIdleTimeout":"30s","keepAlivePeriod":"10s","disablePathMTUDiscovery":true,"sockopts":{"bindInterface":"eth0","fwmark":123}}"#
+                .into(),
+        );
+        node.params.insert(
+            "tls".into(),
+            format!(
+                r#"{{"sni":"edge.example","insecure":false,"pinSHA256":"1111111111111111111111111111111111111111111111111111111111111111","ech":"{VALID_ECH_CONFIG_LIST}"}}"#
+            ),
+        );
+        node.params.insert(
+            "transport".into(),
+            r#"{"type":"udp","udp":{"minHopInterval":"5s","maxHopInterval":"9s"}}"#.into(),
+        );
+
+        let expanded = expand_hysteria2_official_objects(&node).unwrap();
+        assert_eq!(
+            expanded
+                .params
+                .get("disableLossCompensation")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            expanded.params.get("congestion").map(String::as_str),
+            Some("bbr")
+        );
+        assert_eq!(
+            expanded.params.get("bbrProfile").map(String::as_str),
+            Some("aggressive")
+        );
+        assert_eq!(
+            expanded.params.get("obfs").map(String::as_str),
+            Some("gecko")
+        );
+        assert_eq!(
+            expanded.params.get("obfs-password").map(String::as_str),
+            Some("mask-secret")
+        );
+        let settings = expanded.stream_settings.as_ref().unwrap();
+        assert_eq!(settings.sockopt.as_ref().unwrap().interface, "eth0");
+        assert_eq!(settings.sockopt.as_ref().unwrap().mark, 123);
+        assert_eq!(
+            settings
+                .finalmask
+                .as_ref()
+                .unwrap()
+                .quic_params
+                .as_ref()
+                .unwrap()
+                .udp_hop
+                .interval,
+            I32Range::new(5, 9)
+        );
+        let outbound = build_outbound(&node).unwrap();
+        assert_eq!(outbound.protocol(), "hysteria2");
     }
 
     #[test]

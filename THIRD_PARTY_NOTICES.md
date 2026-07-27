@@ -69,8 +69,8 @@
 
 ## 协议与解析辅助依赖
 
-- `rsteria2 0.1.1`：提供 Hysteria2 的 HTTP/3 认证、TCP/UDP 中继、Brutal
-  拥塞控制、Salamander 混淆与端口跳跃客户端实现；许可证 MIT。
+- `quinn` / `quinn-proto 0.11`、`h3` / `h3-quinn 0.0.x`：提供 Hysteria
+  1/2 的 QUIC、QUIC Datagram 与 HTTP/3 状态机；许可证 MIT 或 Apache-2.0。
 - `hickory-proto 0.24.4`：为 DNS 解析器及 ECH 配置发现提供 DNS wire
   message 编解码；许可证 MIT 或 Apache-2.0。
 - `data-encoding 2.11.0`：为依赖树中的 SSH 密钥、WebSocket 与 X.509

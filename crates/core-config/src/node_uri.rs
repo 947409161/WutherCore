@@ -199,9 +199,9 @@ pub fn parse_uri(uri: &str) -> ConfigResult<ParsedNode> {
         | NodeProtocol::Young
         | NodeProtocol::Trojan
         | NodeProtocol::Naive
-        | NodeProtocol::Hysteria2
         | NodeProtocol::Tuic
         | NodeProtocol::Hysteria => parse_url_like(uri, proto)?,
+        NodeProtocol::Hysteria2 => parse_hysteria2_uri(uri)?,
         NodeProtocol::Http | NodeProtocol::Socks5 => parse_http_socks(uri, proto)?,
         NodeProtocol::Ssh => parse_url_like(uri, NodeProtocol::Ssh)?,
         NodeProtocol::Wireguard => parse_url_like(uri, NodeProtocol::Wireguard)?,
@@ -266,7 +266,8 @@ fn require_host_port(url: &Url, protocol_default: Option<u16>) -> ConfigResult<(
 
 fn parse_url_like(uri: &str, proto: NodeProtocol) -> ConfigResult<ParsedNode> {
     let url = Url::parse(uri).map_err(|e| ConfigError::bad_node(format!("非法 URI: {e}")))?;
-    let default_port = matches!(proto, NodeProtocol::AnyTls).then_some(443);
+    let default_port =
+        matches!(proto, NodeProtocol::AnyTls | NodeProtocol::Hysteria2).then_some(443);
     let (host, port) = require_host_port(&url, default_port)?;
     let name = fragment_name(&url, &format!("{}-{}", proto.as_str(), host));
     let mut params = collect_params(&url);
@@ -303,10 +304,10 @@ fn parse_url_like(uri: &str, proto: NodeProtocol) -> ConfigResult<ParsedNode> {
     if !user.is_empty() {
         let decoded = pct_decode(user);
         match proto {
-            NodeProtocol::Trojan | NodeProtocol::Hysteria2 => {
+            NodeProtocol::Trojan => {
                 node.password = Some(decoded);
             }
-            NodeProtocol::AnyTls => {
+            NodeProtocol::AnyTls | NodeProtocol::Hysteria2 => {
                 // The official URI grammar calls the entire userinfo `auth`
                 // and uses it verbatim as the protocol password. The common
                 // form has no colon; preserve an explicit `user:password`
@@ -367,6 +368,70 @@ fn parse_url_like(uri: &str, proto: NodeProtocol) -> ConfigResult<ParsedNode> {
         node.transport = "webtransport".into();
     }
     node.params = params;
+    Ok(node)
+}
+
+/// Hysteria 2 allows a comma/range port set in the URI authority, while
+/// `url::Url` deliberately accepts only one numeric port. Normalize the first
+/// port for the QUIC peer and retain the complete set as executable hopPorts.
+fn parse_hysteria2_uri(uri: &str) -> ConfigResult<ParsedNode> {
+    let scheme_end = uri
+        .find("://")
+        .ok_or_else(|| ConfigError::bad_node("Hysteria 2 URI 缺少 scheme://"))?;
+    let authority_start = scheme_end + 3;
+    let authority_end = uri[authority_start..]
+        .find(['/', '?', '#'])
+        .map(|offset| authority_start + offset)
+        .unwrap_or(uri.len());
+    let authority = &uri[authority_start..authority_end];
+    let host_port = authority
+        .rsplit_once('@')
+        .map(|(_, host_port)| host_port)
+        .unwrap_or(authority);
+    let port_separator = if host_port.starts_with('[') {
+        host_port.find(']').and_then(|close| {
+            host_port[close + 1..]
+                .find(':')
+                .map(|offset| close + 1 + offset)
+        })
+    } else {
+        host_port.rfind(':')
+    };
+    let Some(separator) = port_separator else {
+        return parse_url_like(uri, NodeProtocol::Hysteria2);
+    };
+    let port_set = &host_port[separator + 1..];
+    if !port_set.contains(',') && !port_set.contains('-') {
+        return parse_url_like(uri, NodeProtocol::Hysteria2);
+    }
+    let first = port_set
+        .split(',')
+        .next()
+        .and_then(|entry| entry.split('-').next())
+        .ok_or_else(|| ConfigError::bad_node("Hysteria 2 多端口列表为空"))?;
+    let first_port = first
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0)
+        .ok_or_else(|| ConfigError::bad_node("Hysteria 2 多端口列表首端口无效"))?;
+    let port_start = authority_end - port_set.len();
+    let normalized = format!(
+        "{}{}{}",
+        &uri[..port_start],
+        first_port,
+        &uri[authority_end..]
+    );
+    let mut node = parse_url_like(&normalized, NodeProtocol::Hysteria2)?;
+    node.raw = uri.to_owned();
+    if node.params.contains_key("hopPorts")
+        || node.params.contains_key("hop-ports")
+        || node.params.contains_key("hop_ports")
+    {
+        return Err(ConfigError::bad_node(
+            "Hysteria 2 authority 多端口与 hopPorts 查询参数冲突",
+        ));
+    }
+    node.params.insert("hopPorts".into(), port_set.into());
     Ok(node)
 }
 
@@ -794,6 +859,31 @@ mod tests {
         assert_eq!(node.host, "2409:8a71:6a00:1953::615");
         assert_eq!(node.port, 8964);
         assert_eq!(node.password.as_deref(), Some("uuid"));
+    }
+
+    #[test]
+    fn parse_official_hysteria2_default_port_and_full_userinfo_auth() {
+        let node =
+            parse_uri("hysteria2://alice:let%3Amein@example.com/?sni=edge.example#HY2").unwrap();
+        assert_eq!(node.protocol, NodeProtocol::Hysteria2);
+        assert_eq!(node.port, 443);
+        assert_eq!(node.password.as_deref(), Some("alice:let:mein"));
+        assert_eq!(node.sni.as_deref(), Some("edge.example"));
+        assert_eq!(node.name, "HY2");
+    }
+
+    #[test]
+    fn parse_official_hysteria2_multi_port_authority() {
+        let node = parse_uri("hy2://secret@example.com:2000,3000-3002?hopInterval=8s").unwrap();
+        assert_eq!(node.port, 2000);
+        assert_eq!(
+            node.params.get("hopPorts").map(String::as_str),
+            Some("2000,3000-3002")
+        );
+        assert_eq!(
+            node.params.get("hopInterval").map(String::as_str),
+            Some("8s")
+        );
     }
 
     #[test]

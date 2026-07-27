@@ -13,9 +13,10 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context, Poll},
+    time::{Duration, Instant},
 };
 
 use parking_lot::Mutex;
@@ -28,6 +29,158 @@ use crate::adapter::{BoxedUdp, UdpSocketLike};
 const SEND_QUEUE_PACKETS: usize = 256;
 const RECEIVE_QUEUE_PACKETS: usize = 256;
 const MAX_DATAGRAM: usize = u16::MAX as usize;
+const BRUTAL_MIN_PACING_DELAY: Duration = Duration::from_millis(1);
+
+/// Shared state for Hysteria's independent packet pacer.
+///
+/// Quinn's congestion-controller API controls the in-flight window but its
+/// built-in pacer always derives a rate from that window. Brutal deliberately
+/// uses a larger BDP window while pacing at exactly `bandwidth / ack-rate`, so
+/// the final packet worker must enforce the official token bucket separately.
+#[derive(Clone)]
+pub(crate) struct BrutalPacketPacing {
+    rate: Arc<AtomicU64>,
+    ack_rate_bits: Arc<AtomicU64>,
+    enabled: Arc<AtomicBool>,
+    max_datagram_size: Arc<AtomicU64>,
+    burst_delay_nanos: u64,
+}
+
+impl fmt::Debug for BrutalPacketPacing {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BrutalPacketPacing")
+            .field("rate", &self.rate.load(Ordering::Relaxed))
+            .field(
+                "ack_rate",
+                &f64::from_bits(self.ack_rate_bits.load(Ordering::Relaxed)),
+            )
+            .field("enabled", &self.enabled.load(Ordering::Relaxed))
+            .field(
+                "max_datagram_size",
+                &self.max_datagram_size.load(Ordering::Relaxed),
+            )
+            .finish()
+    }
+}
+
+impl BrutalPacketPacing {
+    pub(crate) fn new(
+        rate: Arc<AtomicU64>,
+        enabled: Arc<AtomicBool>,
+        initial_mtu: u16,
+        burst_delay: Duration,
+    ) -> Self {
+        Self {
+            rate,
+            ack_rate_bits: Arc::new(AtomicU64::new(1.0_f64.to_bits())),
+            enabled,
+            max_datagram_size: Arc::new(AtomicU64::new(u64::from(initial_mtu))),
+            burst_delay_nanos: burst_delay.as_nanos().min(u128::from(u64::MAX)) as u64,
+        }
+    }
+
+    pub(crate) fn set_ack_rate(&self, ack_rate: f64) {
+        self.ack_rate_bits.store(
+            ack_rate.clamp(f64::EPSILON, 1.0).to_bits(),
+            Ordering::Release,
+        );
+    }
+
+    pub(crate) fn reset_ack_rate(&self) {
+        self.ack_rate_bits
+            .store(1.0_f64.to_bits(), Ordering::Release);
+    }
+
+    pub(crate) fn set_rate(&self, rate: u64) {
+        self.rate.store(rate, Ordering::Release);
+    }
+
+    pub(crate) fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Release);
+    }
+
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_max_datagram_size(&self, mtu: u16) {
+        self.max_datagram_size
+            .store(u64::from(mtu), Ordering::Release);
+    }
+
+    pub(crate) fn effective_rate(&self) -> u64 {
+        let rate = self.rate.load(Ordering::Acquire);
+        let ack_rate = f64::from_bits(self.ack_rate_bits.load(Ordering::Acquire));
+        // Match the official Go conversion exactly: Brutal derives the packet
+        // pacer's byte rate with `ByteCount(float64(bps) / ackRate)`, which
+        // truncates toward zero after the floating-point division.
+        (rate as f64 / ack_rate) as u64
+    }
+
+    fn max_burst_size(&self, rate: u64, mtu: u64) -> u64 {
+        (rate.saturating_mul(self.burst_delay_nanos) / 1_000_000_000).max(mtu.saturating_mul(10))
+    }
+}
+
+struct BrutalPacketPacer {
+    shared: BrutalPacketPacing,
+    budget_at_last_send: u64,
+    last_send: Option<Instant>,
+}
+
+impl BrutalPacketPacer {
+    fn new(shared: BrutalPacketPacing) -> Self {
+        Self {
+            shared,
+            budget_at_last_send: 0,
+            last_send: None,
+        }
+    }
+
+    async fn wait_to_send(&mut self, packet_size: usize) {
+        loop {
+            if !self.shared.enabled.load(Ordering::Acquire) {
+                self.budget_at_last_send = 0;
+                self.last_send = None;
+                return;
+            }
+            let rate = self.shared.effective_rate();
+            if rate == 0 {
+                self.budget_at_last_send = 0;
+                self.last_send = None;
+                return;
+            }
+            let mtu = self.shared.max_datagram_size.load(Ordering::Acquire).max(1);
+            let maximum = self.shared.max_burst_size(rate, mtu);
+            let now = Instant::now();
+            let budget = match self.last_send {
+                None => maximum,
+                Some(last_send) => {
+                    let elapsed = now.saturating_duration_since(last_send).as_nanos();
+                    let replenished = (u128::from(rate).saturating_mul(elapsed) / 1_000_000_000)
+                        .min(u128::from(u64::MAX)) as u64;
+                    self.budget_at_last_send
+                        .saturating_add(replenished)
+                        .min(maximum)
+                }
+            };
+            if budget >= mtu {
+                self.budget_at_last_send =
+                    budget.saturating_sub(u64::try_from(packet_size).unwrap_or(u64::MAX));
+                self.last_send = Some(now);
+                return;
+            }
+            let missing = mtu - budget;
+            let delay_nanos = u128::from(missing)
+                .saturating_mul(1_000_000_000)
+                .div_ceil(u128::from(rate))
+                .min(u128::from(u64::MAX)) as u64;
+            tokio::time::sleep(Duration::from_nanos(delay_nanos).max(BRUTAL_MIN_PACING_DELAY))
+                .await;
+        }
+    }
+}
 
 /// Open an endpoint-aware, unconnected UDP carrier. Unlike the public DIRECT
 /// association this deliberately accepts literal alternate destinations used
@@ -229,12 +382,31 @@ impl QuinnUdpSocket {
         target_host: String,
         target_port: u16,
     ) -> Arc<Self> {
+        Self::new_with_pacing(
+            inner,
+            local_addr,
+            logical_peer,
+            target_host,
+            target_port,
+            None,
+        )
+    }
+
+    pub(crate) fn new_with_pacing(
+        inner: BoxedUdp,
+        local_addr: SocketAddr,
+        logical_peer: SocketAddr,
+        target_host: String,
+        target_port: u16,
+        pacing: Option<BrutalPacketPacing>,
+    ) -> Arc<Self> {
         Self::build(
             inner,
             local_addr,
             Some(logical_peer),
             Some(target_host),
             target_port,
+            pacing,
         )
     }
 
@@ -242,7 +414,7 @@ impl QuinnUdpSocket {
     /// Unlike the client association, each receive record retains its source
     /// and each Quinn transmit supplies its own destination.
     pub fn new_server(inner: BoxedUdp, local_addr: SocketAddr) -> Arc<Self> {
-        Self::build(inner, local_addr, None, None, 0)
+        Self::build(inner, local_addr, None, None, 0, None)
     }
 
     fn build(
@@ -251,6 +423,7 @@ impl QuinnUdpSocket {
         logical_peer: Option<SocketAddr>,
         target_host: Option<String>,
         target_port: u16,
+        pacing: Option<BrutalPacketPacing>,
     ) -> Arc<Self> {
         let inner: Arc<dyn crate::adapter::UdpSocketLike> = Arc::from(inner);
         let send_queue = Arc::new(Mutex::new(VecDeque::<SendPacket>::new()));
@@ -276,6 +449,7 @@ impl QuinnUdpSocket {
             target_port,
             carrier_ready.clone(),
             carrier_ready_notify.clone(),
+            pacing,
         );
         spawn_receive_worker(
             inner,
@@ -457,8 +631,10 @@ fn spawn_send_worker(
     port: u16,
     carrier_ready: Arc<AtomicBool>,
     carrier_ready_notify: Arc<Notify>,
+    pacing: Option<BrutalPacketPacing>,
 ) {
     tokio::spawn(async move {
+        let mut pacing = pacing.map(BrutalPacketPacer::new);
         loop {
             loop {
                 let packet = { queue.lock().pop_front() };
@@ -473,6 +649,9 @@ fn spawn_send_worker(
                         packet.destination.port(),
                     ),
                 };
+                if let Some(pacing) = pacing.as_mut() {
+                    pacing.wait_to_send(packet.payload.len()).await;
+                }
                 if let Err(error) = inner.send_to(&packet.payload, &target, port).await {
                     *terminal.lock() = Some(ErrorRecord::from_error(error));
                     closed.store(true, Ordering::Release);

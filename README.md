@@ -105,6 +105,10 @@ WutherCore 负责节点接入、订阅更新、DNS、规则分流、透明代理
 
 AnyTLS 已按官方协议 v2 实现认证、动态 padding scheme、会话复用、SYNACK 与 UDP-over-TCP v2，配置和线格式说明见 [AnyTLS 指南](docs/ANYTLS.md)。
 
+Hysteria 1/2 已按官方线协议实现认证、TCP、UDP session/分片、XPlus、
+Salamander/Gecko、端口跳跃与两代 Brutal；字段语义和配置约束见
+[Hysteria 1 / 2 指南](docs/HYSTERIA.md)。
+
 ### Young
 
 Young 是 WutherCore 的原生代理协议，客户端和服务端都使用 Mozilla Neqo 与 NSS：

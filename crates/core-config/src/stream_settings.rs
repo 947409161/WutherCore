@@ -628,6 +628,10 @@ pub struct QuicParamsConfig {
     pub bbr_profile: String,
     pub brutal_up: BandwidthValue,
     pub brutal_down: BandwidthValue,
+    /// Hysteria 2 `bandwidth.disableLossCompensation`.  This is local to the
+    /// sender and therefore belongs beside the executable Brutal parameters,
+    /// not in the HTTP authentication frame.
+    pub brutal_disable_loss_compensation: bool,
     pub udp_hop: UdpHopConfig,
     pub init_stream_receive_window: u64,
     pub max_stream_receive_window: u64,

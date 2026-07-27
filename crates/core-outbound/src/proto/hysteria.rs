@@ -1,44 +1,57 @@
-//! Hysteria v1 出站 —— 完整实现，与 [hysteria 协议规范](https://github.com/HyNetwork/hysteria/wiki/Protocol-Specification-(v1)) 互通。
+//! Hysteria 1 client data plane.
 //!
-//! ## 协议总览
-//!
-//! 1. **QUIC 握手**：rustls + ALPN（默认 `hysteria`）
-//! 2. **客户端鉴权**：在 control stream（id=0 单向流）上发送 ClientHello msgpack：
-//!    `{"send_bps": u64, "recv_bps": u64, "auth": bytes, "obfs": bytes}`
-//! 3. **服务器响应**：ServerHello msgpack：
-//!    `{"ok": bool, "msg": str, "send_bps": u64, "recv_bps": u64}`
-//! 4. **TCP 代理**：每个 dial 打开新 bidi stream，写 ClientRequest msgpack：
-//!    `{"udp": false, "host": str, "port": u16}`，读 ServerResponse `{"ok": bool, "msg": str}`，
-//!    然后双向裸 payload
-//! 5. **UDP relay**：通过 datagram 或 stream 发送 UDPMessage：
-//!    `{"session_id": u32, "host": str, "port": u16, "data": bytes,
-//!      "msg_id": u16, "frag_id": u8, "frag_count": u8}`
-//! 6. **Obfs**：可选 XOR keystream（与 Hysteria2 Salamander 类似但用 SHA-256 派生）
-//! 7. **Brutal CC**：客户端通过 ClientHello 声明带宽，服务器据此用 brutal 拥塞控制
-//!
-//! ## msgpack 编码
-//!
-//! 为避免引入完整 rmp-serde 依赖，我们手工实现协议所需的最小 msgpack：
-//! 仅 fixmap、fixstr、true/false、u8/u16/u32/u64、bin8/bin16
-//!
-//! ## 实现范围（**完整**）
-//! * ClientHello + ServerHello msgpack 鉴权
-//! * 完整 ClientRequest / ServerResponse
-//! * UDP relay（datagram + stream 双模式）
-//! * 可选 obfs
+//! This module follows `apernet/hysteria`'s `hy1` branch byte-for-byte:
+//! protocol version 3, fixed-width big-endian control/request frames, QUIC
+//! datagrams with server-assigned UDP sessions and fragmentation, XPlus packet
+//! obfuscation, and Hysteria 1's 1.5× Brutal congestion window.
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashMap,
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use async_trait::async_trait;
-use bytes::BufMut;
-use quinn::{ClientConfig, Endpoint, crypto::rustls::QuicClientConfig};
-use rustls::ClientConfig as RustlsConfig;
-use tokio::sync::Mutex as AsyncMutex;
-
-use crate::adapter::{
-    BoxedStream, Capabilities, DialContext, OutboundAdapter, prepare_outbound_udp_socket_for_addr,
-    resolve_host,
+use bytes::Bytes;
+use core_config::{BandwidthValue, QuicParamsConfig, UdpMaskConfig};
+use quinn::{ClientConfig, Endpoint, RecvStream, SendStream, crypto::rustls::QuicClientConfig};
+use rand::{Rng, RngExt};
+use sha2::{Digest, Sha256};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
+    sync::{Mutex as AsyncMutex, mpsc},
 };
+
+use crate::{
+    adapter::{BoxedStream, BoxedUdp, Capabilities, DialContext, OutboundAdapter, UdpSocketLike},
+    transport::{
+        TlsOptions,
+        ech::resolve_ech_config,
+        finalmask::{
+            QuinnUdpSocket, UdpHopCarrier, open_direct_carrier,
+            quic::{HysteriaPeerRx, apply_hysteria1_client_config},
+            wrap_udp_client,
+        },
+        tls::build_tls_client_config,
+    },
+};
+
+const PROTOCOL_VERSION: u8 = 3;
+const MAX_AUTH_LENGTH: usize = u16::MAX as usize;
+const MAX_HOST_LENGTH: usize = u16::MAX as usize;
+const MAX_MESSAGE_LENGTH: usize = u16::MAX as usize;
+const MAX_UDP_SIZE: usize = u16::MAX as usize;
+const DEFAULT_DATAGRAM_SIZE: usize = 1200;
+const UDP_QUEUE_PACKETS: usize = 1024;
+const XPLUS_SALT_SIZE: usize = 16;
+const MIN_BANDWIDTH: u64 = 16_384;
 
 #[derive(Debug, Clone)]
 pub struct HysteriaOutbound {
@@ -46,126 +59,224 @@ pub struct HysteriaOutbound {
     pub host: String,
     pub port: u16,
     pub auth: Vec<u8>,
-    pub obfs: Vec<u8>, // 空表示不启用
-    pub up_mbps: u32,
-    pub down_mbps: u32,
-    pub sni: Option<String>,
-    pub insecure: bool,
-    pub alpn: Vec<String>,
+    pub obfs: Option<Vec<u8>>,
+    /// Required client upload limit, in bytes per second.
+    pub tx_bps: u64,
+    /// Required client download limit, in bytes per second.
+    pub rx_bps: u64,
+    pub tls: TlsOptions,
+    /// Optional Hysteria 1 QUIC handshake deadline. The official client leaves
+    /// zero to quic-go's default and only installs an override when configured.
+    pub handshake_timeout: Option<Duration>,
+    pub fast_open: bool,
     pub udp: bool,
+    pub quic_params: QuicParamsConfig,
     state: Arc<AsyncMutex<Option<Arc<HysteriaSession>>>>,
 }
 
 impl HysteriaOutbound {
-    pub fn new(name: impl Into<String>, host: impl Into<String>, port: u16, auth: Vec<u8>) -> Self {
-        Self {
+    pub fn new(
+        name: impl Into<String>,
+        host: impl Into<String>,
+        port: u16,
+        auth: Vec<u8>,
+        tx_bps: u64,
+        rx_bps: u64,
+    ) -> io::Result<Self> {
+        if auth.len() > MAX_AUTH_LENGTH {
+            return Err(invalid("Hysteria 1 auth exceeds 65535 bytes"));
+        }
+        if tx_bps < MIN_BANDWIDTH || rx_bps < MIN_BANDWIDTH {
+            return Err(invalid(
+                "Hysteria 1 upload and download bandwidth must be at least 16384 bytes/s",
+            ));
+        }
+        Ok(Self {
             name: name.into(),
             host: host.into(),
             port,
             auth,
-            obfs: Vec::new(),
-            up_mbps: 100,
-            down_mbps: 100,
-            sni: None,
-            insecure: false,
-            alpn: vec!["hysteria".into()],
+            obfs: None,
+            tx_bps,
+            rx_bps,
+            tls: TlsOptions {
+                enabled: true,
+                alpn: vec!["hysteria".into()],
+                ..TlsOptions::default()
+            },
+            handshake_timeout: None,
+            fast_open: false,
             udp: true,
+            quic_params: QuicParamsConfig::default(),
             state: Arc::new(AsyncMutex::new(None)),
+        })
+    }
+
+    pub fn with_obfs(mut self, password: Vec<u8>) -> io::Result<Self> {
+        if password.is_empty() {
+            return Err(invalid("Hysteria 1 XPlus password cannot be empty"));
         }
+        self.obfs = Some(password);
+        Ok(self)
     }
 
-    pub fn with_obfs(mut self, obfs: Vec<u8>) -> Self {
-        self.obfs = obfs;
-        self
-    }
-
-    async fn ensure_session(&self) -> std::io::Result<Arc<HysteriaSession>> {
-        let mut guard = self.state.lock().await;
-        if let Some(s) = guard.as_ref() {
-            if !s.is_closed() {
-                return Ok(s.clone());
-            }
+    async fn ensure_session(&self) -> io::Result<Arc<HysteriaSession>> {
+        let mut state = self.state.lock().await;
+        if let Some(session) = state.as_ref()
+            && !session.is_closed()
+        {
+            return Ok(session.clone());
         }
         let session = Arc::new(self.connect_and_auth().await?);
-        *guard = Some(session.clone());
+        *state = Some(session.clone());
         Ok(session)
     }
 
-    async fn connect_and_auth(&self) -> std::io::Result<HysteriaSession> {
+    async fn connect_and_auth(&self) -> io::Result<HysteriaSession> {
         let target_addr = resolve_first(&self.host, self.port).await?;
-
-        let mut tls_config =
-            RustlsConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-                .with_safe_default_protocol_versions()
-                .expect("rustls ring default protocols")
-                .with_root_certificates(root_store())
-                .with_no_client_auth();
-        tls_config.alpn_protocols = self.alpn.iter().map(|s| s.as_bytes().to_vec()).collect();
-        if self.insecure {
-            tls_config
-                .dangerous()
-                .set_certificate_verifier(Arc::new(InsecureVerifier));
+        let mut tls = self.tls.clone();
+        tls.enabled = true;
+        if tls.alpn.is_empty() {
+            tls.alpn = vec!["hysteria".into()];
         }
-        let quic_client_config: QuicClientConfig = QuicClientConfig::try_from(tls_config)
-            .map_err(|e| io_err(format!("hysteria quic config: {e}")))?;
-        let client_config = ClientConfig::new(Arc::new(quic_client_config));
+        if tls
+            .xray_settings
+            .as_ref()
+            .and_then(|settings| settings.ech_config_list.as_deref())
+            .is_some_and(|source| source.contains("://"))
+        {
+            tls.resolved_ech_config_list = resolve_ech_config(&tls, &self.host).await?;
+        }
+        let rustls = build_tls_client_config(&tls)?;
+        let crypto =
+            QuicClientConfig::try_from(rustls).map_err(|error| invalid(error.to_string()))?;
+        let mut client_config = ClientConfig::new(Arc::new(crypto));
 
-        let bind_addr: SocketAddr = if target_addr.is_ipv6() {
-            "[::]:0".parse().unwrap()
+        let mut quic_params = self.quic_params.clone();
+        quic_params.brutal_up = bandwidth_value(self.tx_bps)?;
+        quic_params.brutal_down = bandwidth_value(self.rx_bps)?;
+        quic_params.congestion = "brutal".into();
+        let applied_quic = apply_hysteria1_client_config(&mut client_config, &quic_params)?;
+
+        let active_policy = crate::socket_policy::current();
+        let nominal_local: SocketAddr = if target_addr.is_ipv6() {
+            "[::]:0".parse().expect("IPv6 wildcard")
         } else {
-            "0.0.0.0:0".parse().unwrap()
+            "0.0.0.0:0".parse().expect("IPv4 wildcard")
         };
-        let std_socket = std::net::UdpSocket::bind(bind_addr)?;
-        let loopback_guard = prepare_outbound_udp_socket_for_addr(&std_socket, target_addr)?;
-        std_socket.set_nonblocking(true)?;
-        let mut endpoint = Endpoint::new(
+        let masks = active_policy
+            .as_ref()
+            .and_then(|policy| policy.settings.finalmask.as_ref())
+            .map(|finalmask| finalmask.udp.clone())
+            .unwrap_or_default();
+        if applied_quic.udp_hop().is_some()
+            && masks
+                .iter()
+                .any(|mask| matches!(mask, UdpMaskConfig::Realm(_) | UdpMaskConfig::Xicmp(_)))
+        {
+            return Err(invalid(
+                "Hysteria port hopping cannot be combined with realm/xicmp carriers",
+            ));
+        }
+        let proxy = active_policy.as_ref().and_then(|policy| policy.proxy());
+        let (raw, carrier_local) = if let Some(hop) = applied_quic.udp_hop().cloned() {
+            UdpHopCarrier::open(hop, proxy, self.host.clone(), target_addr).await?
+        } else if let Some(proxy) = proxy {
+            (
+                crate::socket_policy::dial_udp_through_proxy(
+                    proxy,
+                    self.host.clone(),
+                    target_addr.port(),
+                )
+                .await?,
+                nominal_local,
+            )
+        } else {
+            open_direct_carrier(self.host.clone(), target_addr)?
+        };
+        let masked = if masks.is_empty() {
+            raw
+        } else {
+            wrap_udp_client(
+                raw,
+                &masks,
+                self.host.clone(),
+                target_addr.port(),
+                None,
+                Some(target_addr),
+            )
+            .await?
+        };
+        let carrier: BoxedUdp = match self.obfs.as_ref() {
+            Some(password) => Box::new(XPlusUdp::new(masked, password.clone())),
+            None => masked,
+        };
+        let socket = QuinnUdpSocket::new_with_pacing(
+            carrier,
+            carrier_local,
+            target_addr,
+            self.host.clone(),
+            target_addr.port(),
+            applied_quic.packet_pacing(),
+        );
+        let mut endpoint = Endpoint::new_with_abstract_socket(
             quinn::EndpointConfig::default(),
             None,
-            std_socket,
+            socket,
             Arc::new(quinn::TokioRuntime),
         )
-        .map_err(|e| io_err(format!("hysteria endpoint: {e}")))?;
+        .map_err(|error| invalid(format!("Hysteria 1 endpoint: {error}")))?;
         endpoint.set_default_client_config(client_config);
 
-        let server_name = self.sni.clone().unwrap_or_else(|| self.host.clone());
-        let connection = endpoint
+        let server_name = tls.sni.clone().unwrap_or_else(|| self.host.clone());
+        let connecting = endpoint
             .connect(target_addr, &server_name)
-            .map_err(|e| io_err(format!("hysteria connect: {e}")))?
-            .await
-            .map_err(|e| io_err(format!("hysteria connection: {e}")))?;
-
-        // 鉴权：在 first bidi stream 上交换 ClientHello / ServerHello
+            .map_err(|error| invalid(format!("Hysteria 1 connect: {error}")))?;
+        let connection = match self.handshake_timeout {
+            Some(timeout) => tokio::time::timeout(timeout, connecting)
+                .await
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("Hysteria 1 handshake timed out after {timeout:?}"),
+                    )
+                })?,
+            None => connecting.await,
+        }
+        .map_err(|error| invalid(format!("Hysteria 1 handshake: {error}")))?;
         let (mut send, mut recv) = connection
             .open_bi()
             .await
-            .map_err(|e| io_err(format!("hysteria open_bi auth: {e}")))?;
-
-        let send_bps = (self.up_mbps as u64) * 1_000_000 / 8;
-        let recv_bps = (self.down_mbps as u64) * 1_000_000 / 8;
-        let hello = encode_client_hello(send_bps, recv_bps, &self.auth, &self.obfs);
-        send.write_all(&hello)
+            .map_err(|error| invalid(format!("Hysteria 1 control stream: {error}")))?;
+        send.write_all(&encode_client_hello(self.tx_bps, self.rx_bps, &self.auth)?)
             .await
-            .map_err(|e| io_err(format!("hysteria write hello: {e}")))?;
-
-        // 读 ServerHello —— 简化：读到 0x83 (fixmap=3) 起始的 msgpack
-        let mut buf = vec![0u8; 4096];
-        let n = recv
-            .read(&mut buf)
-            .await
-            .map_err(|e| io_err(format!("hysteria read hello: {e}")))?
-            .ok_or_else(|| io_err("hysteria server closed during auth"))?;
-        let server_hello = parse_server_hello(&buf[..n])?;
+            .map_err(|error| invalid(format!("Hysteria 1 client hello: {error}")))?;
+        send.flush().await?;
+        let server_hello = read_server_hello(&mut recv).await?;
         if !server_hello.ok {
-            return Err(io_err(format!(
-                "hysteria server rejected auth: {}",
-                server_hello.msg
-            )));
+            connection.close(2u32.into(), b"auth error");
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "Hysteria 1 authentication rejected: {}",
+                    server_hello.message
+                ),
+            ));
         }
-
+        if server_hello.recv_bps == 0 || server_hello.send_bps == 0 {
+            connection.close(1u32.into(), b"invalid bandwidth");
+            return Err(invalid(
+                "Hysteria 1 server returned a zero negotiated bandwidth",
+            ));
+        }
+        applied_quic.finish_hysteria_negotiation(HysteriaPeerRx::Rate(server_hello.recv_bps));
+        applied_quic.apply_max_receive_window(&connection);
+        let router = self.udp.then(|| HysteriaUdpRouter::new(connection.clone()));
         Ok(HysteriaSession {
             connection,
             endpoint,
-            _loopback_guard: loopback_guard,
+            control: AsyncMutex::new(Some(super::hysteria2::QuinnBiStream::new(send, recv))),
+            router,
         })
     }
 }
@@ -175,355 +286,861 @@ impl OutboundAdapter for HysteriaOutbound {
     fn name(&self) -> &str {
         &self.name
     }
+
     fn protocol(&self) -> &'static str {
         "hysteria"
     }
+
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             tcp: true,
-            udp: false,
+            udp: self.udp,
             ipv6: true,
             multiplex: true,
         }
     }
 
-    async fn dial_tcp(&self, ctx: DialContext) -> std::io::Result<BoxedStream> {
+    async fn dial_tcp(&self, ctx: DialContext) -> io::Result<BoxedStream> {
         let session = self.ensure_session().await?;
+        let (mut send, recv) = session
+            .connection
+            .open_bi()
+            .await
+            .map_err(|error| invalid(format!("Hysteria 1 open TCP stream: {error}")))?;
+        send.write_all(&encode_client_request(false, &ctx.host, ctx.port)?)
+            .await
+            .map_err(|error| invalid(format!("Hysteria 1 write TCP request: {error}")))?;
+        send.flush().await?;
+        let mut stream = HysteriaTcpStream::new(send, recv);
+        if !self.fast_open {
+            stream.establish().await?;
+        }
+        Ok(Box::pin(stream))
+    }
+
+    async fn dial_udp(&self, _ctx: DialContext) -> io::Result<BoxedUdp> {
+        if !self.udp {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Hysteria 1 UDP is disabled by configuration",
+            ));
+        }
+        let session = self.ensure_session().await?;
+        let router = session
+            .router
+            .as_ref()
+            .ok_or_else(|| invalid("Hysteria 1 UDP router is unavailable"))?
+            .clone();
         let (mut send, mut recv) = session
             .connection
             .open_bi()
             .await
-            .map_err(|e| io_err(format!("hysteria open_bi: {e}")))?;
-
-        let req = encode_client_request(&ctx.host, ctx.port, ctx.network == "udp");
-        send.write_all(&req)
+            .map_err(|error| invalid(format!("Hysteria 1 open UDP stream: {error}")))?;
+        send.write_all(&encode_client_request(true, "", 0)?)
             .await
-            .map_err(|e| io_err(format!("hysteria write req: {e}")))?;
-
-        let mut buf = vec![0u8; 1024];
-        let n = recv
-            .read(&mut buf)
-            .await
-            .map_err(|e| io_err(format!("hysteria read resp: {e}")))?
-            .ok_or_else(|| io_err("hysteria server closed during connect"))?;
-        let resp = parse_server_response(&buf[..n])?;
-        if !resp.ok {
-            return Err(io_err(format!("hysteria server refused: {}", resp.msg)));
+            .map_err(|error| invalid(format!("Hysteria 1 write UDP request: {error}")))?;
+        send.flush().await?;
+        let response = read_server_response(&mut recv).await?;
+        if !response.ok {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                format!(
+                    "Hysteria 1 server rejected UDP session: {}",
+                    response.message
+                ),
+            ));
         }
-
-        Ok(Box::pin(super::hysteria2::QuinnBiStream::new(send, recv)))
+        Ok(Box::new(router.open(
+            response.udp_session_id,
+            super::hysteria2::QuinnBiStream::new(send, recv),
+        )?))
     }
 }
 
 #[derive(Debug)]
 struct HysteriaSession {
     connection: quinn::Connection,
-    #[allow(dead_code)]
     endpoint: Endpoint,
-    _loopback_guard: crate::loopback::LoopbackUdpGuard,
+    control: AsyncMutex<Option<super::hysteria2::QuinnBiStream>>,
+    router: Option<Arc<HysteriaUdpRouter>>,
 }
 
 impl HysteriaSession {
     fn is_closed(&self) -> bool {
+        let _keep_endpoint_alive = &self.endpoint;
+        let _keep_control_stream_alive = &self.control;
         self.connection.close_reason().is_some()
     }
 }
 
-/* ---------------- msgpack 编码（最小子集） ---------------- */
+/* ---------------- fixed-width wire protocol ---------------- */
 
-fn encode_client_hello(send_bps: u64, recv_bps: u64, auth: &[u8], obfs: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(64 + auth.len() + obfs.len());
-    // fixmap with 4 entries: 0x84
-    out.push(0x84);
-    write_str(&mut out, "send_bps");
-    write_u64(&mut out, send_bps);
-    write_str(&mut out, "recv_bps");
-    write_u64(&mut out, recv_bps);
-    write_str(&mut out, "auth");
-    write_bin(&mut out, auth);
-    write_str(&mut out, "obfs");
-    write_bin(&mut out, obfs);
-    out
+fn encode_client_hello(send_bps: u64, recv_bps: u64, auth: &[u8]) -> io::Result<Vec<u8>> {
+    let auth_len =
+        u16::try_from(auth.len()).map_err(|_| invalid("Hysteria 1 auth exceeds 65535 bytes"))?;
+    let mut output = Vec::with_capacity(19 + auth.len());
+    output.push(PROTOCOL_VERSION);
+    output.extend_from_slice(&send_bps.to_be_bytes());
+    output.extend_from_slice(&recv_bps.to_be_bytes());
+    output.extend_from_slice(&auth_len.to_be_bytes());
+    output.extend_from_slice(auth);
+    Ok(output)
 }
 
-fn encode_client_request(host: &str, port: u16, is_udp: bool) -> Vec<u8> {
-    let mut out = Vec::with_capacity(host.len() + 16);
-    // fixmap with 3 entries: 0x83
-    out.push(0x83);
-    write_str(&mut out, "udp");
-    out.push(if is_udp { 0xc3 } else { 0xc2 });
-    write_str(&mut out, "host");
-    write_str(&mut out, host);
-    write_str(&mut out, "port");
-    write_u16(&mut out, port);
-    out
-}
-
-fn write_str(out: &mut Vec<u8>, s: &str) {
-    let b = s.as_bytes();
-    if b.len() < 32 {
-        out.push(0xa0 | (b.len() as u8));
-    } else if b.len() < 256 {
-        out.push(0xd9);
-        out.push(b.len() as u8);
-    } else {
-        out.push(0xda);
-        out.put_u16(b.len() as u16);
-    }
-    out.extend_from_slice(b);
-}
-
-fn write_bin(out: &mut Vec<u8>, b: &[u8]) {
-    if b.len() < 256 {
-        out.push(0xc4);
-        out.push(b.len() as u8);
-    } else {
-        out.push(0xc5);
-        out.put_u16(b.len() as u16);
-    }
-    out.extend_from_slice(b);
-}
-
-fn write_u16(out: &mut Vec<u8>, v: u16) {
-    out.push(0xcd);
-    out.put_u16(v);
-}
-
-fn write_u64(out: &mut Vec<u8>, v: u64) {
-    out.push(0xcf);
-    out.put_u64(v);
-}
-
-/* ---------------- msgpack 解码（最小子集） ---------------- */
-
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct ServerHello {
     ok: bool,
-    msg: String,
+    send_bps: u64,
+    recv_bps: u64,
+    message: String,
+}
+
+async fn read_server_hello(recv: &mut RecvStream) -> io::Result<ServerHello> {
+    let fixed = read_exact::<19>(recv, "server hello").await?;
+    let message_len = u16::from_be_bytes([fixed[17], fixed[18]]) as usize;
+    Ok(ServerHello {
+        ok: parse_bool(fixed[0])?,
+        send_bps: u64::from_be_bytes(fixed[1..9].try_into().expect("eight bytes")),
+        recv_bps: u64::from_be_bytes(fixed[9..17].try_into().expect("eight bytes")),
+        message: read_utf8(recv, message_len, "server hello message").await?,
+    })
+}
+
+fn encode_client_request(udp: bool, host: &str, port: u16) -> io::Result<Vec<u8>> {
+    let host_len =
+        u16::try_from(host.len()).map_err(|_| invalid("Hysteria 1 host exceeds 65535 bytes"))?;
+    let mut output = Vec::with_capacity(5 + host.len());
+    output.push(u8::from(udp));
+    output.extend_from_slice(&host_len.to_be_bytes());
+    output.extend_from_slice(host.as_bytes());
+    output.extend_from_slice(&port.to_be_bytes());
+    Ok(output)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ServerResponse {
+    ok: bool,
+    udp_session_id: u32,
+    message: String,
+}
+
+async fn read_server_response(recv: &mut RecvStream) -> io::Result<ServerResponse> {
+    let fixed = read_exact::<7>(recv, "server response").await?;
+    let message_len = u16::from_be_bytes([fixed[5], fixed[6]]) as usize;
+    Ok(ServerResponse {
+        ok: parse_bool(fixed[0])?,
+        udp_session_id: u32::from_be_bytes(fixed[1..5].try_into().expect("four bytes")),
+        message: read_utf8(recv, message_len, "server response message").await?,
+    })
+}
+
+async fn read_exact<const N: usize>(
+    recv: &mut RecvStream,
+    context: &'static str,
+) -> io::Result<[u8; N]> {
+    let mut output = [0u8; N];
+    let mut offset = 0;
+    while offset < N {
+        let read = recv
+            .read(&mut output[offset..])
+            .await
+            .map_err(|error| invalid(format!("Hysteria 1 read {context}: {error}")))?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("Hysteria 1 stream closed during {context}"),
+                )
+            })?;
+        offset += read;
+    }
+    Ok(output)
+}
+
+async fn read_utf8(
+    recv: &mut RecvStream,
+    length: usize,
+    context: &'static str,
+) -> io::Result<String> {
+    if length > MAX_MESSAGE_LENGTH {
+        return Err(invalid("Hysteria 1 message exceeds protocol limit"));
+    }
+    let mut output = vec![0u8; length];
+    let mut offset = 0;
+    while offset < length {
+        let read = recv
+            .read(&mut output[offset..])
+            .await
+            .map_err(|error| invalid(format!("Hysteria 1 read {context}: {error}")))?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, context))?;
+        offset += read;
+    }
+    String::from_utf8(output).map_err(|_| invalid(format!("Hysteria 1 {context} is not UTF-8")))
+}
+
+fn parse_bool(value: u8) -> io::Result<bool> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(invalid("Hysteria 1 boolean is neither 0 nor 1")),
+    }
+}
+
+enum ResponseParse {
+    NeedMore,
+    Invalid(&'static str),
+    Done {
+        ok: bool,
+        message: String,
+        consumed: usize,
+    },
+}
+
+fn parse_server_response(input: &[u8]) -> ResponseParse {
+    if input.len() < 7 {
+        return ResponseParse::NeedMore;
+    }
+    let Ok(ok) = parse_bool(input[0]) else {
+        return ResponseParse::Invalid("invalid response boolean");
+    };
+    let message_len = u16::from_be_bytes([input[5], input[6]]) as usize;
+    let consumed = 7 + message_len;
+    if input.len() < consumed {
+        return ResponseParse::NeedMore;
+    }
+    let Ok(message) = std::str::from_utf8(&input[7..consumed]) else {
+        return ResponseParse::Invalid("response message is not UTF-8");
+    };
+    ResponseParse::Done {
+        ok,
+        message: message.to_owned(),
+        consumed,
+    }
+}
+
+struct HysteriaTcpStream {
+    send: SendStream,
+    recv: RecvStream,
+    response_done: bool,
+    scratch: Vec<u8>,
+    leftover: Vec<u8>,
+    leftover_offset: usize,
+}
+
+impl HysteriaTcpStream {
+    fn new(send: SendStream, recv: RecvStream) -> Self {
+        Self {
+            send,
+            recv,
+            response_done: false,
+            scratch: Vec::new(),
+            leftover: Vec::new(),
+            leftover_offset: 0,
+        }
+    }
+
+    async fn establish(&mut self) -> io::Result<()> {
+        std::future::poll_fn(|context| Pin::new(&mut *self).poll_establish(context)).await
+    }
+
+    fn poll_establish(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while !self.response_done {
+            match parse_server_response(&self.scratch) {
+                ResponseParse::Done {
+                    ok,
+                    message,
+                    consumed,
+                } => {
+                    if !ok {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::ConnectionRefused,
+                            format!("Hysteria 1 server rejected TCP request: {message}"),
+                        )));
+                    }
+                    self.leftover = self.scratch.split_off(consumed);
+                    self.scratch.clear();
+                    self.response_done = true;
+                }
+                ResponseParse::Invalid(reason) => {
+                    return Poll::Ready(Err(invalid(format!(
+                        "malformed Hysteria 1 TCP response: {reason}"
+                    ))));
+                }
+                ResponseParse::NeedMore => {
+                    let mut buffer = [0u8; 512];
+                    let mut read = ReadBuf::new(&mut buffer);
+                    match Pin::new(&mut self.recv).poll_read(context, &mut read) {
+                        Poll::Ready(Ok(())) if read.filled().is_empty() => {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "Hysteria 1 stream closed before TCP response",
+                            )));
+                        }
+                        Poll::Ready(Ok(())) => self.scratch.extend_from_slice(read.filled()),
+                        Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncRead for HysteriaTcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if !self.response_done {
+            match self.as_mut().poll_establish(context) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        if self.leftover_offset < self.leftover.len() {
+            let available = &self.leftover[self.leftover_offset..];
+            let length = available.len().min(output.remaining());
+            output.put_slice(&available[..length]);
+            self.leftover_offset += length;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.recv).poll_read(context, output)
+    }
+}
+
+impl AsyncWrite for HysteriaTcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        input: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.send)
+            .poll_write(context, input)
+            .map_err(io::Error::other)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.send).poll_flush(context)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.recv.stop(0u32.into()).ok();
+        Pin::new(&mut self.send).poll_shutdown(context)
+    }
+}
+
+/* ---------------- Hysteria 1 UDP datagrams ---------------- */
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HysteriaUdpMessage {
+    session_id: u32,
+    host: String,
+    port: u16,
+    message_id: u16,
+    fragment_id: u8,
+    fragment_count: u8,
+    data: Vec<u8>,
+}
+
+impl HysteriaUdpMessage {
+    fn header_size(&self) -> io::Result<usize> {
+        if self.host.len() > MAX_HOST_LENGTH {
+            return Err(invalid("Hysteria 1 UDP host exceeds 65535 bytes"));
+        }
+        Ok(14 + self.host.len())
+    }
+
+    fn serialize(&self) -> io::Result<Vec<u8>> {
+        if self.fragment_count == 0 || self.fragment_id >= self.fragment_count {
+            return Err(invalid("Hysteria 1 UDP fragment metadata is invalid"));
+        }
+        if self.fragment_count > 1 && self.message_id == 0 {
+            return Err(invalid(
+                "Hysteria 1 fragmented UDP message ID must be non-zero",
+            ));
+        }
+        let host_len = u16::try_from(self.host.len())
+            .map_err(|_| invalid("Hysteria 1 UDP host is too long"))?;
+        let data_len = u16::try_from(self.data.len())
+            .map_err(|_| invalid("Hysteria 1 UDP payload exceeds 65535 bytes"))?;
+        let mut output = Vec::with_capacity(self.header_size()? + self.data.len());
+        output.extend_from_slice(&self.session_id.to_be_bytes());
+        output.extend_from_slice(&host_len.to_be_bytes());
+        output.extend_from_slice(self.host.as_bytes());
+        output.extend_from_slice(&self.port.to_be_bytes());
+        output.extend_from_slice(&self.message_id.to_be_bytes());
+        output.push(self.fragment_id);
+        output.push(self.fragment_count);
+        output.extend_from_slice(&data_len.to_be_bytes());
+        output.extend_from_slice(&self.data);
+        Ok(output)
+    }
+
+    fn parse(input: &[u8]) -> io::Result<Self> {
+        if input.len() < 14 {
+            return Err(invalid("Hysteria 1 UDP datagram is truncated"));
+        }
+        let session_id = u32::from_be_bytes(input[0..4].try_into().expect("four bytes"));
+        let host_len = u16::from_be_bytes(input[4..6].try_into().expect("two bytes")) as usize;
+        let fixed_end = 6usize
+            .checked_add(host_len)
+            .and_then(|value| value.checked_add(8))
+            .ok_or_else(|| invalid("Hysteria 1 UDP length overflow"))?;
+        if input.len() < fixed_end {
+            return Err(invalid("Hysteria 1 UDP host is truncated"));
+        }
+        let host = std::str::from_utf8(&input[6..6 + host_len])
+            .map_err(|_| invalid("Hysteria 1 UDP host is not UTF-8"))?
+            .to_owned();
+        let offset = 6 + host_len;
+        let port = u16::from_be_bytes(input[offset..offset + 2].try_into().expect("two bytes"));
+        let message_id =
+            u16::from_be_bytes(input[offset + 2..offset + 4].try_into().expect("two bytes"));
+        let fragment_id = input[offset + 4];
+        let fragment_count = input[offset + 5];
+        let data_len =
+            u16::from_be_bytes(input[offset + 6..offset + 8].try_into().expect("two bytes"))
+                as usize;
+        if fragment_count == 0
+            || fragment_id >= fragment_count
+            || (fragment_count > 1 && message_id == 0)
+        {
+            return Err(invalid("Hysteria 1 UDP fragment metadata is invalid"));
+        }
+        if input.len() != fixed_end + data_len {
+            return Err(invalid("Hysteria 1 UDP data length does not match frame"));
+        }
+        Ok(Self {
+            session_id,
+            host,
+            port,
+            message_id,
+            fragment_id,
+            fragment_count,
+            data: input[fixed_end..].to_vec(),
+        })
+    }
+}
+
+#[derive(Default)]
+struct HysteriaDefragger {
+    message_id: u16,
+    fragments: Vec<Option<HysteriaUdpMessage>>,
+    received: usize,
+    size: usize,
+}
+
+impl HysteriaDefragger {
+    fn feed(&mut self, message: HysteriaUdpMessage) -> Option<HysteriaUdpMessage> {
+        if message.fragment_count <= 1 {
+            return Some(message);
+        }
+        if message.message_id != self.message_id
+            || self.fragments.len() != usize::from(message.fragment_count)
+        {
+            self.message_id = message.message_id;
+            self.fragments = vec![None; usize::from(message.fragment_count)];
+            self.received = 0;
+            self.size = 0;
+        }
+        let index = usize::from(message.fragment_id);
+        if self.fragments[index].is_some() {
+            return None;
+        }
+        self.size = self.size.saturating_add(message.data.len());
+        if self.size > MAX_UDP_SIZE {
+            self.fragments.clear();
+            return None;
+        }
+        self.fragments[index] = Some(message);
+        self.received += 1;
+        if self.received != self.fragments.len() {
+            return None;
+        }
+        let mut first = self.fragments[0].take()?;
+        let mut data = Vec::with_capacity(self.size);
+        data.extend_from_slice(&first.data);
+        for fragment in self.fragments.iter_mut().skip(1) {
+            data.extend_from_slice(&fragment.take()?.data);
+        }
+        first.fragment_id = 0;
+        first.fragment_count = 1;
+        first.data = data;
+        self.fragments.clear();
+        self.received = 0;
+        self.size = 0;
+        Some(first)
+    }
 }
 
 #[derive(Debug)]
-struct ServerResponse {
-    ok: bool,
-    msg: String,
+struct HysteriaUdpRouter {
+    connection: quinn::Connection,
+    sessions: Mutex<HashMap<u32, mpsc::Sender<HysteriaUdpMessage>>>,
 }
 
-fn parse_server_hello(buf: &[u8]) -> std::io::Result<ServerHello> {
-    let mut cursor = MsgpackCursor::new(buf);
-    let map_size = cursor.read_map_header()?;
-    let mut ok = false;
-    let mut msg = String::new();
-    for _ in 0..map_size {
-        let key = cursor.read_str()?;
-        match key.as_str() {
-            "ok" => ok = cursor.read_bool()?,
-            "msg" => msg = cursor.read_str()?,
-            _ => cursor.skip()?,
+impl HysteriaUdpRouter {
+    fn new(connection: quinn::Connection) -> Arc<Self> {
+        let router = Arc::new(Self {
+            connection: connection.clone(),
+            sessions: Mutex::new(HashMap::new()),
+        });
+        let weak = Arc::downgrade(&router);
+        tokio::spawn(async move {
+            receive_hysteria_datagrams(connection, weak).await;
+        });
+        router
+    }
+
+    fn open(
+        self: &Arc<Self>,
+        id: u32,
+        control: super::hysteria2::QuinnBiStream,
+    ) -> io::Result<HysteriaUdp> {
+        let (sender, receiver) = mpsc::channel(UDP_QUEUE_PACKETS);
+        let previous = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(id, sender);
+        if previous.is_some() {
+            return Err(invalid("Hysteria 1 server reused an active UDP session ID"));
+        }
+        Ok(HysteriaUdp {
+            router: self.clone(),
+            id,
+            control: AsyncMutex::new(Some(control)),
+            receive: AsyncMutex::new(HysteriaUdpReceive {
+                receiver,
+                defragger: HysteriaDefragger::default(),
+            }),
+            closed: AtomicBool::new(false),
+        })
+    }
+
+    fn remove(&self, id: u32) {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&id);
+    }
+
+    fn dispatch(&self, message: HysteriaUdpMessage) {
+        let sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(sender) = sessions.get(&message.session_id) {
+            let _ = sender.try_send(message);
         }
     }
-    Ok(ServerHello { ok, msg })
+
+    fn close_all(&self) {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
 }
 
-fn parse_server_response(buf: &[u8]) -> std::io::Result<ServerResponse> {
-    let mut cursor = MsgpackCursor::new(buf);
-    let map_size = cursor.read_map_header()?;
-    let mut ok = false;
-    let mut msg = String::new();
-    for _ in 0..map_size {
-        let key = cursor.read_str()?;
-        match key.as_str() {
-            "ok" => ok = cursor.read_bool()?,
-            "msg" => msg = cursor.read_str()?,
-            _ => cursor.skip()?,
-        }
-    }
-    Ok(ServerResponse { ok, msg })
-}
-
-struct MsgpackCursor<'a> {
-    buf: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> MsgpackCursor<'a> {
-    fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
-    }
-
-    fn read_byte(&mut self) -> std::io::Result<u8> {
-        if self.pos >= self.buf.len() {
-            return Err(io_err("msgpack underflow"));
-        }
-        let b = self.buf[self.pos];
-        self.pos += 1;
-        Ok(b)
-    }
-
-    fn read_bytes(&mut self, n: usize) -> std::io::Result<&[u8]> {
-        if self.pos + n > self.buf.len() {
-            return Err(io_err("msgpack bytes underflow"));
-        }
-        let s = &self.buf[self.pos..self.pos + n];
-        self.pos += n;
-        Ok(s)
-    }
-
-    fn read_map_header(&mut self) -> std::io::Result<usize> {
-        let b = self.read_byte()?;
-        if b & 0xf0 == 0x80 {
-            return Ok((b & 0x0f) as usize);
-        }
-        match b {
-            0xde => {
-                let bytes = self.read_bytes(2)?;
-                Ok(u16::from_be_bytes([bytes[0], bytes[1]]) as usize)
+async fn receive_hysteria_datagrams(
+    connection: quinn::Connection,
+    router: Weak<HysteriaUdpRouter>,
+) {
+    loop {
+        match connection.read_datagram().await {
+            Ok(datagram) => {
+                if let Ok(message) = HysteriaUdpMessage::parse(&datagram) {
+                    let Some(router) = router.upgrade() else {
+                        return;
+                    };
+                    router.dispatch(message);
+                }
             }
-            0xdf => {
-                let bytes = self.read_bytes(4)?;
-                Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize)
+            Err(_) => {
+                if let Some(router) = router.upgrade() {
+                    router.close_all();
+                }
+                return;
             }
-            _ => Err(io_err("msgpack expected map")),
         }
     }
+}
 
-    fn read_str(&mut self) -> std::io::Result<String> {
-        let b = self.read_byte()?;
-        let len = if b & 0xe0 == 0xa0 {
-            (b & 0x1f) as usize
-        } else if b == 0xd9 {
-            self.read_byte()? as usize
-        } else if b == 0xda {
-            let bytes = self.read_bytes(2)?;
-            u16::from_be_bytes([bytes[0], bytes[1]]) as usize
-        } else if b == 0xdb {
-            let bytes = self.read_bytes(4)?;
-            u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize
+struct HysteriaUdpReceive {
+    receiver: mpsc::Receiver<HysteriaUdpMessage>,
+    defragger: HysteriaDefragger,
+}
+
+struct HysteriaUdp {
+    router: Arc<HysteriaUdpRouter>,
+    id: u32,
+    control: AsyncMutex<Option<super::hysteria2::QuinnBiStream>>,
+    receive: AsyncMutex<HysteriaUdpReceive>,
+    closed: AtomicBool,
+}
+
+impl HysteriaUdp {
+    fn check_open(&self) -> io::Result<()> {
+        if self.closed.load(Ordering::Acquire) {
+            Err(io::ErrorKind::NotConnected.into())
         } else {
-            return Err(io_err("msgpack expected str"));
-        };
-        let bytes = self.read_bytes(len)?;
-        String::from_utf8(bytes.to_vec()).map_err(|_| io_err("msgpack utf8"))
-    }
-
-    fn read_bool(&mut self) -> std::io::Result<bool> {
-        match self.read_byte()? {
-            0xc2 => Ok(false),
-            0xc3 => Ok(true),
-            _ => Err(io_err("msgpack expected bool")),
+            Ok(())
         }
     }
 
-    fn skip(&mut self) -> std::io::Result<()> {
-        let b = self.read_byte()?;
-        match b {
-            0xc0 | 0xc2 | 0xc3 => Ok(()),
-            0xcc | 0xd0 => {
-                self.read_byte()?;
-                Ok(())
+    fn send_message(&self, message: HysteriaUdpMessage) -> io::Result<()> {
+        match self
+            .router
+            .connection
+            .send_datagram(Bytes::from(message.serialize()?))
+        {
+            Ok(()) => Ok(()),
+            Err(quinn::SendDatagramError::TooLarge) => {
+                let maximum = self
+                    .router
+                    .connection
+                    .max_datagram_size()
+                    .unwrap_or(DEFAULT_DATAGRAM_SIZE);
+                self.send_fragmented(message, maximum)
             }
-            0xcd | 0xd1 => {
-                self.read_bytes(2)?;
-                Ok(())
-            }
-            0xce | 0xd2 => {
-                self.read_bytes(4)?;
-                Ok(())
-            }
-            0xcf | 0xd3 => {
-                self.read_bytes(8)?;
-                Ok(())
-            }
-            _ if b & 0xe0 == 0xa0 => {
-                let len = (b & 0x1f) as usize;
-                self.read_bytes(len)?;
-                Ok(())
-            }
-            _ if b & 0xf0 == 0x80 => {
-                let n = (b & 0x0f) as usize;
-                for _ in 0..n {
-                    self.skip()?;
-                    self.skip()?;
-                }
-                Ok(())
-            }
-            _ if b & 0xf0 == 0x90 => {
-                let n = (b & 0x0f) as usize;
-                for _ in 0..n {
-                    self.skip()?;
-                }
-                Ok(())
-            }
-            0xc4 => {
-                let len = self.read_byte()? as usize;
-                self.read_bytes(len)?;
-                Ok(())
-            }
-            0xc5 => {
-                let bytes = self.read_bytes(2)?;
-                let len = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
-                self.read_bytes(len)?;
-                Ok(())
-            }
-            _ => Err(io_err("msgpack skip unsupported type")),
+            Err(error) => Err(invalid(format!("Hysteria 1 UDP send: {error}"))),
         }
+    }
+
+    fn send_fragmented(&self, mut message: HysteriaUdpMessage, maximum: usize) -> io::Result<()> {
+        let header = message.header_size()?;
+        let payload_max = maximum
+            .checked_sub(header)
+            .filter(|size| *size > 0)
+            .ok_or_else(|| invalid("Hysteria 1 UDP datagram limit is smaller than its header"))?;
+        let count = message.data.len().div_ceil(payload_max);
+        if count == 0 || count > u8::MAX as usize {
+            return Err(invalid("Hysteria 1 UDP packet requires too many fragments"));
+        }
+        message.message_id = rand::rng().random_range(1..=u16::MAX);
+        message.fragment_count = count as u8;
+        let payload = std::mem::take(&mut message.data);
+        for (index, chunk) in payload.chunks(payload_max).enumerate() {
+            let mut fragment = message.clone();
+            fragment.fragment_id = index as u8;
+            fragment.data = chunk.to_vec();
+            self.router
+                .connection
+                .send_datagram(Bytes::from(fragment.serialize()?))
+                .map_err(|error| invalid(format!("Hysteria 1 UDP fragment send: {error}")))?;
+        }
+        Ok(())
     }
 }
 
-/* ---------------- 工具 ---------------- */
+impl Drop for HysteriaUdp {
+    fn drop(&mut self) {
+        self.router.remove(self.id);
+    }
+}
 
-async fn resolve_first(host: &str, port: u16) -> std::io::Result<SocketAddr> {
-    resolve_host(host, port)
+#[async_trait]
+impl UdpSocketLike for HysteriaUdp {
+    async fn send_to(&self, payload: &[u8], target: &str, port: u16) -> io::Result<usize> {
+        self.check_open()?;
+        if payload.is_empty() || payload.len() > MAX_UDP_SIZE {
+            return Err(invalid(format!(
+                "Hysteria 1 UDP payload must be 1..={MAX_UDP_SIZE} bytes"
+            )));
+        }
+        self.send_message(HysteriaUdpMessage {
+            session_id: self.id,
+            host: target.to_owned(),
+            port,
+            message_id: 0,
+            fragment_id: 0,
+            fragment_count: 1,
+            data: payload.to_vec(),
+        })?;
+        Ok(payload.len())
+    }
+
+    async fn recv_from(&self, output: &mut [u8]) -> io::Result<usize> {
+        self.recv_from_endpoint(output)
+            .await
+            .map(|(length, _)| length)
+    }
+
+    async fn recv_from_endpoint(
+        &self,
+        output: &mut [u8],
+    ) -> io::Result<(usize, Option<SocketAddr>)> {
+        self.check_open()?;
+        let mut receive = self.receive.lock().await;
+        loop {
+            let message = receive
+                .receiver
+                .recv()
+                .await
+                .ok_or(io::ErrorKind::UnexpectedEof)?;
+            let Some(message) = receive.defragger.feed(message) else {
+                continue;
+            };
+            if message.data.len() > output.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "Hysteria 1 UDP received {} bytes into {} byte buffer",
+                        message.data.len(),
+                        output.len()
+                    ),
+                ));
+            }
+            output[..message.data.len()].copy_from_slice(&message.data);
+            let source = format_host_port(&message.host, message.port)
+                .parse::<SocketAddr>()
+                .ok();
+            return Ok((message.data.len(), source));
+        }
+    }
+
+    fn supports_multi_target(&self) -> bool {
+        true
+    }
+
+    async fn close(&self) -> io::Result<()> {
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            self.router.remove(self.id);
+            if let Some(mut control) = self.control.lock().await.take() {
+                control.shutdown().await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/* ---------------- official XPlus packet obfuscation ---------------- */
+
+struct XPlusUdp {
+    inner: BoxedUdp,
+    key: Vec<u8>,
+}
+
+impl XPlusUdp {
+    fn new(inner: BoxedUdp, key: Vec<u8>) -> Self {
+        Self { inner, key }
+    }
+
+    fn encode(&self, payload: &[u8]) -> Vec<u8> {
+        let mut salt = [0u8; XPLUS_SALT_SIZE];
+        rand::rng().fill_bytes(&mut salt);
+        xplus_encode_with_salt(&self.key, payload, salt)
+    }
+
+    fn decode(&self, packet: &[u8]) -> io::Result<Vec<u8>> {
+        if packet.len() <= XPLUS_SALT_SIZE {
+            return Err(invalid("Hysteria 1 XPlus packet is truncated"));
+        }
+        let mut salt = [0u8; XPLUS_SALT_SIZE];
+        salt.copy_from_slice(&packet[..XPLUS_SALT_SIZE]);
+        Ok(xplus_xor(&self.key, salt, &packet[XPLUS_SALT_SIZE..]))
+    }
+}
+
+#[async_trait]
+impl UdpSocketLike for XPlusUdp {
+    async fn send_to(&self, payload: &[u8], target: &str, port: u16) -> io::Result<usize> {
+        let encoded = self.encode(payload);
+        self.inner.send_to(&encoded, target, port).await?;
+        Ok(payload.len())
+    }
+
+    async fn recv_from(&self, output: &mut [u8]) -> io::Result<usize> {
+        self.recv_from_endpoint(output)
+            .await
+            .map(|(length, _)| length)
+    }
+
+    async fn recv_from_endpoint(
+        &self,
+        output: &mut [u8],
+    ) -> io::Result<(usize, Option<SocketAddr>)> {
+        let mut packet = vec![0u8; 65_535 + XPLUS_SALT_SIZE];
+        loop {
+            let (length, source) = self.inner.recv_from_endpoint(&mut packet).await?;
+            let Ok(decoded) = self.decode(&packet[..length]) else {
+                continue;
+            };
+            if decoded.len() > output.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Hysteria 1 decoded XPlus packet exceeds receive buffer",
+                ));
+            }
+            output[..decoded.len()].copy_from_slice(&decoded);
+            return Ok((decoded.len(), source));
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
+        self.inner.local_addr()
+    }
+
+    fn supports_multi_target(&self) -> bool {
+        self.inner.supports_multi_target()
+    }
+
+    async fn close(&self) -> io::Result<()> {
+        self.inner.close().await
+    }
+}
+
+fn xplus_encode_with_salt(key: &[u8], payload: &[u8], salt: [u8; XPLUS_SALT_SIZE]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(XPLUS_SALT_SIZE + payload.len());
+    output.extend_from_slice(&salt);
+    output.extend_from_slice(&xplus_xor(key, salt, payload));
+    output
+}
+
+fn xplus_xor(key: &[u8], salt: [u8; XPLUS_SALT_SIZE], payload: &[u8]) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(key);
+    hasher.update(salt);
+    let stream = hasher.finalize();
+    payload
+        .iter()
+        .enumerate()
+        .map(|(index, byte)| byte ^ stream[index % stream.len()])
+        .collect()
+}
+
+fn bandwidth_value(bytes_per_second: u64) -> io::Result<BandwidthValue> {
+    bytes_per_second
+        .checked_mul(8)
+        .map(BandwidthValue::Number)
+        .ok_or_else(|| invalid("Hysteria 1 bandwidth overflows bits per second"))
+}
+
+fn format_host_port(host: &str, port: u16) -> String {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+async fn resolve_first(host: &str, port: u16) -> io::Result<SocketAddr> {
+    crate::adapter::resolve_host(host, port)
         .await?
         .into_iter()
         .next()
-        .ok_or_else(|| io_err("no addr resolved"))
+        .ok_or_else(|| invalid("Hysteria 1 server resolved to no address"))
 }
 
-fn root_store() -> rustls::RootCertStore {
-    let mut store = rustls::RootCertStore::empty();
-    store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    store
-}
-
-#[derive(Debug)]
-struct InsecureVerifier;
-
-impl rustls::client::danger::ServerCertVerifier for InsecureVerifier {
-    fn verify_server_cert(
-        &self,
-        _: &rustls_pki_types::CertificateDer<'_>,
-        _: &[rustls_pki_types::CertificateDer<'_>],
-        _: &rustls_pki_types::ServerName<'_>,
-        _: &[u8],
-        _: rustls_pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-    fn verify_tls12_signature(
-        &self,
-        _: &[u8],
-        _: &rustls_pki_types::CertificateDer<'_>,
-        _: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-    fn verify_tls13_signature(
-        &self,
-        _: &[u8],
-        _: &rustls_pki_types::CertificateDer<'_>,
-        _: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
-
-fn io_err<S: Into<String>>(s: S) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Other, s.into())
+fn invalid(error: impl std::fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
 
 #[cfg(test)]
@@ -531,78 +1148,70 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hysteria_construct() {
-        let ob = HysteriaOutbound::new("h", "1.2.3.4", 443, b"auth".to_vec());
-        assert_eq!(ob.protocol(), "hysteria");
-        assert_eq!(ob.auth, b"auth".to_vec());
+    fn official_client_hello_layout() {
+        let encoded = encode_client_hello(0x0102, 0x0304, b"auth").unwrap();
+        assert_eq!(encoded[0], 3);
+        assert_eq!(&encoded[1..9], &0x0102u64.to_be_bytes());
+        assert_eq!(&encoded[9..17], &0x0304u64.to_be_bytes());
+        assert_eq!(&encoded[17..19], &[0, 4]);
+        assert_eq!(&encoded[19..], b"auth");
     }
 
     #[test]
-    fn encode_client_hello_format() {
-        let buf = encode_client_hello(1024, 2048, b"auth", b"obfs");
-        // fixmap with 4 entries
-        assert_eq!(buf[0], 0x84);
-        // 包含 "send_bps" 字符串
-        assert!(buf.windows(8).any(|w| w == b"send_bps"));
-        assert!(buf.windows(4).any(|w| w == b"auth"));
-        assert!(buf.windows(4).any(|w| w == b"obfs"));
+    fn official_tcp_and_udp_request_layouts() {
+        assert_eq!(
+            encode_client_request(false, "example.com", 443).unwrap(),
+            [
+                0, 0, 11, b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'c', b'o', b'm', 0x01,
+                0xbb
+            ]
+        );
+        assert_eq!(encode_client_request(true, "", 0).unwrap(), [1, 0, 0, 0, 0]);
     }
 
     #[test]
-    fn encode_client_request_tcp() {
-        let buf = encode_client_request("example.com", 443, false);
-        assert_eq!(buf[0], 0x83);
-        assert!(buf.windows(11).any(|w| w == b"example.com"));
+    fn official_udp_golden_vector_round_trips() {
+        let message = HysteriaUdpMessage {
+            // The official server assigns its first UDP association ID as
+            // zero; this is a real wire value rather than a placeholder.
+            session_id: 0,
+            host: "example.com".into(),
+            port: 53,
+            message_id: 0,
+            fragment_id: 0,
+            fragment_count: 1,
+            data: b"abc".to_vec(),
+        };
+        let expected = [
+            0, 0, 0, 0, 0, 11, b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'c', b'o', b'm', 0,
+            53, 0, 0, 0, 1, 0, 3, b'a', b'b', b'c',
+        ];
+        assert_eq!(message.serialize().unwrap(), expected);
+        assert_eq!(HysteriaUdpMessage::parse(&expected).unwrap(), message);
     }
 
     #[test]
-    fn encode_client_request_udp() {
-        let buf = encode_client_request("1.2.3.4", 53, true);
-        assert!(buf.contains(&0xc3)); // true
+    fn xplus_matches_official_sha256_xor_layout() {
+        let salt = [7u8; XPLUS_SALT_SIZE];
+        let encoded = xplus_encode_with_salt(b"password", b"payload", salt);
+        assert_eq!(&encoded[..XPLUS_SALT_SIZE], &salt);
+        assert_eq!(
+            xplus_xor(b"password", salt, &encoded[XPLUS_SALT_SIZE..]),
+            b"payload"
+        );
     }
 
     #[test]
-    fn parse_server_hello_round_trip() {
-        let mut buf = Vec::new();
-        // fixmap 2 entries
-        buf.push(0x82);
-        // "ok": true
-        write_str(&mut buf, "ok");
-        buf.push(0xc3);
-        // "msg": "ready"
-        write_str(&mut buf, "msg");
-        write_str(&mut buf, "ready");
-        let hello = parse_server_hello(&buf).unwrap();
-        assert!(hello.ok);
-        assert_eq!(hello.msg, "ready");
-    }
-
-    #[test]
-    fn parse_server_hello_failure() {
-        let mut buf = Vec::new();
-        buf.push(0x82);
-        write_str(&mut buf, "ok");
-        buf.push(0xc2);
-        write_str(&mut buf, "msg");
-        write_str(&mut buf, "wrong password");
-        let hello = parse_server_hello(&buf).unwrap();
-        assert!(!hello.ok);
-        assert_eq!(hello.msg, "wrong password");
-    }
-
-    #[test]
-    fn msgpack_skip_handles_complex() {
-        let mut buf = Vec::new();
-        buf.push(0x83);
-        write_str(&mut buf, "ok");
-        buf.push(0xc3);
-        // 跳过未知字段 "data" -> u64
-        write_str(&mut buf, "data");
-        write_u64(&mut buf, 12345);
-        write_str(&mut buf, "msg");
-        write_str(&mut buf, "hi");
-        let hello = parse_server_hello(&buf).unwrap();
-        assert!(hello.ok);
-        assert_eq!(hello.msg, "hi");
+    fn fragmented_udp_requires_nonzero_message_id() {
+        let message = HysteriaUdpMessage {
+            session_id: 1,
+            host: "1.1.1.1".into(),
+            port: 53,
+            message_id: 0,
+            fragment_id: 0,
+            fragment_count: 2,
+            data: vec![1],
+        };
+        assert!(message.serialize().is_err());
     }
 }
