@@ -92,10 +92,10 @@ impl SubscriptionUserinfo {
         I: IntoIterator<Item = (&'a str, &'a str)>,
     {
         for (name, value) in headers {
-            if is_userinfo_header_name(name) {
-                if let Some(info) = Self::parse(value) {
-                    return Some(info);
-                }
+            if is_userinfo_header_name(name)
+                && let Some(info) = Self::parse(value)
+            {
+                return Some(info);
             }
         }
         None
@@ -133,7 +133,7 @@ fn eq_ascii_ci(a: &str, b: &str) -> bool {
     a.len() == b.len()
         && a.bytes()
             .zip(b.bytes())
-            .all(|(x, y)| x.to_ascii_lowercase() == y.to_ascii_lowercase())
+            .all(|(x, y)| x.eq_ignore_ascii_case(&y))
 }
 
 #[cfg(test)]

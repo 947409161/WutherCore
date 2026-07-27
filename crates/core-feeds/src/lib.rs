@@ -2,8 +2,10 @@
 //!
 //! §5.3 feeds：负责把远程订阅链接转换为可用的 `ParsedNode` 列表。
 //! 设计要点：
-//! * 格式：Mihomo YAML、Base64 包装的 YAML/URI、纯文本 URI 与 SIP008；
-//!   解码后会再次自动嗅探。
+//! * 格式：WutherCore 原生 YAML/JSON、Mihomo YAML、Base64 包装的结构化
+//!   文档/URI、纯文本 URI 与 SIP008；解码后会再次自动嗅探。
+//! * 原生节点：复用 `core-config` 的强类型 NodeSpec，同时接受紧凑 `type`
+//!   节点；Young 等自有协议不依赖 Mihomo 注册表。
 //! * 抓取：`core-fetch` HTTP/HTTPS、`file://`、本地路径和 inline payload；
 //!   支持请求头、大小上限与 X25519/PQ age 解密。
 //! * 过滤：Mihomo 扩展正则 + keep.name_has / drop.name_has。
@@ -29,5 +31,7 @@ pub use cache::{FeedDiskCache, FeedMeta, url_digest};
 pub use fetcher::{FetchError, FetchResult, fetch_feed, fetch_feed_for_provider};
 #[cfg(feature = "fetch")]
 pub use manager::{FeedManager, FeedSink, FeedStatus, FeedUpdate};
-pub use parser::{FormatHint, apply_filter_rename, parse_feed_payload};
+pub use parser::{
+    FormatHint, ParseError, apply_filter_rename, parse_feed_payload, parse_feed_payload_checked,
+};
 pub use userinfo::SubscriptionUserinfo;

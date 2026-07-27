@@ -23,5 +23,5 @@ pub mod stream_settings;
 pub use error::{ConfigError, ConfigErrorKind, ConfigResult};
 pub use loader::{load_from_path, load_from_str};
 pub use model::*;
-pub use runtime_plan::RuntimePlan;
+pub use runtime_plan::{RuntimePlan, compile_node_spec};
 pub use stream_settings::*;

@@ -18,7 +18,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::{ConfigError, ConfigResult},
     model::*,
-    node_uri::{NodeProtocol, ParsedNode, parse_uri, validate_reality_client_settings},
+    node_uri::{
+        NodeProtocol, ParsedNode, parse_uri, validate_reality_client_settings, validate_young_node,
+    },
     stream_settings::NodeStreamSettings,
 };
 
@@ -1771,7 +1773,7 @@ fn compile_feeds(feeds: &BTreeMap<String, FeedSpec>) -> ConfigResult<BTreeMap<St
             };
             if detail.url.trim().is_empty() && detail.payload.is_empty() {
                 return Err(
-                    ConfigError::invalid("订阅必须配置 url/path 或 inline payload")
+                    ConfigError::invalid("订阅必须配置 url/path 或内联 nodes/payload")
                         .at(format!("feeds.{k}")),
                 );
             }
@@ -1872,10 +1874,7 @@ fn compile_nodes(specs: &[NodeSpec]) -> ConfigResult<Vec<ParsedNode>> {
     let mut out = Vec::with_capacity(specs.len());
     let mut seen = std::collections::HashSet::new();
     for spec in specs {
-        let mut node = match spec {
-            NodeSpec::Uri(u) => parse_uri(u)?,
-            NodeSpec::Detail(d) => detail_to_parsed(d)?,
-        };
+        let mut node = compile_node_spec(spec)?;
         if !seen.insert(node.name.clone()) {
             // 同名节点自动追加序号
             let mut i = 2;
@@ -1892,6 +1891,20 @@ fn compile_nodes(specs: &[NodeSpec]) -> ConfigResult<Vec<ParsedNode>> {
     }
     validate_dialer_proxy_graph(&out)?;
     Ok(out)
+}
+
+/// Compile one native node declaration into the same normalized representation
+/// used by local configuration and subscription feeds.
+///
+/// Keeping this conversion public prevents feed parsers from maintaining a
+/// second, weaker implementation of WutherCore's structured node model.
+pub fn compile_node_spec(spec: &NodeSpec) -> ConfigResult<ParsedNode> {
+    let node = match spec {
+        NodeSpec::Uri(uri) => parse_uri(uri),
+        NodeSpec::Detail(detail) => detail_to_parsed(detail),
+    }?;
+    validate_young_node(&node)?;
+    Ok(node)
 }
 
 fn validate_dialer_proxy_graph(nodes: &[ParsedNode]) -> ConfigResult<()> {

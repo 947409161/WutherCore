@@ -1228,9 +1228,14 @@ pub enum FeedSpec {
 pub struct FeedDetail {
     #[serde(default)]
     pub url: String,
-    /// Mihomo `type: inline` provider payload. When non-empty it is parsed
-    /// directly and no network request is made.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Inline native nodes. Mihomo's `payload` spelling remains accepted;
+    /// `nodes` and `outbounds` make the field independent of provider syntax.
+    #[serde(
+        default,
+        alias = "nodes",
+        alias = "outbounds",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub payload: Vec<serde_yaml::Value>,
     #[serde(default = "default_feed_every", with = "humantime_serde")]
     pub every: Duration,
@@ -1443,9 +1448,11 @@ pub enum NodeSpec {
 #[serde(deny_unknown_fields)]
 pub struct NodeDetail {
     pub name: String,
-    #[serde(default)]
+    #[serde(default, alias = "uri", alias = "url")]
     pub link: Option<String>,
-    #[serde(default)]
+    /// Native subscriptions may use the concise `type` spelling while local
+    /// configuration keeps the more descriptive `protocol` spelling.
+    #[serde(default, alias = "type", alias = "kind")]
     pub protocol: Option<String>,
     #[serde(default)]
     pub address: Option<String>,

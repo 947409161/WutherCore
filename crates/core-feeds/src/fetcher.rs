@@ -5,7 +5,7 @@
 //!
 //! 走 `core_fetch` 而不是 reqwest —— `core_fetch` 内置 hyper + tokio-rustls
 //! + `bind_outbound_socket`，四大平台都能让 TCP 真正绕过 TUN（含 Windows，
-//! reqwest 0.12 没暴露 IP_UNICAST_IF 注入点做不到）。
+//!   reqwest 0.12 没暴露 IP_UNICAST_IF 注入点做不到）。
 
 use std::time::Duration;
 
@@ -106,7 +106,7 @@ pub async fn fetch_feed_for_provider(
     if !detail.payload.is_empty() {
         let mut root = serde_yaml::Mapping::new();
         root.insert(
-            serde_yaml::Value::String("proxies".into()),
+            serde_yaml::Value::String("nodes".into()),
             serde_yaml::Value::Sequence(detail.payload.clone()),
         );
         let bytes = serde_yaml::to_string(&serde_yaml::Value::Mapping(root))
@@ -222,7 +222,7 @@ payload:
             .await
             .unwrap();
         let text = String::from_utf8(result.bytes).unwrap();
-        assert!(text.contains("proxies:"));
+        assert!(text.contains("nodes:"));
         assert!(text.contains("DIRECT"));
     }
 

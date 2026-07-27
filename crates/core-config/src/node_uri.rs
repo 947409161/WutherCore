@@ -337,38 +337,96 @@ fn parse_url_like(uri: &str, proto: NodeProtocol) -> ConfigResult<ParsedNode> {
         }
     }
     if matches!(proto, NodeProtocol::Young) {
-        let key = node
-            .user
-            .as_deref()
-            .ok_or_else(|| ConfigError::bad_node("Young URI 必须在 userinfo 中携带 256 位密钥"))?;
-        core_young::YoungKey::parse_base64url(key)
-            .map_err(|error| ConfigError::bad_node(format!("Young 密钥无效：{error}")))?;
-        if params
-            .get("security")
-            .is_some_and(|security| !security.eq_ignore_ascii_case("tls"))
-        {
-            return Err(ConfigError::bad_node(
-                "Young 固定使用 Neqo QUIC/TLS；security 只能是 tls",
-            ));
-        }
-        let pin = params
-            .get("pin-sha256")
-            .or_else(|| params.get("pin_sha256"))
-            .or_else(|| params.get("pin"))
-            .ok_or_else(|| ConfigError::bad_node("Young URI 缺少 pin-sha256 证书固定值"))?;
-        validate_young_certificate_pin(pin)?;
-        if params
-            .get("path")
-            .is_some_and(|path| !path.starts_with('/') || path.len() > 512)
-        {
-            return Err(ConfigError::bad_node(
-                "Young path 必须以 / 开头且不超过 512 字节",
-            ));
-        }
         node.transport = "webtransport".into();
     }
     node.params = params;
+    validate_young_node(&node)?;
     Ok(node)
+}
+
+/// Validate the executable fields shared by URI, native-subscription and
+/// Mihomo-compatible Young declarations.
+pub fn validate_young_node(node: &ParsedNode) -> ConfigResult<()> {
+    if node.protocol != NodeProtocol::Young {
+        return Ok(());
+    }
+    if node.host.trim().is_empty() || node.port == 0 {
+        return Err(ConfigError::bad_node("Young 节点缺少有效服务器地址或端口"));
+    }
+    if !node.tls
+        || node
+            .params
+            .get("security")
+            .is_some_and(|security| !security.eq_ignore_ascii_case("tls"))
+    {
+        return Err(ConfigError::bad_node(
+            "Young 固定使用 Neqo QUIC/TLS；不能禁用 TLS",
+        ));
+    }
+    let key = node
+        .user
+        .as_deref()
+        .or(node.password.as_deref())
+        .ok_or_else(|| ConfigError::bad_node("Young 节点缺少 256 位 key"))?;
+    core_young::YoungKey::parse_base64url(key)
+        .map_err(|error| ConfigError::bad_node(format!("Young 密钥无效：{error}")))?;
+
+    let pin = node
+        .params
+        .get("pin-sha256")
+        .or_else(|| node.params.get("pin_sha256"))
+        .or_else(|| node.params.get("pin"))
+        .ok_or_else(|| ConfigError::bad_node("Young 节点缺少 pin-sha256 证书固定值"))?;
+    validate_young_certificate_pin(pin)?;
+    if node
+        .params
+        .get("path")
+        .is_some_and(|path| !path.starts_with('/') || path.len() > 512)
+    {
+        return Err(ConfigError::bad_node(
+            "Young path 必须以 / 开头且不超过 512 字节",
+        ));
+    }
+    if node
+        .params
+        .get("authority")
+        .is_some_and(|authority| authority.trim().is_empty())
+    {
+        return Err(ConfigError::bad_node("Young authority 不能为空"));
+    }
+
+    let parse_u16 = |field: &str, default: u16| -> ConfigResult<u16> {
+        match node.params.get(field) {
+            Some(value) => value
+                .parse::<u16>()
+                .map_err(|_| ConfigError::bad_node(format!("Young {field} 必须是有效的 u16 整数"))),
+            None => Ok(default),
+        }
+    };
+    let padding_min = parse_u16("padding-min", 64)?;
+    let padding_max = parse_u16("padding-max", 512)?;
+    if padding_min == 0
+        || padding_min > padding_max
+        || usize::from(padding_max) > core_young::MAX_PADDING_BYTES
+    {
+        return Err(ConfigError::bad_node(
+            "Young padding-min/padding-max 范围无效",
+        ));
+    }
+    for field in ["idle-secs", "max-streams"] {
+        if node.params.get(field).is_some_and(|value| {
+            value
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0)
+                .is_none()
+        }) {
+            return Err(ConfigError::bad_node(format!(
+                "Young {field} 必须是大于 0 的整数"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Hysteria 2 allows a comma/range port set in the URI authority, while

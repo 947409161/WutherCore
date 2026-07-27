@@ -29,7 +29,7 @@ use crate::{
     age::decrypt_provider_payload,
     cache::{FeedDiskCache, FeedMeta, url_digest},
     fetcher::fetch_feed_for_provider,
-    parser::{FormatHint, apply_filter_rename, parse_feed_payload},
+    parser::{FormatHint, apply_filter_rename, parse_feed_payload_checked},
     userinfo::SubscriptionUserinfo,
 };
 
@@ -216,10 +216,10 @@ impl FeedManager {
                 if url_changed {
                     info!(target: "feeds", name = %name, "url changed since last cache; forgetting");
                     cache.forget(&name);
-                } else if let Some(elapsed) = meta.elapsed() {
-                    if elapsed < every {
-                        initial_wait = every - elapsed;
-                    }
+                } else if let Some(elapsed) = meta.elapsed()
+                    && elapsed < every
+                {
+                    initial_wait = every - elapsed;
                 }
                 if self.snapshot(&name).is_none() {
                     let _ = self
@@ -385,20 +385,8 @@ impl FeedManager {
         detail: &FeedDetail,
         timeout: Duration,
     ) -> Result<FeedUpdate, String> {
-        let (raw, userinfo) = match fetch_feed_for_provider(detail, timeout).await {
-            Ok(result) => {
-                if let Some(cache) = &self.cache {
-                    let meta = FeedMeta {
-                        last_refreshed_ms: now_ms(),
-                        raw_size: result.bytes.len() as u64,
-                        etag: result.etag.clone(),
-                        content_type: result.content_type.clone(),
-                        url_hash: Some(url_digest(&detail.url)),
-                    };
-                    cache.save_with_meta(name, &result.bytes, &meta);
-                }
-                (result.bytes, result.userinfo)
-            }
+        let result = match fetch_feed_for_provider(detail, timeout).await {
+            Ok(result) => result,
             Err(e) => {
                 warn!(target: "feeds", name, error = %e, "online fetch failed; trying disk cache");
                 let cache = self
@@ -417,13 +405,26 @@ impl FeedManager {
             }
         };
 
-        let nodes = self.parse_with_filter(detail, &raw)?;
+        // Validate and normalize before replacing the last-known-good cache.
+        // A captive portal, truncated response or malformed subscription must
+        // never poison the snapshot used during the next cold start.
+        let nodes = self.parse_with_filter(detail, &result.bytes)?;
+        if let Some(cache) = &self.cache {
+            let meta = FeedMeta {
+                last_refreshed_ms: now_ms(),
+                raw_size: result.bytes.len() as u64,
+                etag: result.etag.clone(),
+                content_type: result.content_type.clone(),
+                url_hash: Some(url_digest(&detail.url)),
+            };
+            cache.save_with_meta(name, &result.bytes, &meta);
+        }
         Ok(FeedUpdate {
             name: name.to_string(),
             nodes,
             from_cache: false,
-            raw_bytes: raw.len(),
-            userinfo,
+            raw_bytes: result.bytes.len(),
+            userinfo: result.userinfo,
         })
     }
 
@@ -440,7 +441,8 @@ impl FeedManager {
             }
             None => raw.to_vec(),
         };
-        let parsed = parse_feed_payload(&plaintext, FormatHint::Auto);
+        let parsed = parse_feed_payload_checked(&plaintext, FormatHint::Auto)
+            .map_err(|error| format!("订阅解析失败: {error}"))?;
         let mut nodes = apply_filter_rename(detail, parsed);
         let before = nodes.len();
         nodes.retain(|node| {
@@ -539,6 +541,30 @@ mod tests {
         assert!(update.from_cache);
         assert_eq!(update.nodes.len(), 1);
         assert_eq!(update.nodes[0].name, "FromCache");
+    }
+
+    #[tokio::test]
+    async fn invalid_fresh_body_does_not_poison_last_good_cache() {
+        let dir = tmp_root();
+        let cache = FeedDiskCache::new(&dir).unwrap();
+        let valid = b"ss://YWVzLTI1Ni1nY206cGFzcw==@1.1.1.1:8388#LastGood";
+        cache.save("airport", valid);
+        let source = dir.join("invalid-subscription.txt");
+        std::fs::write(&source, b"captive portal response").unwrap();
+
+        let mgr = FeedManager::new(BTreeMap::new(), Some(cache.clone()));
+        let error = mgr
+            .refresh_once(
+                "airport",
+                &detail(source.to_str().unwrap(), 3600),
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("订阅解析失败"), "{error}");
+        assert_eq!(cache.load("airport").as_deref(), Some(valid.as_slice()));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

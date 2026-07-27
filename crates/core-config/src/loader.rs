@@ -115,6 +115,40 @@ feeds:
     }
 
     #[test]
+    fn feed_accepts_native_inline_nodes_alias() {
+        let yaml = r#"
+version: 1
+profile: desktop
+feeds:
+  local:
+    nodes:
+      - {name: DIRECT, type: direct}
+      - {name: BLOCK, type: reject}
+"#;
+        let plan = load_from_str(yaml).unwrap();
+        assert_eq!(plan.feeds["local"].payload.len(), 2);
+        assert!(plan.feeds["local"].url.is_empty());
+    }
+
+    #[test]
+    fn structured_node_accepts_type_as_protocol_alias() {
+        let yaml = r#"
+version: 1
+profile: desktop
+nodes:
+  - name: local
+    type: socks5
+    address: 127.0.0.1:1080
+"#;
+        let plan = load_from_str(yaml).unwrap();
+        assert_eq!(plan.nodes.len(), 1);
+        assert_eq!(
+            plan.nodes[0].protocol,
+            crate::node_uri::NodeProtocol::Socks5
+        );
+    }
+
+    #[test]
     fn unknown_group_use_yields_friendly_error() {
         let yaml = r#"
 version: 1
