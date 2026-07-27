@@ -4,7 +4,7 @@
 //!
 //! | 场景 | 路径 | 命中范围 | 备注 |
 //! |------|------|----------|------|
-//! | **root**（getuid==0） | `/proc/net/*` + `/proc/<pid>/fd/*` | 全部进程 | 完全等价 Linux finder |
+//! | **root**（getuid==0） | `/proc/net/*` + `/proc/<pid>/fd/*` → UID；Binder `package` service → package names | 全部进程 | 无需 JavaVM/Context |
 //! | **非 root，自己进程的连接** | `/proc/net/*`（仅显示同 UID 行） | 仅本进程 | Android 7+ 内核过滤 |
 //! | **非 root，别 app 连接** | JNI → `ConnectivityManager.getConnectionOwnerUid` | API 29+ 全部 | 需要 [`set_jni_bridge`] 注入过 Context |
 //!
@@ -23,13 +23,15 @@
 //! }
 //! ```
 //!
-//! 没注入桥时，`AndroidFinder` 只会跑 `/proc` 路径 —— root 用户全开，
-//! 普通用户只能命中自己进程的 socket。
+//! 没注入桥时，root 仍会通过 kernel Binder 的 `package` service 将 UID
+//! 解析为全部关联包名；普通用户只能保证命中自己进程的 socket。
 //!
 //! ## 选型理由
 //!
-//! - 用 `jni` crate（mainstream，0.21，与 `core-capture::platform::android_jni`
+//! - 用 `jni` crate（mainstream，0.22，与 `core-capture::platform::android_jni`
 //!   同版本），不靠 NDK linker hack；
+//! - 纯 native root 模式用 `rsbinder` + `rsbinder-aidl` 的 typed proxy，
+//!   不解析 `/data/system/packages.xml`，不执行/解析 `cmd package`；
 //! - 用 `getConnectionOwnerUid` (API 29) 而非 netlink/`SOCK_DIAG_BY_FAMILY`：
 //!   后者要 `CAP_NET_ADMIN`，VpnService app 拿不到；
 //! - 用 `InetAddress.getByAddress(byte[])` 而非 `InetSocketAddress(String, int)`：
@@ -39,13 +41,33 @@
 
 use std::{net::IpAddr, sync::Arc};
 
+use caps::{CapSet, Capability};
 use jni::{
     Env, JavaVM, jni_sig, jni_str,
     objects::{Global, JByteArray, JObject, JObjectArray, JString, JValue},
 };
 use once_cell::sync::OnceCell;
+use rsbinder::{FromIBinder, ProcessState, Strong};
 
 use crate::{NetworkProto, ProcessFinder, ProcessInfo, linux::LinuxFinder};
+
+// IPackageManager is a hidden, non-stable AIDL interface. AOSP changed the
+// transaction ordinal in Android 11 and 12, so each generated proxy carries
+// the exact ordinal for that platform generation while keeping the canonical
+// `android.content.pm.IPackageManager` interface descriptor.
+mod package_manager_api29 {
+    rsbinder::include_aidl!("package_manager_api29");
+}
+mod package_manager_api30 {
+    rsbinder::include_aidl!("package_manager_api30");
+}
+mod package_manager_api31 {
+    rsbinder::include_aidl!("package_manager_api31");
+}
+
+use package_manager_api29::android::content::pm::IPackageManager as pm29;
+use package_manager_api30::android::content::pm::IPackageManager as pm30;
+use package_manager_api31::android::content::pm::IPackageManager as pm31;
 
 /// `ConnectivityManager.getConnectionOwnerUid` 找不到时返回的 sentinel。
 const INVALID_UID: i32 = -1;
@@ -64,6 +86,14 @@ struct JniBridge {
 }
 
 static JNI_BRIDGE: OnceCell<Arc<JniBridge>> = OnceCell::new();
+
+enum NativePackageService {
+    Api29(Strong<dyn pm29::IPackageManager>),
+    Api30(Strong<dyn pm30::IPackageManager>),
+    Api31Plus(Strong<dyn pm31::IPackageManager>),
+}
+
+static NATIVE_PACKAGE_SERVICE: OnceCell<NativePackageService> = OnceCell::new();
 
 /// 注册 Android JNI 桥。`context` 必须是 `android.content.Context`
 /// （通常是 `Application` 或 `VpnService`）。第一次注册成功后 `OnceCell` 锁定，
@@ -123,21 +153,26 @@ pub fn jni_bridge_ready() -> bool {
 
 #[derive(Debug, Clone, Copy)]
 pub struct AndroidFinder {
-    /// 进程是否以 uid=0 运行。root 时 `/proc` 全开 —— 与 Linux 完全一致；
-    /// 非 root 时 `/proc` 只看得到自家 UID 的连接，跨 app 必须靠 JNI。
-    is_root: bool,
+    /// uid=0 或 effective CAP_NET_ADMIN。特权进程可读取跨 UID socket 信息；
+    /// 普通 app 的跨进程连接必须靠 JNI ConnectivityManager。
+    privileged: bool,
 }
 
 impl AndroidFinder {
     pub fn new() -> Self {
         let is_root = unsafe { libc::getuid() } == 0;
-        if is_root {
+        let has_net_admin =
+            caps::has_cap(None, CapSet::Effective, Capability::CAP_NET_ADMIN).unwrap_or(false);
+        let privileged = is_root || has_net_admin;
+        if privileged {
             tracing::info!(
                 target: "core-process::android",
-                "running as root → /proc 全开，process lookup 无需 JNI 桥"
+                is_root,
+                has_net_admin,
+                "Android privileged process lookup enabled"
             );
         }
-        Self { is_root }
+        Self { privileged }
     }
 }
 
@@ -150,7 +185,7 @@ impl Default for AndroidFinder {
 impl ProcessFinder for AndroidFinder {
     fn find(&self, proto: NetworkProto, src_ip: IpAddr, src_port: u16) -> Option<ProcessInfo> {
         let mut info = LinuxFinder::new().find(proto, src_ip, src_port)?;
-        populate_packages(&mut info);
+        populate_packages(&mut info, self.privileged);
         Some(info)
     }
 
@@ -166,11 +201,11 @@ impl ProcessFinder for AndroidFinder {
         if let Some(mut info) =
             LinuxFinder::new().find_with_dst(proto, src_ip, src_port, dst_ip, dst_port)
         {
-            populate_packages(&mut info);
+            populate_packages(&mut info, self.privileged);
             return Some(info);
         }
         // 2) 非 root + 别 app socket → JNI ConnectivityManager
-        if self.is_root {
+        if self.privileged {
             return None; // root 已在 /proc 兜底；JNI 走不到这里
         }
         let bridge = JNI_BRIDGE.get()?.clone();
@@ -277,18 +312,82 @@ fn make_inet_socket_addr<'local>(
     Ok(sock)
 }
 
-fn populate_packages(info: &mut ProcessInfo) {
-    let Some(bridge) = JNI_BRIDGE.get() else {
+fn populate_packages(info: &mut ProcessInfo, is_root: bool) {
+    let packages = if let Some(bridge) = JNI_BRIDGE.get() {
+        bridge
+            .vm
+            .attach_current_thread(|env| {
+                jni_packages_for_uid(env, &bridge.package_manager, info.uid)
+            })
+            .map_err(|error| format!("PackageManager JNI: {error}"))
+    } else if is_root {
+        native_packages_for_uid(info.uid)
+    } else {
         return;
     };
-    if let Ok(packages) = bridge
-        .vm
-        .attach_current_thread(|env| jni_packages_for_uid(env, &bridge.package_manager, info.uid))
-    {
-        if let Some(package) = packages.first() {
-            info.name = package.clone();
+
+    match packages {
+        Ok(packages) => {
+            if let Some(package) = packages.first() {
+                info.name = package.clone();
+            }
+            info.package_names = packages;
         }
-        info.package_names = packages;
+        Err(error) => {
+            tracing::debug!(
+                target: "core-process::android",
+                uid = info.uid,
+                %error,
+                "failed to resolve Android packages for UID"
+            );
+        }
+    }
+}
+
+/// Resolve package names in a pure native root process.
+///
+/// The kernel socket tables produce the owning Linux UID. Android's package
+/// service is then queried through Binder, using the AOSP AIDL contract for
+/// the running SDK. The service proxy is cached process-wide; only the method
+/// transaction is performed for subsequent lookups.
+fn native_packages_for_uid(uid: u32) -> Result<Vec<String>, String> {
+    let service = NATIVE_PACKAGE_SERVICE.get_or_try_init(connect_native_package_service)?;
+    let mut packages = match service {
+        NativePackageService::Api29(service) => service
+            .getPackagesForUid(uid as i32)
+            .map_err(|error| format!("IPackageManager API 29: {error}"))?,
+        NativePackageService::Api30(service) => service
+            .getPackagesForUid(uid as i32)
+            .map_err(|error| format!("IPackageManager API 30: {error}"))?,
+        NativePackageService::Api31Plus(service) => service
+            .getPackagesForUid(uid as i32)
+            .map_err(|error| format!("IPackageManager API 31+: {error}"))?,
+    };
+    packages.retain(|package| !package.is_empty());
+    packages.sort_unstable();
+    packages.dedup();
+    Ok(packages)
+}
+
+fn connect_native_package_service() -> Result<NativePackageService, String> {
+    ProcessState::init_default().map_err(|error| format!("initialize /dev/binder: {error}"))?;
+    let binder = rsbinder::hub::try_get_service("package")
+        .map_err(|error| format!("lookup Binder package service: {error}"))?
+        .ok_or_else(|| "Binder package service is not registered".to_owned())?;
+
+    match rsbinder::get_android_sdk_version() {
+        29 => <dyn pm29::IPackageManager as FromIBinder>::try_from(binder)
+            .map(NativePackageService::Api29)
+            .map_err(|error| format!("cast API 29 IPackageManager: {error}")),
+        30 => <dyn pm30::IPackageManager as FromIBinder>::try_from(binder)
+            .map(NativePackageService::Api30)
+            .map_err(|error| format!("cast API 30 IPackageManager: {error}")),
+        31..=37 => <dyn pm31::IPackageManager as FromIBinder>::try_from(binder)
+            .map(NativePackageService::Api31Plus)
+            .map_err(|error| format!("cast API 31+ IPackageManager: {error}")),
+        sdk => Err(format!(
+            "unsupported Android SDK {sdk}; native Binder package lookup supports API 29-37"
+        )),
     }
 }
 

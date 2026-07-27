@@ -20,5 +20,15 @@ sysinfo = { version = "0.38.4", default-features = false, features = ["system"] 
 # JNI 桥 —— 调 ConnectivityManager.getConnectionOwnerUid 反查跨 UID 连接。
 # 与 core-capture 的 android_jni 同版本，避免 JavaVM 类型不一致。
 jni = "0.22"
+# 纯 native root 守护进程没有 JavaVM：通过 Android kernel Binder 直接调用
+# package service。启用 10+ 覆盖 API 29–37 的 ServiceManager wire format。
+rsbinder = { version = "0.10.0", default-features = false, features = ["android_10_plus"] }
+# 读取 effective Linux capabilities；Android 的 native daemon 可能以非 0 UID
+# 携带 CAP_NET_ADMIN 运行，不能只靠 getuid()==0 判断特权路径。
+caps = "0.5.6"
 parking_lot = { workspace = true }
 libc = "0.2"
+
+[build-dependencies]
+# 从 AOSP AIDL 签名生成 typed Binder proxy，避免手写 Parcel / transaction。
+rsbinder-aidl = "0.10.0"
