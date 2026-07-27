@@ -655,7 +655,12 @@ impl CaptureSupervisor {
         transaction.resources_mut().outbound_fwmark =
             OutboundFwmarkLease::install(runtime.capture_outbound_fwmark())?;
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        if self.plan.kind != EngineKind::Tun {
+        if self.plan.kind != EngineKind::Tun
+            && (!cfg!(test)
+                || self.plan.auto_route
+                || self.plan.auto_redirect
+                || self.plan.strict_route)
+        {
             transaction.resources_mut().crash_recovery = Some(
                 crate::platform::linux_recovery::LinuxCaptureGuard::acquire(&self.plan)?,
             );
@@ -1485,17 +1490,19 @@ route:
         let sup = lifecycle_supervisor(engine.clone());
         let runtime = lifecycle_runtime();
 
-        let start_task = {
+        let mut start_task = {
             let sup = sup.clone();
             let runtime = runtime.clone();
             tokio::spawn(async move { sup.start(runtime).await })
         };
-        engine
-            .entered
-            .acquire()
-            .await
-            .expect("start entry semaphore")
-            .forget();
+        tokio::select! {
+            permit = engine.entered.acquire() => {
+                permit.expect("start entry semaphore").forget();
+            }
+            result = &mut start_task => {
+                panic!("start ended before reaching the engine: {result:?}");
+            }
+        }
         start_task.abort();
         let _ = start_task.await;
 
@@ -1531,8 +1538,10 @@ route:
         fn new(block_start_once: bool) -> Self {
             let mut plan = CapturePlan::from_config(&capture()).unwrap();
             // Lifecycle tests exercise supervisor ownership and rollback only;
-            // TUN dispatcher readiness is covered separately below.
+            // TUN dispatcher readiness and privileged route cleanup are covered
+            // separately below.
             plan.kind = EngineKind::Tproxy;
+            plan.auto_route = false;
             Self {
                 plan,
                 starts: AtomicUsize::new(0),
