@@ -1129,9 +1129,14 @@ fn raw_setsockopt_int(sock: &Socket, level: i32, opt: i32, value: i32) -> std::i
     raw_setsockopt_bytes(sock, level, opt, &value.to_ne_bytes())
 }
 
-#[cfg(any(windows, target_os = "macos", target_os = "ios"))]
+#[cfg(windows)]
 fn raw_setsockopt_u32(sock: &Socket, level: i32, opt: i32, value: u32) -> std::io::Result<()> {
     raw_setsockopt_bytes(sock, level, opt, &value.to_ne_bytes())
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn raw_setsockopt_u32(sock: &Socket, level: i32, opt: i32, value: u32) -> std::io::Result<()> {
+    raw_setsockopt_int(sock, level, opt, value as i32)
 }
 
 #[cfg(unix)]
