@@ -1,0 +1,50 @@
+name: Setup Firefox Neqo build tools
+description: Install only the native tools missing from the current runner image.
+
+runs:
+  using: composite
+  steps:
+    - name: Ensure Linux tools
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        set -euo pipefail
+        declare -A packages=(
+          [clang]=clang
+          [gyp]=gyp
+          [hg]=mercurial
+          [ninja]=ninja-build
+          [pkg-config]=pkg-config
+        )
+        missing=()
+        for command in "${!packages[@]}"; do
+          command -v "$command" >/dev/null 2>&1 || missing+=("${packages[$command]}")
+        done
+        if ((${#missing[@]})); then
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y "${missing[@]}"
+        fi
+
+    - name: Ensure macOS tools
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        set -euo pipefail
+        if ! command -v hg >/dev/null 2>&1; then
+          brew install mercurial
+        fi
+        if ! command -v ninja >/dev/null 2>&1; then
+          brew install ninja
+        fi
+
+    - name: Ensure Windows tools
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        if (-not (Get-Command hg -ErrorAction SilentlyContinue)) {
+          choco install mercurial --yes --no-progress
+        }
+        if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+          choco install ninja --yes --no-progress
+        }

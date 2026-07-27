@@ -192,6 +192,14 @@ jobs:
           read -r -a packages <<< "$PACKAGES"
           sudo apt-get install --no-install-recommends -y "${packages[@]}"
 
+      - name: Ensure Firefox Neqo build tools
+        if: >-
+          (needs.prepare.outputs.tags == '' && matrix.platform.default-tags == 'standard') ||
+          contains(format(',{0},', needs.prepare.outputs.tags), ',with_young,') ||
+          contains(format(',{0},', needs.prepare.outputs.tags), ',standard,') ||
+          contains(format(',{0},', needs.prepare.outputs.tags), ',all_components,')
+        uses: ./.github/actions/setup-neqo
+
       - name: Setup cached Rust
         uses: ./.github/actions/setup-rust
         with:
@@ -391,6 +399,14 @@ jobs:
           targets: ${{ matrix.platform.target }}
           cache-targets: true
 
+      - name: Ensure Firefox Neqo build tools
+        if: >-
+          needs.prepare.outputs.tags == '' ||
+          contains(format(',{0},', needs.prepare.outputs.tags), ',with_young,') ||
+          contains(format(',{0},', needs.prepare.outputs.tags), ',standard,') ||
+          contains(format(',{0},', needs.prepare.outputs.tags), ',all_components,')
+        uses: ./.github/actions/setup-neqo
+
       - name: Build Windows binary
         shell: bash
         env:
@@ -466,6 +482,14 @@ jobs:
           cache-key: build-${{ matrix.platform.target }}-${{ needs.prepare.outputs.tag-key }}
           targets: ${{ matrix.platform.target }}
           cache-targets: true
+
+      - name: Ensure Firefox Neqo build tools
+        if: >-
+          needs.prepare.outputs.tags == '' ||
+          contains(format(',{0},', needs.prepare.outputs.tags), ',with_young,') ||
+          contains(format(',{0},', needs.prepare.outputs.tags), ',standard,') ||
+          contains(format(',{0},', needs.prepare.outputs.tags), ',all_components,')
+        uses: ./.github/actions/setup-neqo
 
       - name: Build macOS binary
         shell: bash
