@@ -8,7 +8,7 @@
 | --- | --- | --- |
 | Friendly YAML | 已实现 | Profile 默认值、显式覆盖、`check` 与 `explain` |
 | Mixed 入站 | 已实现 | 一个监听端口同时接受 HTTP 和 SOCKS5 |
-| 订阅管理 | 已实现 | 拉取、缓存、解析、过滤、重命名与去重 |
+| 订阅管理 | 已实现 | HTTP/文件/内联、Age 解密、Mihomo 26 类节点解析、扩展正则过滤、重命名与去重 |
 | 外部规则集 | 已实现 | Mihomo YAML/文本/MRS v1、sing-box JSON/SRS v1–v5、内联 Payload、RRS |
 | 路由匹配 | 已实现 | 域名、IP、端口、进程、规则集与嗅探信息 |
 | 策略组 | 已实现 | Manual、Load Balance、URLTest、Smart |
@@ -56,6 +56,8 @@ WireGuard 的字段、约束和完整示例见 [WireGuard 配置](WIREGUARD.md)�
 - Mihomo/Clash 风格节点；
 - 配置迁移生成的节点；
 - 运行时订阅更新。
+
+Mihomo provider 的格式、Age 密钥、请求头、过滤语义和协议边界见 [Mihomo 订阅与代理提供者](FEEDS.md)。
 
 规则集运行时支持 Mihomo YAML/文本/MRS v1、sing-box JSON/SRS v1–v5 和 WutherCore RRS。二进制输入会先经过有界解压与结构校验，再编译为与文本规则共用的 matcher。
 

@@ -19,9 +19,16 @@ pub enum FormatHint {
 
 /// 主入口：尝试自动嗅探格式并解析为节点列表。
 pub fn parse_feed_payload(raw: &[u8], hint: FormatHint) -> Vec<ParsedNode> {
+    parse_feed_payload_inner(raw, hint, 0)
+}
+
+fn parse_feed_payload_inner(raw: &[u8], hint: FormatHint, depth: u8) -> Vec<ParsedNode> {
+    if depth > 2 {
+        return Vec::new();
+    }
     // 先尝试 UTF-8。订阅几乎都是文本。
-    let text = String::from_utf8_lossy(raw).into_owned();
-    let trimmed = text.trim();
+    let text = String::from_utf8_lossy(raw);
+    let trimmed = text.trim_start_matches('\u{feff}').trim();
 
     let actual = match hint {
         FormatHint::Auto => sniff(trimmed),
@@ -30,7 +37,7 @@ pub fn parse_feed_payload(raw: &[u8], hint: FormatHint) -> Vec<ParsedNode> {
     debug!(target: "feeds::parser", ?actual, len = trimmed.len(), "parse feed");
 
     let mut nodes = match actual {
-        FormatHint::Base64 => parse_base64(trimmed),
+        FormatHint::Base64 => parse_base64(trimmed, depth),
         FormatHint::ClashYaml => parse_clash_yaml(trimmed),
         FormatHint::PlainUri => parse_plain(trimmed),
         FormatHint::Sip008 => parse_sip008(trimmed),
@@ -78,35 +85,40 @@ fn parse_plain(s: &str) -> Vec<ParsedNode> {
         .collect()
 }
 
-fn parse_base64(s: &str) -> Vec<ParsedNode> {
-    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+fn parse_base64(s: &str, depth: u8) -> Vec<ParsedNode> {
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
     let cleaned = s.replace(['\n', '\r', ' '], "");
-    let decoded = URL_SAFE_NO_PAD
-        .decode(cleaned.trim_end_matches('='))
-        .ok()
-        .or_else(|| STANDARD.decode(&cleaned).ok());
-    match decoded {
-        Some(bytes) => parse_plain(&String::from_utf8_lossy(&bytes)),
-        None => Vec::new(),
+    for engine in [&STANDARD, &STANDARD_NO_PAD, &URL_SAFE, &URL_SAFE_NO_PAD] {
+        if let Ok(bytes) = engine.decode(&cleaned) {
+            let nodes = parse_feed_payload_inner(&bytes, FormatHint::Auto, depth + 1);
+            if !nodes.is_empty() {
+                return nodes;
+            }
+        }
     }
-}
-
-#[derive(Deserialize)]
-struct ClashRoot {
-    #[serde(default)]
-    proxies: Vec<serde_yaml::Value>,
+    Vec::new()
 }
 
 fn parse_clash_yaml(s: &str) -> Vec<ParsedNode> {
-    let root: ClashRoot = match serde_yaml::from_str(s) {
+    let root: serde_yaml::Value = match serde_yaml::from_str(s) {
         Ok(v) => v,
         Err(e) => {
             warn!(target: "feeds::parser", error = %e, "clash yaml parse failed");
             return Vec::new();
         }
     };
-    let mut out = Vec::with_capacity(root.proxies.len());
-    for v in root.proxies {
+    let proxies = match root {
+        serde_yaml::Value::Mapping(map) => map
+            .get(serde_yaml::Value::String("proxies".into()))
+            .or_else(|| map.get(serde_yaml::Value::String("payload".into())))
+            .and_then(serde_yaml::Value::as_sequence)
+            .cloned()
+            .unwrap_or_default(),
+        serde_yaml::Value::Sequence(values) => values,
+        _ => Vec::new(),
+    };
+    let mut out = Vec::with_capacity(proxies.len());
+    for v in proxies {
         let map = match v.as_mapping() {
             Some(m) => m,
             None => continue,
@@ -121,20 +133,86 @@ fn parse_clash_yaml(s: &str) -> Vec<ParsedNode> {
 fn clash_proxy_to_node(m: &serde_yaml::Mapping) -> Option<ParsedNode> {
     let g = |k: &str| m.get(&serde_yaml::Value::String(k.into())).cloned();
     let str_g = |k: &str| g(k).and_then(|v| v.as_str().map(String::from));
-    let u64_g = |k: &str| {
+    let u16_g = |k: &str| {
         g(k).and_then(|v| {
             v.as_u64()
                 .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                .and_then(|port| u16::try_from(port).ok())
+                .filter(|port| *port != 0)
         })
     };
 
     let name = str_g("name")?;
-    let kind = str_g("type")?;
-    let host = str_g("server")?;
-    let port = u64_g("port")? as u16;
+    let kind = str_g("type")?.to_ascii_lowercase();
+    let proto = match kind.as_str() {
+        "reject" => NodeProtocol::Block,
+        other => NodeProtocol::from_scheme(other),
+    };
+    let endpoint_optional = matches!(
+        kind.as_str(),
+        "direct" | "dns" | "reject" | "rematch" | "tailscale"
+    );
+    let mut host = str_g("server").unwrap_or_default();
+    let mut port = u16_g("port");
 
-    let proto = NodeProtocol::from_scheme(&kind);
+    // Mihomo lets Hysteria use a hopping range, and Mieru use `port-range`.
+    // ParsedNode still needs one primary endpoint, so select the first port
+    // while preserving the complete range below in `params`.
+    if port.is_none() {
+        port = ["ports", "port-range"]
+            .into_iter()
+            .find_map(|key| str_g(key).as_deref().and_then(first_port));
+    }
+
+    // Modern WireGuard providers may define only `peers`. Use the first peer
+    // as the legacy primary endpoint without dropping the full peer list.
+    if matches!(&proto, NodeProtocol::Wireguard)
+        && (host.is_empty() || port.is_none())
+        && let Some(peer) = g("peers")
+            .and_then(|value| value.as_sequence().cloned())
+            .and_then(|peers| peers.into_iter().next())
+            .and_then(|peer| peer.as_mapping().cloned())
+    {
+        if host.is_empty() {
+            host = peer
+                .get(serde_yaml::Value::String("server".into()))
+                .and_then(serde_yaml::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+        }
+        if port.is_none() {
+            port = peer
+                .get(serde_yaml::Value::String("port".into()))
+                .and_then(|value| {
+                    value
+                        .as_u64()
+                        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+                })
+                .and_then(|value| u16::try_from(value).ok())
+                .filter(|value| *value != 0);
+        }
+    }
+
+    if !endpoint_optional && (host.is_empty() || port.is_none()) {
+        debug!(
+            target: "feeds::parser",
+            %name,
+            %kind,
+            "skip mihomo node without a valid endpoint"
+        );
+        return None;
+    }
+    if host.is_empty() {
+        host = "0.0.0.0".into();
+    }
+    let port = port.unwrap_or(0);
+
     let mut node = ParsedNode::new(name, proto.clone(), host, port);
+    node.raw = serde_yaml::to_string(&serde_yaml::Value::Mapping(m.clone())).unwrap_or_default();
+    node.params.insert("mihomo-type".into(), kind.clone());
+    if let Ok(json) = serde_json::to_string(&serde_yaml::Value::Mapping(m.clone())) {
+        node.params.insert("mihomo-raw".into(), json);
+    }
     node.user = str_g("username").or_else(|| str_g("user"));
     node.password = str_g("password");
     node.uuid = str_g("uuid");
@@ -164,7 +242,8 @@ fn clash_proxy_to_node(m: &serde_yaml::Mapping) -> Option<ParsedNode> {
     证书校验会用真实服务端 cert 失败（用户实际遭遇）。
     ============================================================ */
 
-    // 1. 全部顶层标量
+    // 1. 全部顶层字段。标量保持原形；映射与数组编码为 JSON，使任何
+    // Mihomo 新增字段都不会在 ParsedNode 兼容层里静默丢失。
     for (k, v) in m.iter() {
         let Some(key) = k.as_str() else { continue };
         if matches!(
@@ -190,6 +269,8 @@ fn clash_proxy_to_node(m: &serde_yaml::Mapping) -> Option<ParsedNode> {
         }
         if let Some(s) = scalar_to_string(v) {
             node.params.insert(key.to_string(), s);
+        } else if let Ok(json) = serde_json::to_string(v) {
+            node.params.insert(key.to_string(), json);
         }
     }
 
@@ -328,6 +409,15 @@ fn scalar_to_string(v: &serde_yaml::Value) -> Option<String> {
     }
 }
 
+fn first_port(value: &str) -> Option<u16> {
+    value
+        .split([',', '-'])
+        .map(str::trim)
+        .find(|part| !part.is_empty())
+        .and_then(|part| part.parse::<u16>().ok())
+        .filter(|port| *port != 0)
+}
+
 /// 把 `parent.{key1, key2, ...}` 子映射展开到 params；可选加前缀。
 fn flatten_transport_opts(
     m: &serde_yaml::Mapping,
@@ -391,6 +481,40 @@ fn parse_sip008(s: &str) -> Vec<ParsedNode> {
 /* ---------------- 过滤 / 重命名 ---------------- */
 
 pub fn apply_filter_rename(detail: &FeedDetail, mut nodes: Vec<ParsedNode>) -> Vec<ParsedNode> {
+    // Mihomo provider regex syntax allows look-around and splits multiple
+    // expressions with a backtick. `fancy_regex` covers those constructs.
+    let include = compile_provider_regexes(detail.filter.as_deref(), "filter");
+    let exclude = compile_provider_regexes(detail.exclude_filter.as_deref(), "exclude-filter");
+    let excluded_types = detail
+        .exclude_type
+        .as_deref()
+        .unwrap_or_default()
+        .split('|')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<std::collections::HashSet<_>>();
+    nodes.retain(|node| {
+        let protocol = node
+            .params
+            .get("mihomo-type")
+            .map(String::as_str)
+            .unwrap_or_else(|| node.protocol.as_str());
+        if excluded_types.contains(&protocol.to_ascii_lowercase()) {
+            return false;
+        }
+        if exclude
+            .iter()
+            .any(|regex| regex.is_match(&node.name).unwrap_or(false))
+        {
+            return false;
+        }
+        include.is_empty()
+            || include
+                .iter()
+                .any(|regex| regex.is_match(&node.name).unwrap_or(false))
+    });
+
     // drop 优先级 > keep
     if !detail.drop.name_has.is_empty() {
         let drops = detail.drop.name_has.clone();
@@ -424,6 +548,28 @@ pub fn apply_filter_rename(detail: &FeedDetail, mut nodes: Vec<ParsedNode>) -> V
     nodes
 }
 
+fn compile_provider_regexes(value: Option<&str>, field: &str) -> Vec<fancy_regex::Regex> {
+    value
+        .unwrap_or_default()
+        .split('`')
+        .map(str::trim)
+        .filter(|pattern| !pattern.is_empty())
+        .filter_map(|pattern| match fancy_regex::Regex::new(pattern) {
+            Ok(regex) => Some(regex),
+            Err(error) => {
+                warn!(
+                    target: "feeds::parser",
+                    field,
+                    pattern,
+                    %error,
+                    "ignore invalid provider regex"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -435,11 +581,18 @@ mod tests {
     fn detail() -> FeedDetail {
         FeedDetail {
             url: String::new(),
+            payload: Vec::new(),
             every: Duration::from_secs(3600),
             via: "direct".into(),
             keep: FeedFilter::default(),
             drop: FeedFilter::default(),
             rename: FeedRename::default(),
+            age_secret_key: None,
+            size_limit: None,
+            headers: Default::default(),
+            filter: None,
+            exclude_filter: None,
+            exclude_type: None,
             overrides: Default::default(),
         }
     }
@@ -459,6 +612,16 @@ mod tests {
         let b64 = base64::engine::general_purpose::STANDARD.encode(inner);
         let nodes = parse_feed_payload(b64.as_bytes(), FormatHint::Auto);
         assert_eq!(nodes.len(), 2);
+    }
+
+    #[test]
+    fn parse_base64_wrapped_mihomo_yaml() {
+        let yaml = "proxies:\n  - {name: DIRECT, type: direct}\n  - {name: BLOCK, type: reject}\n";
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(yaml);
+        let nodes = parse_feed_payload(encoded.as_bytes(), FormatHint::Auto);
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].protocol, NodeProtocol::Direct);
+        assert_eq!(nodes[1].protocol, NodeProtocol::Block);
     }
 
     #[test]
@@ -554,6 +717,77 @@ proxies:
             nodes[0].params.get("disable-reuse").map(String::as_str),
             Some("0")
         );
+    }
+
+    #[test]
+    fn parses_every_mihomo_v1_19_29_proxy_type_without_field_loss() {
+        let yaml = r#"
+proxies:
+  - {name: ss, type: ss, server: proxy.example, port: 443}
+  - {name: ssr, type: ssr, server: proxy.example, port: 443}
+  - {name: socks5, type: socks5, server: proxy.example, port: 443}
+  - {name: http, type: http, server: proxy.example, port: 443}
+  - {name: vmess, type: vmess, server: proxy.example, port: 443}
+  - {name: vless, type: vless, server: proxy.example, port: 443}
+  - {name: snell, type: snell, server: proxy.example, port: 443}
+  - {name: trojan, type: trojan, server: proxy.example, port: 443}
+  - {name: hysteria, type: hysteria, server: proxy.example, ports: "20000-20010"}
+  - {name: hysteria2, type: hysteria2, server: proxy.example, ports: "30000,30001"}
+  - name: wireguard
+    type: wireguard
+    peers:
+      - {server: wg.example, port: 51820, public-key: abc}
+  - {name: tuic, type: tuic, server: proxy.example, port: 443}
+  - {name: shadowquic, type: shadowquic, server: proxy.example, port: 443}
+  - {name: gost-relay, type: gost-relay, server: proxy.example, port: 443}
+  - {name: direct, type: direct}
+  - {name: dns, type: dns}
+  - {name: reject, type: reject}
+  - {name: rematch, type: rematch}
+  - {name: ssh, type: ssh, server: proxy.example, port: 22}
+  - {name: mieru, type: mieru, server: proxy.example, port-range: "40000-40010"}
+  - {name: anytls, type: anytls, server: proxy.example, port: 443}
+  - {name: sudoku, type: sudoku, server: proxy.example, port: 443}
+  - {name: masque, type: masque, server: proxy.example, port: 443}
+  - {name: trusttunnel, type: trusttunnel, server: proxy.example, port: 443}
+  - {name: openvpn, type: openvpn, server: proxy.example, port: 1194}
+  - {name: tailscale, type: tailscale, auth-key: tskey-auth-example}
+"#;
+        let nodes = parse_feed_payload(yaml.as_bytes(), FormatHint::ClashYaml);
+        assert_eq!(nodes.len(), 26);
+        assert_eq!(nodes[8].port, 20_000);
+        assert_eq!(nodes[9].port, 30_000);
+        assert_eq!(nodes[10].host, "wg.example");
+        assert_eq!(nodes[19].port, 40_000);
+
+        let unsupported = nodes
+            .iter()
+            .filter_map(|node| match &node.protocol {
+                NodeProtocol::Other(protocol) => Some(protocol.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            unsupported,
+            [
+                "shadowquic",
+                "gost-relay",
+                "rematch",
+                "masque",
+                "openvpn",
+                "tailscale"
+            ]
+        );
+        let wireguard = &nodes[10];
+        assert!(wireguard.params["peers"].contains("public-key"));
+        assert!(wireguard.params["mihomo-raw"].contains("\"peers\""));
+        assert!(!wireguard.raw.is_empty());
+    }
+
+    #[test]
+    fn rejects_zero_and_out_of_range_ports_instead_of_wrapping() {
+        let yaml = "proxies:\n  - {name: zero, type: trojan, server: example.com, port: 0}\n  - {name: overflow, type: trojan, server: example.com, port: 65537}\n";
+        assert!(parse_feed_payload(yaml.as_bytes(), FormatHint::ClashYaml).is_empty());
     }
 
     #[test]
@@ -688,5 +922,25 @@ proxies:
         assert_eq!(out.len(), 3);
         assert_eq!(out[0].name, "B-HK-1");
         assert_eq!(out[2].name, "B-US-3");
+    }
+
+    #[test]
+    fn mihomo_provider_filters_support_lookaround_and_excluded_types() {
+        let yaml = r#"
+proxies:
+  - {name: "HK premium", type: trojan, server: a.example, port: 443}
+  - {name: "HK expired", type: trojan, server: b.example, port: 443}
+  - {name: "HK direct", type: direct}
+"#;
+        let mut detail = detail();
+        detail.filter = Some(r"^HK(?= )".into());
+        detail.exclude_filter = Some("expired".into());
+        detail.exclude_type = Some("direct|reject".into());
+        let nodes = apply_filter_rename(
+            &detail,
+            parse_feed_payload(yaml.as_bytes(), FormatHint::ClashYaml),
+        );
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].name, "HK premium");
     }
 }

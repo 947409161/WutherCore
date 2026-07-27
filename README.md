@@ -42,7 +42,7 @@ WutherCore 负责节点接入、订阅更新、DNS、规则分流、透明代理
 ### 节点与策略
 
 * 支持本地节点、订阅 URI、Clash/Mihomo 节点和迁移后的配置。
-* 订阅具备拉取、缓存、过滤、重命名、去重和运行时刷新能力。
+* 订阅具备拉取、缓存、Age 解密、Mihomo 全节点解析、扩展正则过滤、重命名、去重和运行时刷新能力。
 * 策略组支持手动选择、负载均衡、URLTest 和 Smart 学习选择。
 * 节点评分、测速历史、手动选择和 Pin 状态可以持久化。
 
@@ -104,6 +104,8 @@ WutherCore 负责节点接入、订阅更新、DNS、规则分流、透明代理
 协议名称出现在列表中表示仓库内存在可执行实现和测试路径。UDP、复用、传输层和服务端版本仍需按照具体协议配置验证。
 
 AnyTLS 已按官方协议 v2 实现认证、动态 padding scheme、会话复用、SYNACK 与 UDP-over-TCP v2，配置和线格式说明见 [AnyTLS 指南](docs/ANYTLS.md)。
+
+订阅解析覆盖 Mihomo v1.19.29 注册的全部 26 类节点，支持 HTTP、文件、内联、Base64 YAML、URI 列表、SIP008、自定义请求头、响应大小限制，以及 X25519 和 ML-KEM-768/X25519 两类 Age 密钥。字段、示例和运行时尚缺的协议见 [Mihomo 订阅指南](docs/FEEDS.md)。
 
 Hysteria 1/2 已按官方线协议实现认证、TCP、UDP session/分片、XPlus、
 Salamander/Gecko、端口跳跃与两代 Brutal；字段语义和配置约束见

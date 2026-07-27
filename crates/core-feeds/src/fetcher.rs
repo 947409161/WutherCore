@@ -9,6 +9,7 @@
 
 use std::time::Duration;
 
+use core_config::model::FeedDetail;
 use thiserror::Error;
 use tracing::{debug, warn};
 
@@ -24,6 +25,8 @@ pub enum FetchError {
     Io(#[from] std::io::Error),
     #[error("URL 非法: {0}")]
     BadUrl(String),
+    #[error("订阅正文超过大小上限 {limit} 字节")]
+    BodyTooLarge { limit: usize },
 }
 
 impl From<core_fetch::FetchError> for FetchError {
@@ -32,6 +35,7 @@ impl From<core_fetch::FetchError> for FetchError {
             core_fetch::FetchError::Status(code) => Self::Status(code),
             core_fetch::FetchError::BadUrl(s) => Self::BadUrl(s),
             core_fetch::FetchError::Io(e) => Self::Io(e),
+            core_fetch::FetchError::BodyTooLarge { limit } => Self::BodyTooLarge { limit },
             other => Self::Http(other.to_string()),
         }
     }
@@ -43,6 +47,7 @@ pub const DEFAULT_UA: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " (clash-meta-compatible)"
 );
+const GLOBAL_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 /// 一次抓取的完整结果 —— body + 关键响应头。
 #[derive(Debug, Clone, Default)]
@@ -77,24 +82,84 @@ pub fn set_shared_http_client<T>(_client: T) {}
 
 /// 抓取一次订阅原文 + 元信息。
 pub async fn fetch_feed(url: &str, timeout: Duration) -> Result<FetchResult, FetchError> {
+    fetch_feed_inner(
+        url,
+        timeout,
+        DEFAULT_UA.to_string(),
+        Vec::new(),
+        GLOBAL_MAX_BODY_BYTES,
+    )
+    .await
+}
+
+/// Fetch using Mihomo provider-owned request headers and `size-limit`.
+pub async fn fetch_feed_for_provider(
+    detail: &FeedDetail,
+    timeout: Duration,
+) -> Result<FetchResult, FetchError> {
+    let max_body_bytes = match detail.size_limit {
+        None | Some(0) => GLOBAL_MAX_BODY_BYTES,
+        Some(limit) => usize::try_from(limit)
+            .unwrap_or(usize::MAX)
+            .min(GLOBAL_MAX_BODY_BYTES),
+    };
+    if !detail.payload.is_empty() {
+        let mut root = serde_yaml::Mapping::new();
+        root.insert(
+            serde_yaml::Value::String("proxies".into()),
+            serde_yaml::Value::Sequence(detail.payload.clone()),
+        );
+        let bytes = serde_yaml::to_string(&serde_yaml::Value::Mapping(root))
+            .map_err(|error| FetchError::Http(format!("inline provider 序列化失败: {error}")))?
+            .into_bytes();
+        ensure_size(bytes.len(), max_body_bytes)?;
+        return Ok(FetchResult::from_bytes(bytes));
+    }
+    let mut user_agent = DEFAULT_UA.to_string();
+    let mut headers = Vec::new();
+    for (name, values) in &detail.headers {
+        for value in values.values() {
+            if name.eq_ignore_ascii_case("user-agent") {
+                user_agent.clone_from(value);
+            } else {
+                headers.push((name.clone(), value.clone()));
+            }
+        }
+    }
+    fetch_feed_inner(&detail.url, timeout, user_agent, headers, max_body_bytes).await
+}
+
+async fn fetch_feed_inner(
+    url: &str,
+    timeout: Duration,
+    user_agent: String,
+    headers: Vec<(String, String)>,
+    max_body_bytes: usize,
+) -> Result<FetchResult, FetchError> {
     if url.starts_with("file://") {
         let path = url.trim_start_matches("file://");
         debug!(target: "feeds", path, "fetch from file");
-        return Ok(FetchResult::from_bytes(std::fs::read(path)?));
+        let bytes = std::fs::read(path)?;
+        ensure_size(bytes.len(), max_body_bytes)?;
+        return Ok(FetchResult::from_bytes(bytes));
     }
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         // 本地路径
         if std::path::Path::new(url).exists() {
-            return Ok(FetchResult::from_bytes(std::fs::read(url)?));
+            let bytes = std::fs::read(url)?;
+            ensure_size(bytes.len(), max_body_bytes)?;
+            return Ok(FetchResult::from_bytes(bytes));
         }
         return Err(FetchError::BadUrl(url.into()));
     }
 
     debug!(target: "feeds", url, "fetch http");
     let opts = core_fetch::FetchOptions {
-        user_agent: DEFAULT_UA.to_string(),
+        user_agent,
         timeout,
         connect_timeout: Duration::from_secs(10),
+        headers,
+        max_body_bytes,
         ..Default::default()
     };
     let resp = match core_fetch::fetch(url, &opts).await {
@@ -130,4 +195,50 @@ pub async fn fetch_feed(url: &str, timeout: Duration) -> Result<FetchResult, Fet
         etag,
         content_type,
     })
+}
+
+fn ensure_size(actual: usize, limit: usize) -> Result<(), FetchError> {
+    if actual > limit {
+        Err(FetchError::BodyTooLarge { limit })
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn inline_provider_does_not_require_a_url() {
+        let detail: FeedDetail = serde_yaml::from_str(
+            r#"
+payload:
+  - {name: DIRECT, type: direct}
+"#,
+        )
+        .unwrap();
+        let result = fetch_feed_for_provider(&detail, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let text = String::from_utf8(result.bytes).unwrap();
+        assert!(text.contains("proxies:"));
+        assert!(text.contains("DIRECT"));
+    }
+
+    #[tokio::test]
+    async fn size_limit_applies_to_inline_provider() {
+        let detail: FeedDetail = serde_yaml::from_str(
+            r#"
+size-limit: 8
+payload:
+  - {name: DIRECT, type: direct}
+"#,
+        )
+        .unwrap();
+        let error = fetch_feed_for_provider(&detail, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, FetchError::BodyTooLarge { limit: 8 }));
+    }
 }

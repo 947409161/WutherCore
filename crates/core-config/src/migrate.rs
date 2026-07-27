@@ -54,30 +54,83 @@ pub fn migrate_mihomo(text: &str) -> ConfigResult<String> {
             let Some(provider) = v.as_mapping() else {
                 continue;
             };
-            let Some(url) = provider
-                .get(&Value::String("url".into()))
-                .and_then(Value::as_str)
-            else {
-                continue;
-            };
-            let client_id = provider
-                .get(&Value::String("override".into()))
-                .and_then(Value::as_mapping)
-                .and_then(|overrides| {
-                    ["clientId", "client-id", "client_id"]
-                        .iter()
-                        .find_map(|key| overrides.get(Value::String((*key).into())))
-                })
+            let source = provider
+                .get(Value::String("url".into()))
+                .or_else(|| provider.get(Value::String("path".into())))
                 .and_then(Value::as_str);
-            if let Some(client_id) = client_id {
-                let mut overrides = serde_yaml::Mapping::new();
-                overrides.insert("clientId".into(), client_id.into());
-                let mut detail = serde_yaml::Mapping::new();
-                detail.insert("url".into(), url.into());
+            let payload = provider
+                .get(Value::String("payload".into()))
+                .and_then(Value::as_sequence);
+            if source.is_none() && payload.is_none() {
+                continue;
+            }
+            let mut detail = serde_yaml::Mapping::new();
+            if let Some(source) = source {
+                detail.insert("url".into(), source.into());
+            }
+            if let Some(payload) = payload {
+                detail.insert("payload".into(), Value::Sequence(payload.clone()));
+            }
+            for key in [
+                "age-secret-key",
+                "size-limit",
+                "header",
+                "filter",
+                "exclude-filter",
+                "exclude-type",
+            ] {
+                if let Some(value) = provider.get(Value::String(key.into())) {
+                    detail.insert(key.into(), value.clone());
+                }
+            }
+            if let Some(interval) = provider
+                .get(Value::String("interval".into()))
+                .and_then(Value::as_u64)
+            {
+                detail.insert("every".into(), format!("{interval}s").into());
+            }
+            let mut overrides = serde_yaml::Mapping::new();
+            if let Some(source) = provider
+                .get(Value::String("override".into()))
+                .and_then(Value::as_mapping)
+            {
+                for key in [
+                    "clientId",
+                    "client-id",
+                    "client_id",
+                    "tfo",
+                    "mptcp",
+                    "udp",
+                    "udp-over-tcp",
+                    "up",
+                    "down",
+                    "dialer-proxy",
+                    "skip-cert-verify",
+                    "name-cert-verify",
+                    "interface-name",
+                    "routing-mark",
+                    "ip-version",
+                    "additional-prefix",
+                    "additional-suffix",
+                    "proxy-name",
+                ] {
+                    if let Some(value) = source.get(Value::String(key.into())) {
+                        overrides.insert(key.into(), value.clone());
+                    }
+                }
+            }
+            if let Some(dialer_proxy) = provider.get(Value::String("dialer-proxy".into())) {
+                overrides.insert("dialer-proxy".into(), dialer_proxy.clone());
+            }
+            if !overrides.is_empty() {
                 detail.insert("override".into(), Value::Mapping(overrides));
-                feeds.insert(name.to_string(), Value::Mapping(detail));
+            }
+            if detail.len() == 1
+                && let Some(source) = source
+            {
+                feeds.insert(name.to_string(), Value::String(source.to_string()));
             } else {
-                feeds.insert(name.to_string(), Value::String(url.to_string()));
+                feeds.insert(name.to_string(), Value::Mapping(detail));
             }
         }
     }
@@ -195,6 +248,66 @@ proxy-providers:
             plan.feeds["airport"].overrides.client_id.as_deref(),
             Some("sing-anytls/0.0.11")
         );
+    }
+
+    #[test]
+    fn migration_preserves_mihomo_provider_fetch_and_filter_fields() {
+        let input = r#"
+proxy-providers:
+  airport:
+    type: http
+    url: "https://example.com/sub"
+    interval: 1800
+    size-limit: 1048576
+    age-secret-key: "AGE-SECRET-KEY-1GQ9778VQXMMJVE8SK7J6VT8UJ4HDQAJUVSFCWCM02D8GEWQ72PVQ2Y5J33"
+    header:
+      User-Agent: ["Mihomo/1.19"]
+      X-Age-Public-Key: "age1example"
+    filter: "^(HK|JP)"
+    exclude-filter: "expired"
+    exclude-type: "direct|reject"
+    override:
+      udp: false
+      additional-prefix: "Airport "
+"#;
+        let migrated = migrate_mihomo(input).unwrap();
+        let plan = crate::loader::load_from_str(&migrated).unwrap();
+        let detail = &plan.feeds["airport"];
+        assert_eq!(detail.every, Duration::from_secs(1800));
+        assert_eq!(detail.size_limit, Some(1_048_576));
+        assert_eq!(
+            detail.age_secret_key.as_deref(),
+            Some("AGE-SECRET-KEY-1GQ9778VQXMMJVE8SK7J6VT8UJ4HDQAJUVSFCWCM02D8GEWQ72PVQ2Y5J33")
+        );
+        assert_eq!(
+            detail.headers["User-Agent"].values(),
+            &["Mihomo/1.19".to_string()]
+        );
+        assert_eq!(detail.filter.as_deref(), Some("^(HK|JP)"));
+        assert_eq!(detail.exclude_type.as_deref(), Some("direct|reject"));
+        assert_eq!(detail.overrides.udp, Some(false));
+        assert_eq!(
+            detail.overrides.additional_prefix.as_deref(),
+            Some("Airport ")
+        );
+    }
+
+    #[test]
+    fn migration_preserves_file_and_inline_proxy_providers() {
+        let input = r#"
+proxy-providers:
+  local:
+    type: file
+    path: "./providers/local.yaml"
+  built-in:
+    type: inline
+    payload:
+      - {name: DIRECT, type: direct}
+"#;
+        let migrated = migrate_mihomo(input).unwrap();
+        let plan = crate::loader::load_from_str(&migrated).unwrap();
+        assert_eq!(plan.feeds["local"].url, "./providers/local.yaml");
+        assert_eq!(plan.feeds["built-in"].payload.len(), 1);
     }
 
     #[test]

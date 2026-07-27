@@ -52,7 +52,7 @@ impl NodeProtocol {
     pub fn from_scheme(scheme: &str) -> Self {
         match scheme.to_ascii_lowercase().as_str() {
             "direct" => Self::Direct,
-            "block" => Self::Block,
+            "block" | "reject" => Self::Block,
             "http" | "https" => Self::Http,
             "socks5" | "socks" => Self::Socks5,
             "ss" => Self::Shadowsocks,

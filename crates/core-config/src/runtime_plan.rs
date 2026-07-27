@@ -1753,21 +1753,100 @@ fn compile_feeds(feeds: &BTreeMap<String, FeedSpec>) -> ConfigResult<BTreeMap<St
             let detail = match v {
                 FeedSpec::Url(u) => FeedDetail {
                     url: u.clone(),
+                    payload: Vec::new(),
                     every: Duration::from_secs(12 * 3600),
                     via: "direct".into(),
                     keep: Default::default(),
                     drop: Default::default(),
                     rename: Default::default(),
+                    age_secret_key: None,
+                    size_limit: None,
+                    headers: Default::default(),
+                    filter: None,
+                    exclude_filter: None,
+                    exclude_type: None,
                     overrides: Default::default(),
                 },
                 FeedSpec::Detail(d) => d.clone(),
             };
+            if detail.url.trim().is_empty() && detail.payload.is_empty() {
+                return Err(
+                    ConfigError::invalid("订阅必须配置 url/path 或 inline payload")
+                        .at(format!("feeds.{k}")),
+                );
+            }
             if let Some(client_id) = detail.overrides.client_id.as_deref() {
                 validate_anytls_client_id(client_id, &format!("feeds.{k}.override.clientId"))?;
+            }
+            if let Some(secret_keys) = detail.age_secret_key.as_deref() {
+                validate_age_secret_keys(secret_keys, &format!("feeds.{k}.age-secret-key"))?;
+            }
+            for (field, value) in [
+                ("filter", detail.filter.as_deref()),
+                ("exclude-filter", detail.exclude_filter.as_deref()),
+            ] {
+                if let Some(value) = value {
+                    for pattern in value.split('`').filter(|pattern| !pattern.is_empty()) {
+                        fancy_regex::Regex::new(pattern).map_err(|error| {
+                            ConfigError::invalid(format!(
+                                "订阅 {field} 正则 `{pattern}` 无效: {error}"
+                            ))
+                            .at(format!("feeds.{k}.{field}"))
+                        })?;
+                    }
+                }
+            }
+            for (index, replacement) in detail.overrides.proxy_name.iter().enumerate() {
+                fancy_regex::Regex::new(&replacement.pattern).map_err(|error| {
+                    ConfigError::invalid(format!(
+                        "订阅 proxy-name 正则 `{}` 无效: {error}",
+                        replacement.pattern
+                    ))
+                    .at(format!("feeds.{k}.override.proxy-name[{index}].pattern"))
+                })?;
+            }
+            for (name, values) in &detail.headers {
+                if name.trim().is_empty()
+                    || values
+                        .values()
+                        .iter()
+                        .any(|value| value.contains(['\r', '\n']))
+                {
+                    return Err(
+                        ConfigError::invalid("订阅请求头名称不能为空，值不能包含换行")
+                            .at(format!("feeds.{k}.header")),
+                    );
+                }
             }
             Ok((k.clone(), detail))
         })
         .collect()
+}
+
+fn validate_age_secret_keys(value: &str, location: &str) -> ConfigResult<()> {
+    let mut count = 0usize;
+    for line in value.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        count += 1;
+        let (hrp, key) = bech32::decode(line).map_err(|error| {
+            ConfigError::invalid(format!("age 私钥 Bech32 编码无效: {error}")).at(location)
+        })?;
+        let supported = ["age-secret-key-", "age-secret-key-pq-"]
+            .iter()
+            .any(|expected| hrp.as_str().eq_ignore_ascii_case(expected));
+        if !supported || key.len() != 32 {
+            return Err(ConfigError::invalid(
+                "仅支持 32 字节的 X25519 或 ML-KEM-768/X25519 age 私钥",
+            )
+            .at(location));
+        }
+    }
+    if count == 0 {
+        return Err(ConfigError::invalid("age-secret-key 不能为空").at(location));
+    }
+    Ok(())
 }
 
 fn validate_anytls_client_id(value: &str, location: &str) -> ConfigResult<()> {

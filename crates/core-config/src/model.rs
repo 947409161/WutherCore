@@ -1226,7 +1226,12 @@ pub enum FeedSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct FeedDetail {
+    #[serde(default)]
     pub url: String,
+    /// Mihomo `type: inline` provider payload. When non-empty it is parsed
+    /// directly and no network request is made.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub payload: Vec<serde_yaml::Value>,
     #[serde(default = "default_feed_every", with = "humantime_serde")]
     pub every: Duration,
     #[serde(default = "default_feed_via")]
@@ -1237,10 +1242,66 @@ pub struct FeedDetail {
     pub drop: FeedFilter,
     #[serde(default)]
     pub rename: FeedRename,
+    /// Mihomo provider `age-secret-key`. The fetched body is decrypted only
+    /// when it is an ASCII-armored age document; plaintext remains accepted.
+    #[serde(
+        default,
+        rename = "age-secret-key",
+        alias = "age_secret_key",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub age_secret_key: Option<String>,
+    /// Provider response size ceiling in bytes. `0` follows Mihomo and means
+    /// no provider-specific ceiling (the global fetch safety limit still
+    /// applies).
+    #[serde(
+        default,
+        rename = "size-limit",
+        alias = "size_limit",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub size_limit: Option<u64>,
+    /// Extra request headers. A single string and Mihomo's string-list form
+    /// are both accepted.
+    #[serde(default, rename = "header", alias = "headers")]
+    pub headers: BTreeMap<String, FeedHeaderValue>,
+    /// Mihomo-compatible provider name/type filters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+    #[serde(
+        default,
+        rename = "exclude-filter",
+        alias = "exclude_filter",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub exclude_filter: Option<String>,
+    #[serde(
+        default,
+        rename = "exclude-type",
+        alias = "exclude_type",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub exclude_type: Option<String>,
     /// Provider 级节点覆写。用于订阅源无法提供客户端所需字段，或机场按
     /// AnyTLS `cmdSettings.client` 识别客户端实现的场景。
     #[serde(default, rename = "override", alias = "overrides")]
     pub overrides: FeedOverride,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum FeedHeaderValue {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl FeedHeaderValue {
+    pub fn values(&self) -> &[String] {
+        match self {
+            Self::One(value) => std::slice::from_ref(value),
+            Self::Many(values) => values,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1256,18 +1317,97 @@ pub struct FeedOverride {
         alias = "anytls_client_id"
     )]
     pub client_id: Option<String>,
+    #[serde(default)]
+    pub tfo: Option<bool>,
+    #[serde(default)]
+    pub mptcp: Option<bool>,
+    #[serde(default)]
+    pub udp: Option<bool>,
+    #[serde(default, rename = "udp-over-tcp", alias = "udp_over_tcp")]
+    pub udp_over_tcp: Option<bool>,
+    #[serde(default)]
+    pub up: Option<String>,
+    #[serde(default)]
+    pub down: Option<String>,
+    #[serde(default, rename = "dialer-proxy", alias = "dialer_proxy")]
+    pub dialer_proxy: Option<String>,
+    #[serde(default, rename = "skip-cert-verify", alias = "skip_cert_verify")]
+    pub skip_cert_verify: Option<bool>,
+    #[serde(default, rename = "name-cert-verify", alias = "name_cert_verify")]
+    pub name_cert_verify: Option<String>,
+    #[serde(default, rename = "interface-name", alias = "interface_name")]
+    pub interface_name: Option<String>,
+    #[serde(default, rename = "routing-mark", alias = "routing_mark")]
+    pub routing_mark: Option<i64>,
+    #[serde(default, rename = "ip-version", alias = "ip_version")]
+    pub ip_version: Option<String>,
+    #[serde(default, rename = "additional-prefix", alias = "additional_prefix")]
+    pub additional_prefix: Option<String>,
+    #[serde(default, rename = "additional-suffix", alias = "additional_suffix")]
+    pub additional_suffix: Option<String>,
+    #[serde(default, rename = "proxy-name", alias = "proxy_name")]
+    pub proxy_name: Vec<FeedProxyNameOverride>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FeedProxyNameOverride {
+    pub pattern: String,
+    #[serde(default)]
+    pub target: String,
 }
 
 impl FeedDetail {
     /// Apply provider-owned values after parsing so they take precedence over
     /// fields supplied by an airport subscription.
     pub fn apply_overrides(&self, nodes: &mut [crate::node_uri::ParsedNode]) {
-        let Some(client_id) = self.overrides.client_id.as_ref() else {
-            return;
-        };
         for node in nodes {
-            if node.protocol == crate::node_uri::NodeProtocol::AnyTls {
+            if node.protocol == crate::node_uri::NodeProtocol::AnyTls
+                && let Some(client_id) = self.overrides.client_id.as_ref()
+            {
                 node.params.insert("clientId".into(), client_id.clone());
+            }
+            if let Some(udp) = self.overrides.udp {
+                node.udp = udp;
+            }
+            for (key, value) in [
+                ("tfo", self.overrides.tfo),
+                ("mptcp", self.overrides.mptcp),
+                ("udp-over-tcp", self.overrides.udp_over_tcp),
+                ("skip-cert-verify", self.overrides.skip_cert_verify),
+            ] {
+                if let Some(value) = value {
+                    node.params
+                        .insert(key.into(), if value { "1" } else { "0" }.into());
+                }
+            }
+            for (key, value) in [
+                ("up", self.overrides.up.as_ref()),
+                ("down", self.overrides.down.as_ref()),
+                ("dialer-proxy", self.overrides.dialer_proxy.as_ref()),
+                ("name-cert-verify", self.overrides.name_cert_verify.as_ref()),
+                ("interface-name", self.overrides.interface_name.as_ref()),
+                ("ip-version", self.overrides.ip_version.as_ref()),
+            ] {
+                if let Some(value) = value {
+                    node.params.insert(key.into(), value.clone());
+                }
+            }
+            if let Some(mark) = self.overrides.routing_mark {
+                node.params.insert("routing-mark".into(), mark.to_string());
+            }
+            for replacement in &self.overrides.proxy_name {
+                if let Ok(pattern) = fancy_regex::Regex::new(&replacement.pattern) {
+                    node.name = pattern
+                        .replace_all(&node.name, replacement.target.as_str())
+                        .into_owned();
+                }
+            }
+            if let Some(prefix) = self.overrides.additional_prefix.as_ref() {
+                node.name.insert_str(0, prefix);
+            }
+            if let Some(suffix) = self.overrides.additional_suffix.as_ref() {
+                node.name.push_str(suffix);
             }
         }
     }

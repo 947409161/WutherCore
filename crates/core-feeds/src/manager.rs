@@ -26,8 +26,9 @@ use tokio::{sync::Notify, task::JoinHandle};
 use tracing::{debug, info, warn};
 
 use crate::{
+    age::decrypt_provider_payload,
     cache::{FeedDiskCache, FeedMeta, url_digest},
-    fetcher::fetch_feed,
+    fetcher::fetch_feed_for_provider,
     parser::{FormatHint, apply_filter_rename, parse_feed_payload},
     userinfo::SubscriptionUserinfo,
 };
@@ -330,7 +331,13 @@ impl FeedManager {
         let Some(raw) = cache.load(name) else {
             return false;
         };
-        let nodes = self.parse_with_filter(detail, &raw);
+        let nodes = match self.parse_with_filter(detail, &raw) {
+            Ok(nodes) => nodes,
+            Err(error) => {
+                warn!(target: "feeds", name = %name, phase, %error, "cached provider payload rejected");
+                return false;
+            }
+        };
         let last_refreshed_ms = meta
             .as_ref()
             .map(|m| m.last_refreshed_ms)
@@ -378,7 +385,7 @@ impl FeedManager {
         detail: &FeedDetail,
         timeout: Duration,
     ) -> Result<FeedUpdate, String> {
-        let (raw, userinfo) = match fetch_feed(&detail.url, timeout).await {
+        let (raw, userinfo) = match fetch_feed_for_provider(detail, timeout).await {
             Ok(result) => {
                 if let Some(cache) = &self.cache {
                     let meta = FeedMeta {
@@ -399,7 +406,7 @@ impl FeedManager {
                     .as_ref()
                     .and_then(|c| c.load(name))
                     .ok_or_else(|| format!("{e}"))?;
-                let nodes = self.parse_with_filter(detail, &cache);
+                let nodes = self.parse_with_filter(detail, &cache)?;
                 return Ok(FeedUpdate {
                     name: name.to_string(),
                     nodes,
@@ -410,7 +417,7 @@ impl FeedManager {
             }
         };
 
-        let nodes = self.parse_with_filter(detail, &raw);
+        let nodes = self.parse_with_filter(detail, &raw)?;
         Ok(FeedUpdate {
             name: name.to_string(),
             nodes,
@@ -420,9 +427,43 @@ impl FeedManager {
         })
     }
 
-    fn parse_with_filter(&self, detail: &FeedDetail, raw: &[u8]) -> Vec<ParsedNode> {
-        let parsed = parse_feed_payload(raw, FormatHint::Auto);
-        apply_filter_rename(detail, parsed)
+    fn parse_with_filter(
+        &self,
+        detail: &FeedDetail,
+        raw: &[u8],
+    ) -> Result<Vec<ParsedNode>, String> {
+        let plaintext = match detail.age_secret_key.as_deref() {
+            Some(secret_key) => decrypt_provider_payload(raw, secret_key)
+                .map_err(|error| format!("provider age 解密失败: {error}"))?,
+            None if raw.starts_with(crate::age::AGE_ARMOR_HEADER) => {
+                return Err("订阅内容已使用 age 加密，但未配置 age-secret-key".into());
+            }
+            None => raw.to_vec(),
+        };
+        let parsed = parse_feed_payload(&plaintext, FormatHint::Auto);
+        let mut nodes = apply_filter_rename(detail, parsed);
+        let before = nodes.len();
+        nodes.retain(|node| {
+            if let core_config::node_uri::NodeProtocol::Other(protocol) = &node.protocol {
+                warn!(
+                    target: "feeds",
+                    name = %node.name,
+                    %protocol,
+                    "mihomo node parsed but runtime protocol is not implemented; skipping activation"
+                );
+                false
+            } else {
+                true
+            }
+        });
+        debug!(
+            target: "feeds",
+            parsed = before,
+            activated = nodes.len(),
+            unsupported = before.saturating_sub(nodes.len()),
+            "provider parse completed"
+        );
+        Ok(nodes)
     }
 }
 
@@ -454,11 +495,18 @@ mod tests {
     fn detail(url: &str, every_secs: u64) -> FeedDetail {
         FeedDetail {
             url: url.into(),
+            payload: Vec::new(),
             every: Duration::from_secs(every_secs),
             via: "direct".into(),
             keep: FeedFilter::default(),
             drop: FeedFilter::default(),
             rename: FeedRename::default(),
+            age_secret_key: None,
+            size_limit: None,
+            headers: Default::default(),
+            filter: None,
+            exclude_filter: None,
+            exclude_type: None,
             overrides: Default::default(),
         }
     }

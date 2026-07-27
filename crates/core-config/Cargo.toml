@@ -16,11 +16,13 @@ url = { workspace = true }
 ipnet = { workspace = true }
 percent-encoding = { workspace = true }
 base64 = { workspace = true }
+bech32 = { workspace = true }
 hex = { workspace = true }
 uuid = { workspace = true }
 xray-utls = { workspace = true }
 once_cell = { workspace = true }
 regex = { workspace = true }
+fancy-regex = { workspace = true }
 tracing = { workspace = true }
 core-young = { workspace = true }
 http = { workspace = true }

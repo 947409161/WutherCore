@@ -4,14 +4,21 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["fetch"]
+fetch = ["dep:core-fetch"]
+
 [dependencies]
 core-config   = { workspace = true }
-core-outbound = { workspace = true }
-core-fetch    = { workspace = true }
+core-fetch    = { workspace = true, optional = true }
 tokio         = { workspace = true }
 serde         = { workspace = true }
 serde_yaml    = { workspace = true }
 serde_json    = { workspace = true }
+age           = { workspace = true }
+age-core      = { workspace = true }
+bech32        = { workspace = true }
+hpke          = { workspace = true }
 base64        = { workspace = true }
 url           = { workspace = true }
 anyhow        = { workspace = true }
@@ -20,3 +27,7 @@ tracing       = { workspace = true }
 parking_lot   = { workspace = true }
 futures       = { workspace = true }
 async-trait   = { workspace = true }
+fancy-regex   = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
