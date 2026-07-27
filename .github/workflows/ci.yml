@@ -209,6 +209,21 @@ jobs:
               -p wuther-core
           fi
 
+      - name: Stage macOS runtime libraries
+        if: >-
+          needs.prepare.outputs.tags == '' ||
+          contains(format(',{0},', needs.prepare.outputs.tags), ',with_young,') ||
+          contains(format(',{0},', needs.prepare.outputs.tags), ',standard,') ||
+          contains(format(',{0},', needs.prepare.outputs.tags), ',all_components,')
+        shell: bash
+        env:
+          TARGET: ${{ matrix.platform.target }}
+        run: >-
+          python3 scripts/stage-runtime-libraries.py
+          --target "$TARGET"
+          --profile release-fast
+          --require libnssutil3.dylib
+
       - name: Smoke-test macOS binary
         shell: bash
         env:

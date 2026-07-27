@@ -243,6 +243,33 @@ jobs:
             cross build --release --locked --target "$TARGET" -p wuther-core
           fi
 
+      - name: Stage Linux runtime libraries
+        if: >-
+          matrix.platform.builder == 'cargo' &&
+          ((needs.prepare.outputs.tags == '' && matrix.platform.default-tags == 'standard') ||
+          contains(format(',{0},', needs.prepare.outputs.tags), ',with_young,') ||
+          contains(format(',{0},', needs.prepare.outputs.tags), ',standard,') ||
+          contains(format(',{0},', needs.prepare.outputs.tags), ',all_components,'))
+        shell: bash
+        env:
+          TARGET: ${{ matrix.platform.target }}
+        run: >-
+          python3 scripts/stage-runtime-libraries.py
+          --target "$TARGET"
+          --require libnssutil3.so
+
+      - name: Smoke-test native Linux binary
+        if: >-
+          matrix.platform.builder == 'cargo' &&
+          ((needs.prepare.outputs.tags == '' && matrix.platform.default-tags == 'standard') ||
+          contains(format(',{0},', needs.prepare.outputs.tags), ',with_young,') ||
+          contains(format(',{0},', needs.prepare.outputs.tags), ',standard,') ||
+          contains(format(',{0},', needs.prepare.outputs.tags), ',all_components,'))
+        shell: bash
+        env:
+          TARGET: ${{ matrix.platform.target }}
+        run: "./target/$TARGET/release/wuther-core --version"
+
       - name: Package artifact
         id: package
         env:
@@ -500,6 +527,20 @@ jobs:
           else
             cargo build --release --locked --target "$TARGET" -p wuther-core
           fi
+
+      - name: Stage macOS runtime libraries
+        if: >-
+          needs.prepare.outputs.tags == '' ||
+          contains(format(',{0},', needs.prepare.outputs.tags), ',with_young,') ||
+          contains(format(',{0},', needs.prepare.outputs.tags), ',standard,') ||
+          contains(format(',{0},', needs.prepare.outputs.tags), ',all_components,')
+        shell: bash
+        env:
+          TARGET: ${{ matrix.platform.target }}
+        run: >-
+          python3 scripts/stage-runtime-libraries.py
+          --target "$TARGET"
+          --require libnssutil3.dylib
 
       - name: Smoke-test macOS binary
         shell: bash

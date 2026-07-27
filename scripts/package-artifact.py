@@ -28,6 +28,11 @@ def arguments() -> argparse.Namespace:
 def copy_payload(stage: Path, binary: Path, metadata: str) -> None:
     stage.mkdir(parents=True, exist_ok=True)
     shutil.copy2(binary, stage / binary.name)
+    for pattern in ("*.dylib", "*.so", "*.so.*", "*.dll"):
+        for runtime in sorted(binary.parent.glob(pattern)):
+            destination = stage / runtime.name
+            if not destination.exists():
+                shutil.copy2(runtime.resolve(strict=True), destination)
     shutil.copy2(ROOT / "README.md", stage / "README.md")
     shutil.copy2(ROOT / "LICENSE", stage / "LICENSE")
 
