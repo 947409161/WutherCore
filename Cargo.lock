@@ -1621,6 +1621,8 @@ name = "core-young"
 version = "0.3.1-rc.5"
 dependencies = [
  "base64 0.23.0",
+ "blake3",
+ "bytes",
  "hmac 0.13.0",
  "neqo-common",
  "neqo-http3",

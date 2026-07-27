@@ -23,65 +23,138 @@ pub const DEFAULT_PADDING_MIN: u16 = 64;
 pub const DEFAULT_PADDING_MAX: u16 = 512;
 pub const DEFAULT_PADDING_SCHEME_LENGTH: u16 = 64;
 pub const MAX_PADDING_SCHEME_LENGTH: usize = 256;
+pub const MAX_DATA_PAYLOAD_BYTES: usize = 32 * 1024;
 pub const MAX_UDP_PAYLOAD_BYTES: usize = 65_507;
 const MAX_UDP_FRAGMENTS: usize = 256;
 const AUTH_TOKEN_BYTES: usize = 1 + 8 + 8 + 16 + 4 + 32;
 const FLOW_TAG_BYTES: usize = 16;
 const FLOW_RESPONSE_BYTES: usize = 2 + 1 + 1 + 8 + FLOW_TAG_BYTES;
+const DATA_FRAME_HEADER_BYTES: usize = 2 + 1 + 1 + 8 + 2 + 2;
 const UDP_HEADER_BYTES: usize = 2 + 1 + 1 + 8 + 4 + 2 + 2 + 2;
+const PADDED_UDP_HEADER_BYTES: usize = UDP_HEADER_BYTES + 2 + 2;
 const UDP_TAG_BYTES: usize = 16;
 const PADDING_SCHEME_TAG_BYTES: usize = 32;
-const PADDING_SCHEME_VERSION: u8 = 1;
+const LEGACY_PADDING_SCHEME_VERSION: u8 = 1;
+const BIDIRECTIONAL_PADDING_SCHEME_VERSION: u8 = 2;
 const PADDING_SCHEME_MAX_ENCODED_BYTES: usize =
-    (1 + 2 + MAX_PADDING_SCHEME_LENGTH * size_of::<u16>() + PADDING_SCHEME_TAG_BYTES).div_ceil(3)
+    (1 + 2 + 2 * MAX_PADDING_SCHEME_LENGTH * size_of::<u16>() + PADDING_SCHEME_TAG_BYTES)
+        .div_ceil(3)
         * 4;
 
-/// Per-WebTransport-session FlowOpen padding lengths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaddingDirection {
+    ClientToServer,
+    ServerToClient,
+}
+
+impl PaddingDirection {
+    const fn tcp_padding_domain(self) -> &'static [u8] {
+        match self {
+            Self::ClientToServer => b"young/tcp-padding/c2s/v1",
+            Self::ServerToClient => b"young/tcp-padding/s2c/v1",
+        }
+    }
+
+    const fn udp_padding_domain(self) -> &'static [u8] {
+        match self {
+            Self::ClientToServer => b"young/udp-padding/c2s/v1",
+            Self::ServerToClient => b"young/udp-padding/s2c/v1",
+        }
+    }
+
+    const fn udp_hmac_domain(self) -> &'static [u8] {
+        match self {
+            Self::ClientToServer => b"young/udp-fragment/c2s/v2",
+            Self::ServerToClient => b"young/udp-fragment/s2c/v2",
+        }
+    }
+}
+
+/// Per-WebTransport-session padding lengths for both traffic directions.
 ///
-/// The server generates this table once during session authentication. Each
-/// The flow-open hot path performs only a counter increment, conditional wrap
-/// and array lookup; no random generator or integer division is used.
+/// A legacy v1 scheme has only the client-to-server table and is limited to
+/// FlowOpen padding. A v2 scheme has independent tables for client-to-server
+/// and server-to-client TCP data frames and UDP fragments.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PaddingScheme {
-    entries: SmallVec<[u16; 64]>,
+    client_to_server: SmallVec<[u16; 64]>,
+    server_to_client: Option<SmallVec<[u16; 64]>>,
 }
 
 impl PaddingScheme {
     pub fn new(entries: impl IntoIterator<Item = u16>) -> io::Result<Self> {
-        let entries = entries.into_iter().collect::<SmallVec<[u16; 64]>>();
-        if entries.is_empty() || entries.len() > MAX_PADDING_SCHEME_LENGTH {
-            return Err(invalid_input(format!(
-                "Young padding scheme 长度必须在 1..={MAX_PADDING_SCHEME_LENGTH}"
-            )));
+        Ok(Self {
+            client_to_server: validate_padding_entries(entries)?,
+            server_to_client: None,
+        })
+    }
+
+    pub fn bidirectional(
+        client_to_server: impl IntoIterator<Item = u16>,
+        server_to_client: impl IntoIterator<Item = u16>,
+    ) -> io::Result<Self> {
+        let client_to_server = validate_padding_entries(client_to_server)?;
+        let server_to_client = validate_padding_entries(server_to_client)?;
+        if client_to_server.len() != server_to_client.len() {
+            return Err(invalid_input(
+                "Young 双向 padding scheme 的两个方向必须具有相同长度",
+            ));
         }
-        if entries
-            .iter()
-            .any(|length| usize::from(*length) > MAX_PADDING_BYTES)
-        {
-            return Err(invalid_input("Young padding scheme 包含超限长度"));
-        }
-        Ok(Self { entries })
+        Ok(Self {
+            client_to_server,
+            server_to_client: Some(server_to_client),
+        })
     }
 
     #[must_use]
-    pub fn padding_for(&self, flow_index: u64) -> u16 {
-        self.entries[(flow_index % self.entries.len() as u64) as usize]
+    pub fn padding_for(&self, direction: PaddingDirection, frame_index: u64) -> u16 {
+        let entries = self.entries(direction);
+        entries[(frame_index % entries.len() as u64) as usize]
     }
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.client_to_server.len()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.client_to_server.is_empty()
     }
 
     #[must_use]
-    pub fn entries(&self) -> &[u16] {
-        &self.entries
+    pub fn is_bidirectional(&self) -> bool {
+        self.server_to_client.is_some()
     }
+
+    #[must_use]
+    pub fn entries(&self, direction: PaddingDirection) -> &[u16] {
+        match direction {
+            PaddingDirection::ClientToServer => &self.client_to_server,
+            PaddingDirection::ServerToClient => self
+                .server_to_client
+                .as_deref()
+                .unwrap_or(&self.client_to_server),
+        }
+    }
+}
+
+fn validate_padding_entries(
+    entries: impl IntoIterator<Item = u16>,
+) -> io::Result<SmallVec<[u16; 64]>> {
+    let entries = entries.into_iter().collect::<SmallVec<[u16; 64]>>();
+    if entries.is_empty() || entries.len() > MAX_PADDING_SCHEME_LENGTH {
+        return Err(invalid_input(format!(
+            "Young padding scheme 长度必须在 1..={MAX_PADDING_SCHEME_LENGTH}"
+        )));
+    }
+    if entries
+        .iter()
+        .any(|length| *length == 0 || usize::from(*length) > MAX_PADDING_BYTES)
+    {
+        return Err(invalid_input("Young padding scheme 长度必须在 1..=4096"));
+    }
+    Ok(entries)
 }
 
 #[derive(Clone)]
@@ -472,7 +545,8 @@ pub fn generate_padding_scheme(
     padding_max: u16,
     scheme_length: u16,
 ) -> io::Result<PaddingScheme> {
-    if padding_min > padding_max || usize::from(padding_max) > MAX_PADDING_BYTES {
+    if padding_min == 0 || padding_min > padding_max || usize::from(padding_max) > MAX_PADDING_BYTES
+    {
         return Err(invalid_input("Young padding scheme 范围无效"));
     }
     if scheme_length == 0 || usize::from(scheme_length) > MAX_PADDING_SCHEME_LENGTH {
@@ -483,17 +557,21 @@ pub fn generate_padding_scheme(
     let mut seed = [0; 32];
     rand::rng().fill_bytes(&mut seed);
     let mut rng = ChaCha8Rng::from_seed(seed);
-    let entries = (0..scheme_length).map(|_| {
-        if padding_min == padding_max {
-            padding_min
-        } else {
-            rng.random_range(padding_min..=padding_max)
-        }
-    });
-    PaddingScheme::new(entries)
+    let mut generate_direction = || {
+        (0..scheme_length)
+            .map(|_| {
+                if padding_min == padding_max {
+                    padding_min
+                } else {
+                    rng.random_range(padding_min..=padding_max)
+                }
+            })
+            .collect::<SmallVec<[u16; 64]>>()
+    };
+    PaddingScheme::bidirectional(generate_direction(), generate_direction())
 }
 
-/// Serialize and authenticate a server-selected padding scheme for the
+/// Serialize and authenticate a bidirectional v2 padding scheme for the
 /// `sec-young-padding` WebTransport response header.
 #[must_use]
 pub fn encode_padding_scheme(
@@ -501,11 +579,39 @@ pub fn encode_padding_scheme(
     client_nonce: [u8; 16],
     scheme: &PaddingScheme,
 ) -> String {
+    debug_assert!(scheme.is_bidirectional());
+    let mut payload =
+        Vec::with_capacity(1 + 2 + 2 * scheme.len() * size_of::<u16>() + PADDING_SCHEME_TAG_BYTES);
+    payload.push(BIDIRECTIONAL_PADDING_SCHEME_VERSION);
+    payload.extend_from_slice(&(scheme.len() as u16).to_be_bytes());
+    for direction in [
+        PaddingDirection::ClientToServer,
+        PaddingDirection::ServerToClient,
+    ] {
+        for length in scheme.entries(direction) {
+            payload.extend_from_slice(&length.to_be_bytes());
+        }
+    }
+    let tag = hmac_tag(
+        key.as_bytes(),
+        &[b"young/padding-scheme/v2", &client_nonce, &payload],
+    );
+    payload.extend_from_slice(&tag);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
+}
+
+/// Encode the original v1 client-to-server-only table for an older peer.
+#[must_use]
+pub fn encode_legacy_padding_scheme(
+    key: &YoungKey,
+    client_nonce: [u8; 16],
+    scheme: &PaddingScheme,
+) -> String {
     let mut payload =
         Vec::with_capacity(1 + 2 + scheme.len() * size_of::<u16>() + PADDING_SCHEME_TAG_BYTES);
-    payload.push(PADDING_SCHEME_VERSION);
+    payload.push(LEGACY_PADDING_SCHEME_VERSION);
     payload.extend_from_slice(&(scheme.len() as u16).to_be_bytes());
-    for length in scheme.entries() {
+    for length in scheme.entries(PaddingDirection::ClientToServer) {
         payload.extend_from_slice(&length.to_be_bytes());
     }
     let tag = hmac_tag(
@@ -527,35 +633,46 @@ pub fn decode_padding_scheme(
     let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(encoded)
         .map_err(|_| permission_denied("Young padding scheme 编码无效"))?;
-    if payload.len() < 1 + 2 + 2 + PADDING_SCHEME_TAG_BYTES || payload[0] != PADDING_SCHEME_VERSION
-    {
+    if payload.len() < 1 + 2 + 2 + PADDING_SCHEME_TAG_BYTES {
         return Err(permission_denied("Young padding scheme 版本或长度无效"));
     }
+    let version = payload[0];
     let count = usize::from(u16::from_be_bytes(
         payload[1..3].try_into().expect("checked length"),
     ));
     if count == 0 || count > MAX_PADDING_SCHEME_LENGTH {
         return Err(permission_denied("Young padding scheme 条目数量无效"));
     }
-    let authenticated_len = 1 + 2 + count * size_of::<u16>();
+    let directions = match version {
+        LEGACY_PADDING_SCHEME_VERSION => 1,
+        BIDIRECTIONAL_PADDING_SCHEME_VERSION => 2,
+        _ => return Err(permission_denied("Young padding scheme 版本无效")),
+    };
+    let authenticated_len = 1 + 2 + directions * count * size_of::<u16>();
     if payload.len() != authenticated_len + PADDING_SCHEME_TAG_BYTES {
         return Err(permission_denied("Young padding scheme 长度不一致"));
     }
+    let domain = if version == LEGACY_PADDING_SCHEME_VERSION {
+        b"young/padding-scheme/v1".as_slice()
+    } else {
+        b"young/padding-scheme/v2".as_slice()
+    };
     verify_hmac(
         key.as_bytes(),
-        &[
-            b"young/padding-scheme/v1",
-            &client_nonce,
-            &payload[..authenticated_len],
-        ],
+        &[domain, &client_nonce, &payload[..authenticated_len]],
         &payload[authenticated_len..],
     )?;
-    PaddingScheme::new(
-        payload[3..authenticated_len]
+    let decode_entries = |start: usize| {
+        payload[start..start + count * 2]
             .chunks_exact(2)
-            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]])),
-    )
-    .map_err(|_| permission_denied("Young padding scheme 包含非法长度"))
+            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+    };
+    let result = if version == LEGACY_PADDING_SCHEME_VERSION {
+        PaddingScheme::new(decode_entries(3))
+    } else {
+        PaddingScheme::bidirectional(decode_entries(3), decode_entries(3 + count * 2))
+    };
+    result.map_err(|_| permission_denied("Young padding scheme 包含非法长度"))
 }
 
 #[must_use]
@@ -586,7 +703,14 @@ pub fn encode_flow_open(
             .to_be_bytes(),
     );
     let padding_start = frame.len();
-    frame.resize(padding_start + padding_len, 0);
+    extend_deterministic_padding(
+        session_key,
+        b"young/flow-padding/v1",
+        &[&open.flow_id.to_be_bytes()],
+        &mut frame,
+        padding_len,
+    );
+    debug_assert_eq!(frame.len(), padding_start + padding_len);
     let tag = hmac_tag(session_key.as_bytes(), &[b"young/flow-open/v1", &frame]);
     frame.extend_from_slice(&tag[..FLOW_TAG_BYTES]);
     Ok(frame)
@@ -594,6 +718,22 @@ pub fn encode_flow_open(
 
 pub fn decode_flow_open(
     session_key: &SessionKey,
+    input: &[u8],
+) -> io::Result<Option<(FlowOpen, usize)>> {
+    decode_flow_open_inner(session_key, None, input)
+}
+
+pub fn decode_flow_open_padded(
+    session_key: &SessionKey,
+    scheme: &PaddingScheme,
+    input: &[u8],
+) -> io::Result<Option<(FlowOpen, usize)>> {
+    decode_flow_open_inner(session_key, Some(scheme), input)
+}
+
+fn decode_flow_open_inner(
+    session_key: &SessionKey,
+    scheme: Option<&PaddingScheme>,
     input: &[u8],
 ) -> io::Result<Option<(FlowOpen, usize)>> {
     const FIXED: usize = 2 + 1 + 1 + 8;
@@ -630,6 +770,19 @@ pub fn decode_flow_open(
         &[b"young/flow-open/v1", &input[..authenticated_len]],
         &input[authenticated_len..total],
     )?;
+    if let Some(scheme) = scheme {
+        let expected_padding =
+            scheme.padding_for(PaddingDirection::ClientToServer, flow_id) as usize;
+        if padding_len != expected_padding {
+            return Err(invalid_data("Young FlowOpen padding 与协商 scheme 不一致"));
+        }
+        verify_deterministic_padding(
+            session_key,
+            b"young/flow-padding/v1",
+            &[&flow_id.to_be_bytes()],
+            &input[padding_offset + 2..authenticated_len],
+        )?;
+    }
     Ok(Some((
         FlowOpen {
             kind,
@@ -683,12 +836,155 @@ pub fn decode_flow_response(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DataFrame {
+    pub sequence: u64,
+    pub payload: Vec<u8>,
+}
+
+#[must_use]
+pub fn padding_cursor_for_flow(
+    scheme: &PaddingScheme,
+    direction: PaddingDirection,
+    flow_id: u64,
+) -> usize {
+    let frame_seed = match direction {
+        // FlowOpen already uses flow_id directly in the C2S table. Starting
+        // data at the following entry avoids repeating the same length.
+        PaddingDirection::ClientToServer => flow_id.wrapping_add(1),
+        PaddingDirection::ServerToClient => flow_id,
+    };
+    (frame_seed % scheme.entries(direction).len() as u64) as usize
+}
+
+/// Encode application bytes into authenticated-transport data frames.
+///
+/// Data frames intentionally do not add a second per-frame MAC: QUIC AEAD
+/// already authenticates the WebTransport stream, its ordering and its stream
+/// identity. Avoiding redundant hashing keeps framing cheaper than the network
+/// encryption that already protects it.
+pub fn encode_data_frames(
+    session_key: &SessionKey,
+    scheme: &PaddingScheme,
+    direction: PaddingDirection,
+    flow_id: u64,
+    sequence: &mut u64,
+    padding_cursor: &mut usize,
+    payload: &[u8],
+) -> io::Result<Vec<Vec<u8>>> {
+    if payload.is_empty() {
+        return Ok(Vec::new());
+    }
+    let entries = scheme.entries(direction);
+    let mut next_sequence = *sequence;
+    let mut next_cursor = *padding_cursor;
+    let frames = payload
+        .chunks(MAX_DATA_PAYLOAD_BYTES)
+        .map(|chunk| {
+            let padding_len = usize::from(entries[next_cursor]);
+            let mut frame = Vec::with_capacity(DATA_FRAME_HEADER_BYTES + chunk.len() + padding_len);
+            frame.extend_from_slice(b"YP");
+            frame.push(VERSION);
+            frame.push(0);
+            frame.extend_from_slice(&next_sequence.to_be_bytes());
+            frame.extend_from_slice(
+                &u16::try_from(chunk.len())
+                    .map_err(|_| invalid_input("Young data frame payload 超过 u16"))?
+                    .to_be_bytes(),
+            );
+            frame.extend_from_slice(
+                &u16::try_from(padding_len)
+                    .map_err(|_| invalid_input("Young data frame padding 超过 u16"))?
+                    .to_be_bytes(),
+            );
+            frame.extend_from_slice(chunk);
+            extend_deterministic_padding(
+                session_key,
+                direction.tcp_padding_domain(),
+                &[&flow_id.to_be_bytes(), &next_sequence.to_be_bytes()],
+                &mut frame,
+                padding_len,
+            );
+            next_sequence = next_sequence
+                .checked_add(1)
+                .ok_or_else(|| invalid_input("Young data frame sequence 已耗尽"))?;
+            next_cursor += 1;
+            if next_cursor == entries.len() {
+                next_cursor = 0;
+            }
+            Ok(frame)
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    *sequence = next_sequence;
+    *padding_cursor = next_cursor;
+    Ok(frames)
+}
+
+pub fn decode_data_frame(
+    session_key: &SessionKey,
+    scheme: &PaddingScheme,
+    direction: PaddingDirection,
+    flow_id: u64,
+    expected_sequence: &mut u64,
+    padding_cursor: &mut usize,
+    input: &[u8],
+) -> io::Result<Option<(DataFrame, usize)>> {
+    if input.len() < DATA_FRAME_HEADER_BYTES {
+        return Ok(None);
+    }
+    if &input[..2] != b"YP" || input[2] != VERSION || input[3] != 0 {
+        return Err(invalid_data("Young data frame header 无效"));
+    }
+    let sequence = u64::from_be_bytes(input[4..12].try_into().expect("checked"));
+    let payload_len = usize::from(u16::from_be_bytes(
+        input[12..14].try_into().expect("checked"),
+    ));
+    let padding_len = usize::from(u16::from_be_bytes(
+        input[14..16].try_into().expect("checked"),
+    ));
+    if sequence != *expected_sequence {
+        return Err(invalid_data("Young data frame sequence 不连续"));
+    }
+    if payload_len == 0 || payload_len > MAX_DATA_PAYLOAD_BYTES {
+        return Err(invalid_data("Young data frame payload 长度无效"));
+    }
+    let entries = scheme.entries(direction);
+    if padding_len != usize::from(entries[*padding_cursor]) {
+        return Err(invalid_data(
+            "Young data frame padding 与协商 scheme 不一致",
+        ));
+    }
+    let frame_len = DATA_FRAME_HEADER_BYTES
+        .checked_add(payload_len)
+        .and_then(|length| length.checked_add(padding_len))
+        .ok_or_else(|| invalid_data("Young data frame 长度溢出"))?;
+    if input.len() < frame_len {
+        return Ok(None);
+    }
+    verify_deterministic_padding(
+        session_key,
+        direction.tcp_padding_domain(),
+        &[&flow_id.to_be_bytes(), &sequence.to_be_bytes()],
+        &input[DATA_FRAME_HEADER_BYTES + payload_len..frame_len],
+    )?;
+    let payload = input[DATA_FRAME_HEADER_BYTES..DATA_FRAME_HEADER_BYTES + payload_len].to_vec();
+    *expected_sequence = expected_sequence
+        .checked_add(1)
+        .ok_or_else(|| invalid_data("Young data frame sequence 已耗尽"))?;
+    *padding_cursor += 1;
+    if *padding_cursor == entries.len() {
+        *padding_cursor = 0;
+    }
+    Ok(Some((DataFrame { sequence, payload }, frame_len)))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UdpFragment {
     pub association_id: u64,
     pub packet_id: u32,
     pub index: u16,
     pub count: u16,
     pub total_len: u16,
+    pub padding_len: u16,
     pub payload: Vec<u8>,
 }
 
@@ -742,6 +1038,96 @@ pub fn encode_udp_fragments(
         .collect()
 }
 
+pub fn encode_udp_fragments_padded(
+    session_key: &SessionKey,
+    scheme: &PaddingScheme,
+    direction: PaddingDirection,
+    association_id: u64,
+    packet_id: u32,
+    payload: &[u8],
+    max_datagram_size: usize,
+) -> io::Result<Vec<Vec<u8>>> {
+    if payload.is_empty() || payload.len() > MAX_UDP_PAYLOAD_BYTES {
+        return Err(invalid_input("Young UDP payload 长度必须为 1..=65507"));
+    }
+    let overhead = PADDED_UDP_HEADER_BYTES + UDP_TAG_BYTES;
+    if max_datagram_size < overhead + 2 {
+        return Err(invalid_input(
+            "WebTransport datagram 上限不足以承载 padded Young header、payload 和 padding",
+        ));
+    }
+    let datagram_budget = max_datagram_size - overhead;
+    let mut parts = Vec::new();
+    let mut offset = 0;
+    while offset < payload.len() {
+        if parts.len() >= MAX_UDP_FRAGMENTS {
+            return Err(invalid_input("Young UDP fragment 数量超过上限"));
+        }
+        let fragment_index = parts.len();
+        let requested_padding = usize::from(scheme.padding_for(
+            direction,
+            udp_padding_index(association_id, packet_id, fragment_index as u16),
+        ));
+        let padding_len = requested_padding.min(datagram_budget.saturating_sub(1));
+        let payload_len = (datagram_budget - padding_len).min(payload.len() - offset);
+        if payload_len == 0 {
+            return Err(invalid_input("Young padded UDP fragment 无 payload 空间"));
+        }
+        parts.push((offset, payload_len, padding_len));
+        offset += payload_len;
+    }
+
+    let count =
+        u16::try_from(parts.len()).map_err(|_| invalid_input("Young UDP fragment 数量超过 u16"))?;
+    let total_len =
+        u16::try_from(payload.len()).map_err(|_| invalid_input("Young UDP payload 超过 u16"))?;
+    parts
+        .into_iter()
+        .enumerate()
+        .map(|(index, (offset, payload_len, padding_len))| {
+            let index =
+                u16::try_from(index).map_err(|_| invalid_input("Young UDP fragment index 过大"))?;
+            let mut frame = Vec::with_capacity(overhead + payload_len.saturating_add(padding_len));
+            frame.extend_from_slice(b"YD");
+            frame.push(VERSION);
+            frame.push(1);
+            frame.extend_from_slice(&association_id.to_be_bytes());
+            frame.extend_from_slice(&packet_id.to_be_bytes());
+            frame.extend_from_slice(&index.to_be_bytes());
+            frame.extend_from_slice(&count.to_be_bytes());
+            frame.extend_from_slice(&total_len.to_be_bytes());
+            frame.extend_from_slice(
+                &u16::try_from(payload_len)
+                    .map_err(|_| invalid_input("Young UDP fragment payload 超过 u16"))?
+                    .to_be_bytes(),
+            );
+            frame.extend_from_slice(
+                &u16::try_from(padding_len)
+                    .map_err(|_| invalid_input("Young UDP fragment padding 超过 u16"))?
+                    .to_be_bytes(),
+            );
+            frame.extend_from_slice(&payload[offset..offset + payload_len]);
+            extend_deterministic_padding(
+                session_key,
+                direction.udp_padding_domain(),
+                &[
+                    &association_id.to_be_bytes(),
+                    &packet_id.to_be_bytes(),
+                    &index.to_be_bytes(),
+                ],
+                &mut frame,
+                padding_len,
+            );
+            let tag = hmac_tag(
+                session_key.as_bytes(),
+                &[direction.udp_hmac_domain(), &frame],
+            );
+            frame.extend_from_slice(&tag[..UDP_TAG_BYTES]);
+            Ok(frame)
+        })
+        .collect()
+}
+
 pub fn decode_udp_fragment(session_key: &SessionKey, input: &[u8]) -> io::Result<UdpFragment> {
     if input.len() < UDP_HEADER_BYTES + UDP_TAG_BYTES
         || &input[..2] != b"YD"
@@ -779,7 +1165,81 @@ pub fn decode_udp_fragment(session_key: &SessionKey, input: &[u8]) -> io::Result
         index,
         count,
         total_len,
+        padding_len: 0,
         payload: input[UDP_HEADER_BYTES..authenticated_len].to_vec(),
+    })
+}
+
+pub fn decode_udp_fragment_padded(
+    session_key: &SessionKey,
+    scheme: &PaddingScheme,
+    direction: PaddingDirection,
+    input: &[u8],
+) -> io::Result<UdpFragment> {
+    if input.len() < PADDED_UDP_HEADER_BYTES + UDP_TAG_BYTES
+        || &input[..2] != b"YD"
+        || input[2] != VERSION
+        || input[3] != 1
+    {
+        return Err(invalid_data("Young padded UDP fragment header 无效"));
+    }
+    let authenticated_len = input.len() - UDP_TAG_BYTES;
+    verify_hmac_truncated(
+        session_key.as_bytes(),
+        &[direction.udp_hmac_domain(), &input[..authenticated_len]],
+        &input[authenticated_len..],
+    )?;
+    let association_id = u64::from_be_bytes(input[4..12].try_into().expect("checked"));
+    let packet_id = u32::from_be_bytes(input[12..16].try_into().expect("checked"));
+    let index = u16::from_be_bytes(input[16..18].try_into().expect("checked"));
+    let count = u16::from_be_bytes(input[18..20].try_into().expect("checked"));
+    let total_len = u16::from_be_bytes(input[20..22].try_into().expect("checked"));
+    let payload_len = usize::from(u16::from_be_bytes(
+        input[22..24].try_into().expect("checked"),
+    ));
+    let padding_len = u16::from_be_bytes(input[24..26].try_into().expect("checked"));
+    let expected_len = PADDED_UDP_HEADER_BYTES
+        .checked_add(payload_len)
+        .and_then(|length| length.checked_add(usize::from(padding_len)))
+        .and_then(|length| length.checked_add(UDP_TAG_BYTES))
+        .ok_or_else(|| invalid_data("Young padded UDP fragment 长度溢出"))?;
+    let requested_padding = scheme.padding_for(
+        direction,
+        udp_padding_index(association_id, packet_id, index),
+    );
+    if count == 0
+        || usize::from(count) > MAX_UDP_FRAGMENTS
+        || count > total_len
+        || index >= count
+        || total_len == 0
+        || usize::from(total_len) > MAX_UDP_PAYLOAD_BYTES
+        || payload_len == 0
+        || payload_len > usize::from(total_len)
+        || padding_len == 0
+        || padding_len > requested_padding
+        || input.len() != expected_len
+    {
+        return Err(invalid_data("Young padded UDP fragment metadata 无效"));
+    }
+    verify_deterministic_padding(
+        session_key,
+        direction.udp_padding_domain(),
+        &[
+            &association_id.to_be_bytes(),
+            &packet_id.to_be_bytes(),
+            &index.to_be_bytes(),
+        ],
+        &input[PADDED_UDP_HEADER_BYTES + payload_len
+            ..PADDED_UDP_HEADER_BYTES + payload_len + usize::from(padding_len)],
+    )?;
+    Ok(UdpFragment {
+        association_id,
+        packet_id,
+        index,
+        count,
+        total_len,
+        padding_len,
+        payload: input[PADDED_UDP_HEADER_BYTES..PADDED_UDP_HEADER_BYTES + payload_len].to_vec(),
     })
 }
 
@@ -932,6 +1392,59 @@ fn decode_target(input: &[u8]) -> io::Result<Option<(Target, usize)>> {
     Ok(Some((Target::new(host, port)?, consumed)))
 }
 
+fn extend_deterministic_padding(
+    session_key: &SessionKey,
+    domain: &[u8],
+    context: &[&[u8]],
+    output: &mut Vec<u8>,
+    padding_len: usize,
+) {
+    if padding_len == 0 {
+        return;
+    }
+    let start = output.len();
+    output.resize(start + padding_len, 0);
+    let mut hasher = blake3::Hasher::new_keyed(session_key.as_bytes());
+    hasher.update(domain);
+    for part in context {
+        hasher.update(part);
+    }
+    hasher.finalize_xof().fill(&mut output[start..]);
+}
+
+const fn udp_padding_index(association_id: u64, packet_id: u32, fragment_index: u16) -> u64 {
+    association_id
+        .wrapping_add(packet_id as u64)
+        .wrapping_add(fragment_index as u64)
+}
+
+fn verify_deterministic_padding(
+    session_key: &SessionKey,
+    domain: &[u8],
+    context: &[&[u8]],
+    padding: &[u8],
+) -> io::Result<()> {
+    let mut hasher = blake3::Hasher::new_keyed(session_key.as_bytes());
+    hasher.update(domain);
+    for part in context {
+        hasher.update(part);
+    }
+    let mut reader = hasher.finalize_xof();
+    let mut mismatch = 0_u8;
+    for actual in padding.chunks(64) {
+        let mut expected = [0; 64];
+        reader.fill(&mut expected[..actual.len()]);
+        for (left, right) in actual.iter().zip(expected) {
+            mismatch |= left ^ right;
+        }
+    }
+    if mismatch == 0 {
+        Ok(())
+    } else {
+        Err(invalid_data("Young deterministic padding 内容不匹配"))
+    }
+}
+
 fn hmac_tag(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key size");
     for part in parts {
@@ -1040,6 +1553,11 @@ mod tests {
         let encoded = encode_flow_open(&session, &open, 127).unwrap();
         assert_eq!(encoded, encode_flow_open(&session, &open, 127).unwrap());
         assert!(
+            encoded[encoded.len() - FLOW_TAG_BYTES - 127..encoded.len() - FLOW_TAG_BYTES]
+                .iter()
+                .any(|byte| *byte != 0)
+        );
+        assert!(
             decode_flow_open(&session, &encoded[..20])
                 .unwrap()
                 .is_none()
@@ -1047,6 +1565,29 @@ mod tests {
         let (decoded, consumed) = decode_flow_open(&session, &encoded).unwrap().unwrap();
         assert_eq!(decoded, open);
         assert_eq!(consumed, encoded.len());
+        let scheme = PaddingScheme::bidirectional([127], [127]).unwrap();
+        assert_eq!(
+            decode_flow_open_padded(&session, &scheme, &encoded)
+                .unwrap()
+                .unwrap()
+                .0,
+            open
+        );
+
+        let mut invalid_padding = encoded.clone();
+        let authenticated_len = invalid_padding.len() - FLOW_TAG_BYTES;
+        invalid_padding[authenticated_len - 1] ^= 1;
+        let replacement_tag = hmac_tag(
+            session.as_bytes(),
+            &[b"young/flow-open/v1", &invalid_padding[..authenticated_len]],
+        );
+        invalid_padding[authenticated_len..].copy_from_slice(&replacement_tag[..FLOW_TAG_BYTES]);
+        assert!(decode_flow_open(&session, &invalid_padding).is_ok());
+        assert!(
+            decode_flow_open_padded(&session, &scheme, &invalid_padding).is_err(),
+            "v2 FlowOpen padding bytes must be derived and verified, not merely authenticated"
+        );
+
         let mut tampered = encoded;
         tampered[15] ^= 1;
         assert!(decode_flow_open(&session, &tampered).is_err());
@@ -1058,13 +1599,22 @@ mod tests {
         let nonce = [7; 16];
         let scheme = generate_padding_scheme(17, 79, 64).unwrap();
         assert_eq!(scheme.len(), 64);
-        assert!(
-            scheme
-                .entries()
-                .iter()
-                .all(|length| (17..=79).contains(length))
-        );
-        assert_eq!(scheme.padding_for(0), scheme.padding_for(64));
+        assert!(scheme.is_bidirectional());
+        for direction in [
+            PaddingDirection::ClientToServer,
+            PaddingDirection::ServerToClient,
+        ] {
+            assert!(
+                scheme
+                    .entries(direction)
+                    .iter()
+                    .all(|length| (17..=79).contains(length))
+            );
+            assert_eq!(
+                scheme.padding_for(direction, 0),
+                scheme.padding_for(direction, 64)
+            );
+        }
 
         let encoded = encode_padding_scheme(&key, nonce, &scheme);
         assert_eq!(
@@ -1079,15 +1629,184 @@ mod tests {
         tampered[3] ^= 1;
         let tampered = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(tampered);
         assert!(decode_padding_scheme(&key, nonce, &tampered).is_err());
+
+        let legacy = decode_padding_scheme(
+            &key,
+            nonce,
+            &encode_legacy_padding_scheme(&key, nonce, &scheme),
+        )
+        .unwrap();
+        assert!(!legacy.is_bidirectional());
+        assert_eq!(
+            legacy.entries(PaddingDirection::ClientToServer),
+            scheme.entries(PaddingDirection::ClientToServer)
+        );
     }
 
     #[test]
     fn padding_scheme_rejects_invalid_limits() {
         assert!(generate_padding_scheme(80, 17, 64).is_err());
+        assert!(generate_padding_scheme(0, 1, 64).is_err());
         assert!(generate_padding_scheme(0, (MAX_PADDING_BYTES + 1) as u16, 64).is_err());
         assert!(generate_padding_scheme(0, 1, 0).is_err());
         assert!(generate_padding_scheme(0, 1, (MAX_PADDING_SCHEME_LENGTH + 1) as u16).is_err());
+        assert!(PaddingScheme::new([0]).is_err());
         assert!(decode_padding_scheme(&key(1), [0; 16], &"A".repeat(1024)).is_err());
+    }
+
+    #[test]
+    fn tcp_data_frames_pad_both_directions_and_validate_sequence() {
+        let scheme = PaddingScheme::bidirectional([3, 5], [7, 9]).unwrap();
+        let session = SessionKey::new([13; 32]);
+        let mut send_sequence = 0;
+        let mut send_cursor = 0;
+        let encoded = encode_data_frames(
+            &session,
+            &scheme,
+            PaddingDirection::ClientToServer,
+            42,
+            &mut send_sequence,
+            &mut send_cursor,
+            b"hello",
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        assert_eq!(encoded.len(), DATA_FRAME_HEADER_BYTES + 5 + 3);
+        assert!(
+            encoded[DATA_FRAME_HEADER_BYTES + 5..]
+                .iter()
+                .any(|byte| *byte != 0)
+        );
+        assert!(
+            decode_data_frame(
+                &session,
+                &scheme,
+                PaddingDirection::ClientToServer,
+                42,
+                &mut 0,
+                &mut 0,
+                &encoded[..DATA_FRAME_HEADER_BYTES + 4],
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        let mut receive_sequence = 0;
+        let mut receive_cursor = 0;
+        let (decoded, consumed) = decode_data_frame(
+            &session,
+            &scheme,
+            PaddingDirection::ClientToServer,
+            42,
+            &mut receive_sequence,
+            &mut receive_cursor,
+            &encoded,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(decoded.payload, b"hello");
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(receive_sequence, 1);
+        assert_eq!(receive_cursor, 1);
+
+        let mut wrong_sequence = 1;
+        assert!(
+            decode_data_frame(
+                &session,
+                &scheme,
+                PaddingDirection::ClientToServer,
+                42,
+                &mut wrong_sequence,
+                &mut 0,
+                &encoded,
+            )
+            .is_err()
+        );
+        assert!(
+            decode_data_frame(
+                &session,
+                &scheme,
+                PaddingDirection::ServerToClient,
+                42,
+                &mut 0,
+                &mut 0,
+                &encoded,
+            )
+            .is_err()
+        );
+
+        let same_lengths = PaddingScheme::bidirectional([3], [3]).unwrap();
+        assert!(
+            decode_data_frame(
+                &session,
+                &same_lengths,
+                PaddingDirection::ServerToClient,
+                42,
+                &mut 0,
+                &mut 0,
+                &encoded,
+            )
+            .is_err(),
+            "direction domain must be checked even when both tables contain the same length"
+        );
+
+        let mut tampered = encoded.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(
+            decode_data_frame(
+                &session,
+                &scheme,
+                PaddingDirection::ClientToServer,
+                42,
+                &mut 0,
+                &mut 0,
+                &tampered,
+            )
+            .is_err(),
+            "padding bytes must be derived and verified, not ignored"
+        );
+
+        let large_payload = vec![0x5a; MAX_DATA_PAYLOAD_BYTES * 2 + 19];
+        let mut send_sequence = 0;
+        let mut send_cursor =
+            padding_cursor_for_flow(&scheme, PaddingDirection::ServerToClient, 77);
+        let frames = encode_data_frames(
+            &session,
+            &scheme,
+            PaddingDirection::ServerToClient,
+            77,
+            &mut send_sequence,
+            &mut send_cursor,
+            &large_payload,
+        )
+        .unwrap();
+        assert_eq!(frames.len(), 3);
+        let wire = frames.concat();
+        let mut buffered = Vec::new();
+        let mut receive_sequence = 0;
+        let mut receive_cursor =
+            padding_cursor_for_flow(&scheme, PaddingDirection::ServerToClient, 77);
+        let mut decoded_payload = Vec::new();
+        for chunk in wire.chunks(997) {
+            buffered.extend_from_slice(chunk);
+            while let Some((frame, consumed)) = decode_data_frame(
+                &session,
+                &scheme,
+                PaddingDirection::ServerToClient,
+                77,
+                &mut receive_sequence,
+                &mut receive_cursor,
+                &buffered,
+            )
+            .unwrap()
+            {
+                decoded_payload.extend_from_slice(&frame.payload);
+                buffered.drain(..consumed);
+            }
+        }
+        assert!(buffered.is_empty());
+        assert_eq!(decoded_payload, large_payload);
     }
 
     #[test]
@@ -1118,5 +1837,79 @@ mod tests {
                 .or(output);
         }
         assert_eq!(output.unwrap(), payload);
+
+        let scheme = PaddingScheme::bidirectional([17, 31], [23, 47]).unwrap();
+        let mut fragments = encode_udp_fragments_padded(
+            &session,
+            &scheme,
+            PaddingDirection::ServerToClient,
+            99,
+            8,
+            &payload,
+            900,
+        )
+        .unwrap();
+        assert!(fragments.len() > 1);
+        fragments.reverse();
+        let mut reassembler = UdpReassembler::default();
+        let mut output = None;
+        for encoded in fragments {
+            let payload_len = usize::from(u16::from_be_bytes([encoded[22], encoded[23]]));
+            let padding_len = usize::from(u16::from_be_bytes([encoded[24], encoded[25]]));
+            assert!(
+                encoded[PADDED_UDP_HEADER_BYTES + payload_len
+                    ..PADDED_UDP_HEADER_BYTES + payload_len + padding_len]
+                    .iter()
+                    .any(|byte| *byte != 0)
+            );
+            let fragment = decode_udp_fragment_padded(
+                &session,
+                &scheme,
+                PaddingDirection::ServerToClient,
+                &encoded,
+            )
+            .unwrap();
+            assert!(fragment.padding_len > 0);
+            output = reassembler
+                .push(fragment, Instant::now())
+                .unwrap()
+                .or(output);
+        }
+        assert_eq!(output.unwrap(), payload);
+
+        let encoded = encode_udp_fragments_padded(
+            &session,
+            &PaddingScheme::bidirectional([19], [19]).unwrap(),
+            PaddingDirection::ClientToServer,
+            99,
+            9,
+            b"direction-bound",
+            1200,
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        assert!(
+            decode_udp_fragment_padded(
+                &session,
+                &PaddingScheme::bidirectional([19], [19]).unwrap(),
+                PaddingDirection::ServerToClient,
+                &encoded,
+            )
+            .is_err(),
+            "UDP authentication must bind the traffic direction"
+        );
+        let mut tampered = encoded;
+        tampered[PADDED_UDP_HEADER_BYTES + b"direction-bound".len()] ^= 1;
+        assert!(
+            decode_udp_fragment_padded(
+                &session,
+                &PaddingScheme::bidirectional([19], [19]).unwrap(),
+                PaddingDirection::ClientToServer,
+                &tampered,
+            )
+            .is_err(),
+            "UDP padding must be authenticated and validated"
+        );
     }
 }

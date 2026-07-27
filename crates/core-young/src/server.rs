@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use bytes::{Buf as _, BytesMut};
 use neqo_common::{Datagram, Header, Tos, header::HeadersExt as _};
 use neqo_http3::{
     Http3OrWebTransportStream, Http3Parameters, Http3Server, Http3ServerEvent, SessionAcceptAction,
@@ -28,10 +29,12 @@ use tokio::{
 use tracing::{debug, warn};
 
 use crate::codec::{
-    FlowKind, FlowResponse, KeyRing, ReplayCache, SessionKey, Status, Target, UdpReassembler,
-    decode_flow_open, decode_udp_fragment, derive_rotating_path, derive_session_key,
-    encode_flow_response, encode_padding_scheme, encode_udp_fragments, generate_padding_scheme,
-    server_accept_proof, unix_time_secs, verify_authorization,
+    FlowKind, FlowResponse, KeyRing, PaddingDirection, PaddingScheme, ReplayCache, SessionKey,
+    Status, Target, UdpReassembler, decode_data_frame, decode_flow_open, decode_flow_open_padded,
+    decode_udp_fragment, decode_udp_fragment_padded, derive_rotating_path, derive_session_key,
+    encode_data_frames, encode_flow_response, encode_legacy_padding_scheme, encode_padding_scheme,
+    encode_udp_fragments, encode_udp_fragments_padded, generate_padding_scheme,
+    padding_cursor_for_flow, server_accept_proof, unix_time_secs, verify_authorization,
 };
 
 const STREAM_CHUNK_BYTES: usize = 32 * 1024;
@@ -39,6 +42,7 @@ const MAX_FLOW_WRITE_BUFFER_BYTES: usize = 1024 * 1024;
 const EXPORTER_LABEL: &[u8] = b"young-session-v1";
 const EXPORTER_CONTEXT: &[u8] = b"wuther-core";
 const CAP_PADDING_SCHEME: u32 = 4;
+const CAP_BIDIRECTIONAL_PADDING: u32 = 8;
 const NSS_ANTI_REPLAY_WINDOW: Duration = Duration::from_secs(10);
 static NSS_DATABASE: OnceLock<PathBuf> = OnceLock::new();
 
@@ -105,7 +109,8 @@ impl YoungServerConfig {
         if self.max_streams == 0 || self.max_sessions == 0 || self.max_flows_per_session == 0 {
             return Err(invalid_input("Young server 资源上限必须大于 0"));
         }
-        if self.padding_min > self.padding_max
+        if self.padding_min == 0
+            || self.padding_min > self.padding_max
             || usize::from(self.padding_max) > crate::codec::MAX_PADDING_BYTES
             || self.padding_scheme_length == 0
             || usize::from(self.padding_scheme_length) > crate::codec::MAX_PADDING_SCHEME_LENGTH
@@ -224,6 +229,12 @@ struct ServerStream {
     flow_id: Option<u64>,
     target_input: Option<mpsc::Sender<Vec<u8>>>,
     target_task: Option<tokio::task::JoinHandle<()>>,
+    padded_data: bool,
+    data_buffer: BytesMut,
+    send_sequence: u64,
+    receive_sequence: u64,
+    send_padding_cursor: usize,
+    receive_padding_cursor: usize,
     writes: VecDeque<PendingWrite>,
     queued_write_bytes: usize,
     finish_after_writes: bool,
@@ -242,6 +253,8 @@ struct DecoyStream {
 struct SessionState {
     session: ServerSession,
     session_key: SessionKey,
+    padding_scheme: PaddingScheme,
+    bidirectional_padding: bool,
     reassembler: UdpReassembler,
     flow_count: usize,
 }
@@ -476,15 +489,21 @@ impl ServerDriver {
         }
         let proof = server_accept_proof(&key, nonce);
         let mut response_headers = vec![Header::new("sec-young-accept", proof)];
-        if capabilities & CAP_PADDING_SCHEME != 0 {
-            let scheme = generate_padding_scheme(
-                self.config.padding_min,
-                self.config.padding_max,
-                self.config.padding_scheme_length,
-            )?;
+        let padding_scheme = generate_padding_scheme(
+            self.config.padding_min,
+            self.config.padding_max,
+            self.config.padding_scheme_length,
+        )?;
+        let bidirectional_padding = capabilities & CAP_BIDIRECTIONAL_PADDING != 0;
+        if bidirectional_padding {
             response_headers.push(Header::new(
                 "sec-young-padding",
-                encode_padding_scheme(&key, nonce, &scheme),
+                encode_padding_scheme(&key, nonce, &padding_scheme),
+            ));
+        } else if capabilities & CAP_PADDING_SCHEME != 0 {
+            response_headers.push(Header::new(
+                "sec-young-padding",
+                encode_legacy_padding_scheme(&key, nonce, &padding_scheme),
             ));
         }
         session
@@ -502,6 +521,8 @@ impl ServerDriver {
             SessionState {
                 session,
                 session_key: derive_session_key(&key, &exporter, nonce),
+                padding_scheme,
+                bidirectional_padding,
                 reassembler: UdpReassembler::default(),
                 flow_count: 0,
             },
@@ -545,6 +566,7 @@ impl ServerDriver {
             let _ = stream.stream_close_send(Instant::now());
             return Ok(());
         }
+        let padded_data = session.bidirectional_padding;
         session.flow_count += 1;
         self.streams.insert(
             stream.stream_id(),
@@ -557,6 +579,12 @@ impl ServerDriver {
                 flow_id: None,
                 target_input: None,
                 target_task: None,
+                padded_data,
+                data_buffer: BytesMut::new(),
+                send_sequence: 0,
+                receive_sequence: 0,
+                send_padding_cursor: 0,
+                receive_padding_cursor: 0,
                 writes: VecDeque::new(),
                 queued_write_bytes: 0,
                 finish_after_writes: false,
@@ -580,12 +608,19 @@ impl ServerDriver {
         let mut reset_after_read = false;
         if !flow.opened {
             flow.open_buffer.extend_from_slice(&data);
-            let session_key = &self
+            let session = self
                 .sessions
                 .get(&flow.session_id)
-                .ok_or_else(|| not_connected("Young session 已关闭"))?
-                .session_key;
-            let decoded = match decode_flow_open(session_key, &flow.open_buffer) {
+                .ok_or_else(|| not_connected("Young session 已关闭"))?;
+            let decoded = match if flow.padded_data {
+                decode_flow_open_padded(
+                    &session.session_key,
+                    &session.padding_scheme,
+                    &flow.open_buffer,
+                )
+            } else {
+                decode_flow_open(&session.session_key, &flow.open_buffer)
+            } {
                 Ok(decoded) => decoded,
                 Err(error) => {
                     debug!(%error, "丢弃无效 Young flow open");
@@ -610,6 +645,16 @@ impl ServerDriver {
             flow.opened = true;
             flow.kind = Some(open.kind);
             flow.flow_id = Some(open.flow_id);
+            flow.send_padding_cursor = padding_cursor_for_flow(
+                &session.padding_scheme,
+                PaddingDirection::ServerToClient,
+                open.flow_id,
+            );
+            flow.receive_padding_cursor = padding_cursor_for_flow(
+                &session.padding_scheme,
+                PaddingDirection::ClientToServer,
+                open.flow_id,
+            );
             if open.kind == FlowKind::Udp && !remaining.is_empty() {
                 if fin {
                     flow.receive_finished = true;
@@ -635,19 +680,32 @@ impl ServerDriver {
                     self.commands.clone(),
                 )),
             });
-            if !remaining.is_empty() && target_input.try_send(remaining).is_err() {
-                reset_after_read = true;
+            if !remaining.is_empty() {
+                reset_after_read = deliver_client_tcp_data(
+                    flow,
+                    &session.session_key,
+                    &session.padding_scheme,
+                    remaining,
+                )?;
             }
         } else if flow.kind == Some(FlowKind::Udp) && !data.is_empty() {
             reset_after_read = true;
-        } else if !data.is_empty()
-            && let Some(target) = &flow.target_input
-            && target.try_send(data).is_err()
-        {
-            reset_after_read = true;
+        } else if !data.is_empty() {
+            let session = self
+                .sessions
+                .get(&flow.session_id)
+                .ok_or_else(|| not_connected("Young session 已关闭"))?;
+            reset_after_read =
+                deliver_client_tcp_data(flow, &session.session_key, &session.padding_scheme, data)?;
         }
         if reset_after_read {
             flow.target_input.take();
+            self.reset_stream(stream_id);
+            return Ok(());
+        }
+        if fin && flow.padded_data && !flow.data_buffer.is_empty() {
+            flow.target_input.take();
+            flow.receive_finished = true;
             self.reset_stream(stream_id);
             return Ok(());
         }
@@ -722,14 +780,28 @@ impl ServerDriver {
     }
 
     async fn handle_datagram(&mut self, session_id: StreamId, data: &[u8]) -> io::Result<()> {
-        let Some(session_key) = self
-            .sessions
-            .get(&session_id)
-            .map(|session| session.session_key.clone())
+        let Some((session_key, padding_scheme, bidirectional_padding)) =
+            self.sessions.get(&session_id).map(|session| {
+                (
+                    session.session_key.clone(),
+                    session.padding_scheme.clone(),
+                    session.bidirectional_padding,
+                )
+            })
         else {
             return Ok(());
         };
-        let Ok(fragment) = decode_udp_fragment(&session_key, data) else {
+        let decoded = if bidirectional_padding {
+            decode_udp_fragment_padded(
+                &session_key,
+                &padding_scheme,
+                PaddingDirection::ClientToServer,
+                data,
+            )
+        } else {
+            decode_udp_fragment(&session_key, data)
+        };
+        let Ok(fragment) = decoded else {
             return Ok(());
         };
         let association_id = fragment.association_id;
@@ -757,17 +829,40 @@ impl ServerDriver {
             }
             ServerCommand::StreamOutput { stream_id, payload } => {
                 let mut reset = false;
+                let session_material = self
+                    .streams
+                    .get(&stream_id)
+                    .and_then(|flow| self.sessions.get(&flow.session_id))
+                    .map(|session| (session.session_key.clone(), session.padding_scheme.clone()));
                 if let Some(flow) = self.streams.get_mut(&stream_id) {
-                    if flow.queued_write_bytes.saturating_add(payload.len())
+                    let frames = if flow.padded_data {
+                        let (session_key, scheme) = session_material
+                            .as_ref()
+                            .ok_or_else(|| not_connected("Young session 不存在"))?;
+                        encode_data_frames(
+                            session_key,
+                            scheme,
+                            PaddingDirection::ServerToClient,
+                            flow.flow_id.unwrap_or(0),
+                            &mut flow.send_sequence,
+                            &mut flow.send_padding_cursor,
+                            &payload,
+                        )?
+                    } else {
+                        vec![payload]
+                    };
+                    let wire_bytes = frames.iter().map(Vec::len).sum::<usize>();
+                    if flow.queued_write_bytes.saturating_add(wire_bytes)
                         > MAX_FLOW_WRITE_BUFFER_BYTES
                     {
                         reset = true;
                     } else {
-                        flow.queued_write_bytes += payload.len();
-                        flow.writes.push_back(PendingWrite {
-                            bytes: payload,
-                            offset: 0,
-                        });
+                        flow.queued_write_bytes += wire_bytes;
+                        flow.writes.extend(
+                            frames
+                                .into_iter()
+                                .map(|bytes| PendingWrite { bytes, offset: 0 }),
+                        );
                     }
                 }
                 if reset {
@@ -934,13 +1029,26 @@ impl ServerDriver {
             .ok_or_else(|| not_connected("Young session 不存在"))?;
         let max_size = usize::try_from(session.session.max_datagram_size().map_err(neqo_error)?)
             .map_err(|_| invalid_input("WebTransport datagram size 超过 usize"))?;
-        for fragment in encode_udp_fragments(
-            &session.session_key,
-            association_id,
-            packet_id,
-            payload,
-            max_size,
-        )? {
+        let fragments = if session.bidirectional_padding {
+            encode_udp_fragments_padded(
+                &session.session_key,
+                &session.padding_scheme,
+                PaddingDirection::ServerToClient,
+                association_id,
+                packet_id,
+                payload,
+                max_size,
+            )?
+        } else {
+            encode_udp_fragments(
+                &session.session_key,
+                association_id,
+                packet_id,
+                payload,
+                max_size,
+            )?
+        };
+        for fragment in fragments {
             session
                 .session
                 .send_datagram(&fragment, None, Instant::now())
@@ -985,6 +1093,39 @@ impl ServerDriver {
                 .stream_reset_send(neqo_http3::Error::HttpRequestRejected.code());
         }
         self.remove_stream(stream_id);
+    }
+}
+
+fn deliver_client_tcp_data(
+    flow: &mut ServerStream,
+    session_key: &SessionKey,
+    scheme: &PaddingScheme,
+    data: Vec<u8>,
+) -> io::Result<bool> {
+    let Some(target) = &flow.target_input else {
+        return Ok(true);
+    };
+    if !flow.padded_data {
+        return Ok(target.try_send(data).is_err());
+    }
+    flow.data_buffer.extend_from_slice(&data);
+    loop {
+        let Some((frame, consumed)) = decode_data_frame(
+            session_key,
+            scheme,
+            PaddingDirection::ClientToServer,
+            flow.flow_id.unwrap_or(0),
+            &mut flow.receive_sequence,
+            &mut flow.receive_padding_cursor,
+            &flow.data_buffer,
+        )?
+        else {
+            return Ok(false);
+        };
+        flow.data_buffer.advance(consumed);
+        if target.try_send(frame.payload).is_err() {
+            return Ok(true);
+        }
     }
 }
 

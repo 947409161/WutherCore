@@ -879,7 +879,8 @@ fn compile_young_listeners(listeners: &[YoungListen]) -> ConfigResult<Vec<YoungL
         {
             return Err(ConfigError::invalid("Young idleTimeout/资源上限无效").at(location));
         }
-        if listener.padding_min > listener.padding_max
+        if listener.padding_min == 0
+            || listener.padding_min > listener.padding_max
             || usize::from(listener.padding_max) > core_young::MAX_PADDING_BYTES
             || listener.padding_scheme_length == 0
             || usize::from(listener.padding_scheme_length) > core_young::MAX_PADDING_SCHEME_LENGTH
@@ -4862,6 +4863,7 @@ listen:
     #[test]
     fn young_listener_rejects_invalid_padding_scheme() {
         for padding in [
+            "paddingMin: 0",
             "paddingMin: 513\n      paddingMax: 512",
             "paddingMax: 4097",
             "paddingSchemeLength: 0",

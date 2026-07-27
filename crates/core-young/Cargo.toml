@@ -17,6 +17,8 @@ firefox-stack = [
 
 [dependencies]
 base64 = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true }
 hmac = { workspace = true }
 neqo-common = { workspace = true, optional = true }
 neqo-http3 = { workspace = true, optional = true }

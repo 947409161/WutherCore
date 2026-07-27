@@ -9,6 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use bytes::{Buf as _, BytesMut};
 use neqo_common::{Datagram, Header, Tos, event::Provider as _, header::HeadersExt as _};
 use neqo_http3::{
     Http3Client, Http3ClientEvent, Http3Parameters, Http3State, WebTransportEvent,
@@ -28,10 +29,12 @@ use tokio::{
 use tracing::{debug, warn};
 
 use crate::codec::{
-    DEFAULT_PADDING_SCHEME_LENGTH, FlowKind, FlowOpen, PaddingScheme, SessionKey, Status, Target,
-    UdpReassembler, YoungKey, create_authorization, decode_flow_response, decode_padding_scheme,
-    decode_udp_fragment, derive_rotating_path, derive_session_key, encode_flow_open,
-    encode_udp_fragments, generate_padding_scheme, unix_time_secs, verify_server_accept_proof,
+    DEFAULT_PADDING_SCHEME_LENGTH, FlowKind, FlowOpen, PaddingDirection, PaddingScheme, SessionKey,
+    Status, Target, UdpReassembler, YoungKey, create_authorization, decode_data_frame,
+    decode_flow_response, decode_padding_scheme, decode_udp_fragment, decode_udp_fragment_padded,
+    derive_rotating_path, derive_session_key, encode_data_frames, encode_flow_open,
+    encode_udp_fragments, encode_udp_fragments_padded, generate_padding_scheme,
+    padding_cursor_for_flow, unix_time_secs, verify_server_accept_proof,
 };
 
 const STREAM_BUFFER_BYTES: usize = 256 * 1024;
@@ -42,6 +45,7 @@ const EXPORTER_CONTEXT: &[u8] = b"wuther-core";
 const CAP_TCP: u32 = 1;
 const CAP_UDP: u32 = 2;
 const CAP_PADDING_SCHEME: u32 = 4;
+const CAP_BIDIRECTIONAL_PADDING: u32 = 8;
 
 #[derive(Clone)]
 pub struct YoungClientConfig {
@@ -90,7 +94,8 @@ impl YoungClientConfig {
                 "Young client server、server_name、authority 和 port 均不能为空",
             ));
         }
-        if self.padding_min > self.padding_max
+        if self.padding_min == 0
+            || self.padding_min > self.padding_max
             || usize::from(self.padding_max) > crate::codec::MAX_PADDING_BYTES
         {
             return Err(invalid_input("Young client padding 范围无效"));
@@ -298,6 +303,12 @@ struct ClientFlow {
     result: Option<OpenResult>,
     to_application: Option<mpsc::Sender<Vec<u8>>>,
     bridge_task: Option<tokio::task::JoinHandle<()>>,
+    padded_data: bool,
+    data_buffer: BytesMut,
+    send_sequence: u64,
+    receive_sequence: u64,
+    send_padding_cursor: usize,
+    receive_padding_cursor: usize,
     writes: VecDeque<PendingWrite>,
     queued_write_bytes: usize,
     finish_after_writes: bool,
@@ -317,6 +328,7 @@ struct ClientDriver {
     session_key: Option<SessionKey>,
     padding_scheme: PaddingScheme,
     next_padding_index: usize,
+    bidirectional_padding: bool,
     client_nonce: Option<[u8; 16]>,
     session_started: bool,
     pending: VecDeque<ClientCommand>,
@@ -354,6 +366,7 @@ impl ClientDriver {
             session_key: None,
             padding_scheme,
             next_padding_index: 0,
+            bidirectional_padding: false,
             client_nonce: None,
             session_started: false,
             pending: VecDeque::new(),
@@ -581,7 +594,7 @@ impl ClientDriver {
             &self.config.key,
             &self.config.authority,
             &path,
-            CAP_TCP | CAP_UDP | CAP_PADDING_SCHEME,
+            CAP_TCP | CAP_UDP | CAP_PADDING_SCHEME | CAP_BIDIRECTIONAL_PADDING,
         )?;
         let headers = [
             Header::new("authorization", format!("Bearer {authorization}")),
@@ -636,6 +649,7 @@ impl ClientDriver {
         {
             self.padding_scheme = decode_padding_scheme(&self.config.key, nonce, encoded_scheme)?;
             self.next_padding_index = 0;
+            self.bidirectional_padding = self.padding_scheme.is_bidirectional();
         }
         let mut exporter = [0; 32];
         self.client
@@ -679,16 +693,31 @@ impl ClientDriver {
             ClientCommand::SendStream { stream_id, payload } => {
                 let mut reset = false;
                 if let Some(flow) = self.flows.get_mut(&stream_id) {
-                    if flow.queued_write_bytes.saturating_add(payload.len())
+                    let frames = if flow.padded_data {
+                        encode_data_frames(
+                            self.session_key.as_ref().expect("ready"),
+                            &self.padding_scheme,
+                            PaddingDirection::ClientToServer,
+                            flow.flow_id,
+                            &mut flow.send_sequence,
+                            &mut flow.send_padding_cursor,
+                            &payload,
+                        )?
+                    } else {
+                        vec![payload]
+                    };
+                    let wire_bytes = frames.iter().map(Vec::len).sum::<usize>();
+                    if flow.queued_write_bytes.saturating_add(wire_bytes)
                         > MAX_FLOW_WRITE_BUFFER_BYTES
                     {
                         reset = true;
                     } else {
-                        flow.queued_write_bytes += payload.len();
-                        flow.writes.push_back(PendingWrite {
-                            bytes: payload,
-                            offset: 0,
-                        });
+                        flow.queued_write_bytes += wire_bytes;
+                        flow.writes.extend(
+                            frames
+                                .into_iter()
+                                .map(|bytes| PendingWrite { bytes, offset: 0 }),
+                        );
                     }
                 }
                 if reset {
@@ -746,11 +775,20 @@ impl ClientDriver {
             .map_err(neqo_error)?;
         let flow_id = self.next_flow_id;
         self.next_flow_id = self.next_flow_id.wrapping_add(1).max(1);
-        let padding = self.padding_scheme.entries()[self.next_padding_index];
-        self.next_padding_index += 1;
-        if self.next_padding_index == self.padding_scheme.len() {
-            self.next_padding_index = 0;
-        }
+        let padding = if self.bidirectional_padding {
+            self.padding_scheme
+                .padding_for(PaddingDirection::ClientToServer, flow_id)
+        } else {
+            let open_padding = self
+                .padding_scheme
+                .entries(PaddingDirection::ClientToServer);
+            let padding = open_padding[self.next_padding_index];
+            self.next_padding_index += 1;
+            if self.next_padding_index == open_padding.len() {
+                self.next_padding_index = 0;
+            }
+            padding
+        };
         let frame = encode_flow_open(
             self.session_key.as_ref().expect("ready"),
             &FlowOpen {
@@ -795,6 +833,16 @@ impl ClientDriver {
             }
         };
         let queued_write_bytes = frame.len();
+        let send_padding_cursor = padding_cursor_for_flow(
+            &self.padding_scheme,
+            PaddingDirection::ClientToServer,
+            flow_id,
+        );
+        let receive_padding_cursor = padding_cursor_for_flow(
+            &self.padding_scheme,
+            PaddingDirection::ServerToClient,
+            flow_id,
+        );
         self.flows.insert(
             stream_id,
             ClientFlow {
@@ -805,6 +853,12 @@ impl ClientDriver {
                 result: Some(result),
                 to_application,
                 bridge_task,
+                padded_data: self.bidirectional_padding,
+                data_buffer: BytesMut::new(),
+                send_sequence: 0,
+                receive_sequence: 0,
+                send_padding_cursor,
+                receive_padding_cursor,
                 writes: VecDeque::from([PendingWrite {
                     bytes: frame,
                     offset: 0,
@@ -872,6 +926,19 @@ impl ClientDriver {
             }
             if fin || length == 0 {
                 if fin {
+                    let truncated_frame = self
+                        .flows
+                        .get(&stream_id)
+                        .is_some_and(|flow| flow.padded_data && !flow.data_buffer.is_empty());
+                    if truncated_frame {
+                        let _ = self
+                            .client
+                            .as_mut()
+                            .expect("initialized")
+                            .cancel_fetch(stream_id, neqo_http3::Error::HttpRequestRejected.code());
+                        self.fail_flow(stream_id, "Young data frame 在 FIN 前被截断");
+                        break;
+                    }
                     let remove_after_read = self.flows.get_mut(&stream_id).is_some_and(|flow| {
                         flow.receive_finished = true;
                         flow.to_application.take();
@@ -942,16 +1009,21 @@ impl ClientDriver {
                     }));
                 }
             }
-            if !remaining.is_empty()
-                && flow.kind == FlowKind::Tcp
-                && let Some(sender) = &flow.to_application
-            {
-                reset_after_delivery = sender.try_send(remaining).is_err();
+            if !remaining.is_empty() && flow.kind == FlowKind::Tcp {
+                reset_after_delivery = deliver_tcp_data(
+                    flow,
+                    self.session_key.as_ref().expect("ready"),
+                    &self.padding_scheme,
+                    remaining,
+                )?;
             }
-        } else if flow.kind == FlowKind::Tcp
-            && let Some(sender) = &flow.to_application
-        {
-            reset_after_delivery = sender.try_send(payload).is_err();
+        } else if flow.kind == FlowKind::Tcp {
+            reset_after_delivery = deliver_tcp_data(
+                flow,
+                self.session_key.as_ref().expect("ready"),
+                &self.padding_scheme,
+                payload,
+            )?;
         }
         if reset_after_delivery {
             let _ = self
@@ -978,13 +1050,26 @@ impl ClientDriver {
         )
         .map_err(|_| invalid_input("WebTransport datagram size 超过 usize"))?;
         self.next_packet_id = self.next_packet_id.wrapping_add(1);
-        for fragment in encode_udp_fragments(
-            self.session_key.as_ref().expect("ready"),
-            association_id,
-            self.next_packet_id,
-            payload,
-            max_size,
-        )? {
+        let fragments = if self.bidirectional_padding {
+            encode_udp_fragments_padded(
+                self.session_key.as_ref().expect("ready"),
+                &self.padding_scheme,
+                PaddingDirection::ClientToServer,
+                association_id,
+                self.next_packet_id,
+                payload,
+                max_size,
+            )?
+        } else {
+            encode_udp_fragments(
+                self.session_key.as_ref().expect("ready"),
+                association_id,
+                self.next_packet_id,
+                payload,
+                max_size,
+            )?
+        };
+        for fragment in fragments {
             self.client
                 .as_mut()
                 .expect("initialized")
@@ -995,7 +1080,16 @@ impl ClientDriver {
     }
 
     async fn handle_udp_datagram(&mut self, datagram: &[u8]) -> io::Result<()> {
-        let fragment = decode_udp_fragment(self.session_key.as_ref().expect("ready"), datagram)?;
+        let fragment = if self.bidirectional_padding {
+            decode_udp_fragment_padded(
+                self.session_key.as_ref().expect("ready"),
+                &self.padding_scheme,
+                PaddingDirection::ServerToClient,
+                datagram,
+            )?
+        } else {
+            decode_udp_fragment(self.session_key.as_ref().expect("ready"), datagram)?
+        };
         let association_id = fragment.association_id;
         let Some(stream_id) = self.udp_streams.get(&association_id).copied() else {
             return Ok(());
@@ -1057,6 +1151,39 @@ impl ClientDriver {
         let stream_ids: Vec<_> = self.flows.keys().copied().collect();
         for stream_id in stream_ids {
             self.fail_flow(stream_id, &message);
+        }
+    }
+}
+
+fn deliver_tcp_data(
+    flow: &mut ClientFlow,
+    session_key: &SessionKey,
+    scheme: &PaddingScheme,
+    payload: Vec<u8>,
+) -> io::Result<bool> {
+    let Some(sender) = &flow.to_application else {
+        return Ok(false);
+    };
+    if !flow.padded_data {
+        return Ok(sender.try_send(payload).is_err());
+    }
+    flow.data_buffer.extend_from_slice(&payload);
+    loop {
+        let Some((frame, consumed)) = decode_data_frame(
+            session_key,
+            scheme,
+            PaddingDirection::ServerToClient,
+            flow.flow_id,
+            &mut flow.receive_sequence,
+            &mut flow.receive_padding_cursor,
+            &flow.data_buffer,
+        )?
+        else {
+            return Ok(false);
+        };
+        flow.data_buffer.advance(consumed);
+        if sender.try_send(frame.payload).is_err() {
+            return Ok(true);
         }
     }
 }

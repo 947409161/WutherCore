@@ -90,14 +90,19 @@ async fn neqo_webtransport_tcp_and_udp_round_trip() {
     .await
     .unwrap()
     .unwrap();
-    stream.write_all(b"young-over-neqo").await.unwrap();
+    let tcp_payload = (0..80_123)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    stream.write_all(&tcp_payload[..7]).await.unwrap();
+    stream.write_all(&tcp_payload[7..32_777]).await.unwrap();
+    stream.write_all(&tcp_payload[32_777..]).await.unwrap();
     stream.shutdown().await.unwrap();
-    let mut tcp_reply = [0; 15];
+    let mut tcp_reply = vec![0; tcp_payload.len()];
     tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut tcp_reply))
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(&tcp_reply, b"young-over-neqo");
+    assert_eq!(tcp_reply, tcp_payload);
 
     let udp = tokio::time::timeout(
         Duration::from_secs(10),
