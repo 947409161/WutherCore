@@ -163,7 +163,8 @@ async fn version_advertises_meta() {
     assert_eq!(resp.status(), StatusCode::OK);
     let v = body_json(resp).await;
     assert_eq!(v["meta"], Value::Bool(true));
-    assert_eq!(v["premium"], Value::Bool(true));
+    assert!(v.get("premium").is_none());
+    assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
 }
 
 #[tokio::test]
@@ -334,12 +335,12 @@ async fn configs_get_and_put_round_trip() {
     assert_eq!(v["log-level"], "info");
     // authentication 必须是用户名列表，不能回传 password 字段对象。
     assert!(v["authentication"].is_array());
-    // PUT 修改 mode + log-level（allow-lan 热切换已禁用，见下测）
+    // PATCH 修改 mode + log-level（Mihomo PUT 是完整配置重载）
     let resp = app
         .clone()
         .oneshot(
             Request::builder()
-                .method("PUT")
+                .method("PATCH")
                 .uri("/configs")
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"mode":"global","log-level":"debug"}"#))
@@ -370,7 +371,7 @@ async fn configs_put_rejects_allow_lan_hot_toggle() {
     let resp = app
         .oneshot(
             Request::builder()
-                .method("PUT")
+                .method("PATCH")
                 .uri("/configs")
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"allow-lan":true}"#))
@@ -454,10 +455,32 @@ async fn rules_serialize_steps() {
             .iter()
             .any(|r| r["type"] == "MATCH" || r["type"] == "GEOIP")
     );
+    assert_eq!(rules[0]["index"], 0);
+    assert_eq!(rules[0]["size"], -1);
 }
 
 #[tokio::test]
-async fn connections_close_all_returns_count() {
+async fn rules_disable_changes_route_engine_state() {
+    let state = build_state();
+    let runtime = state.runtime.clone();
+    let app = core_api::compat::router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/rules/disable")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"0":true}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(runtime.route.rule_disabled(0));
+}
+
+#[tokio::test]
+async fn connections_close_all_returns_no_content() {
     let app = core_api::compat::router(build_state());
     let resp = app
         .oneshot(
@@ -469,9 +492,7 @@ async fn connections_close_all_returns_count() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = body_json(resp).await;
-    assert_eq!(v["closed"], 0);
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 }
 
 #[tokio::test]
@@ -521,7 +542,7 @@ async fn connections_snapshot_uses_connection_manager() {
 }
 
 #[tokio::test]
-async fn logs_sse_replays_recent_history() {
+async fn logs_ndjson_replays_recent_history() {
     let state = build_state();
     state.runtime.logs.push("info", "boot marker");
 
@@ -534,12 +555,71 @@ async fn logs_sse_replays_recent_history() {
 
     let frame = tokio::time::timeout(Duration::from_secs(1), resp.into_body().frame())
         .await
-        .expect("logs SSE should yield history")
-        .expect("logs SSE frame")
-        .expect("logs SSE frame ok");
+        .expect("logs NDJSON should yield history")
+        .expect("logs NDJSON frame")
+        .expect("logs NDJSON frame ok");
     let bytes = frame.into_data().expect("data frame");
     let text = String::from_utf8(bytes.to_vec()).unwrap();
     assert!(text.contains("boot marker"), "{text}");
+    assert!(!text.starts_with("data:"), "{text}");
+}
+
+#[tokio::test]
+async fn storage_round_trip_matches_mihomo() {
+    let app = core_api::compat::router(build_state());
+    let put = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/storage/dashboard")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"theme":"dark"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(put.status(), StatusCode::NO_CONTENT);
+
+    let get = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/storage/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(body_json(get).await["theme"], "dark");
+
+    let delete = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/storage/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn dns_rejects_unknown_query_type() {
+    let app = core_api::compat::router(build_state());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/dns/query?name=example.com&type=BOGUS")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(resp).await["message"], "invalid query type");
 }
 
 #[tokio::test]

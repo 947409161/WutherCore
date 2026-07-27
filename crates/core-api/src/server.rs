@@ -151,10 +151,7 @@ impl ApiServer {
 /* ====================== `GET /` hello ====================== */
 
 async fn hello() -> impl IntoResponse {
-    Json(json!({
-        "hello": "clash.meta",
-        "version": env!("CARGO_PKG_VERSION"),
-    }))
+    Json(json!({"hello": "mihomo"}))
 }
 
 /* ====================== Auth middleware ====================== */

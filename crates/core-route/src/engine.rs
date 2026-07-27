@@ -3,7 +3,7 @@
 //! 输入：[`FlowContext`] —— 一次连接的目标（域名/IP/端口/网络/进程）。
 //! 输出：[`RouteDecision`] —— direct / block / group("xxx")。
 
-use std::{net::IpAddr, sync::Arc};
+use std::{collections::BTreeSet, net::IpAddr, sync::Arc};
 
 use core_config::runtime_plan::{RouteAction, RouteMatcher, RoutePlan};
 use core_ruleset::{RulesetIndex, RulesetInterfaceAddress, RulesetMatchContext};
@@ -160,6 +160,7 @@ pub struct RouteEngine {
     plan: Arc<RoutePlan>,
     extra_cidrs: Vec<IpNet>,
     rulesets: Option<Arc<RulesetIndex>>,
+    disabled_rules: Arc<parking_lot::RwLock<BTreeSet<usize>>>,
 }
 
 impl RouteEngine {
@@ -168,6 +169,7 @@ impl RouteEngine {
             plan: Arc::new(plan),
             extra_cidrs: Vec::new(),
             rulesets: None,
+            disabled_rules: Arc::new(parking_lot::RwLock::new(BTreeSet::new())),
         }
     }
 
@@ -176,6 +178,7 @@ impl RouteEngine {
             plan: Arc::new(plan),
             extra_cidrs: Vec::new(),
             rulesets: Some(rulesets),
+            disabled_rules: Arc::new(parking_lot::RwLock::new(BTreeSet::new())),
         }
     }
 
@@ -187,8 +190,30 @@ impl RouteEngine {
         self.rulesets.clone()
     }
 
+    /// Mihomo `PATCH /rules/disable` compatible runtime rule switch.
+    pub fn set_rule_disabled(&self, index: usize, disabled: bool) -> bool {
+        if index >= self.plan.steps.len() {
+            return false;
+        }
+        let mut rules = self.disabled_rules.write();
+        if disabled {
+            rules.insert(index);
+        } else {
+            rules.remove(&index);
+        }
+        true
+    }
+
+    pub fn rule_disabled(&self, index: usize) -> bool {
+        self.disabled_rules.read().contains(&index)
+    }
+
     pub fn decide(&self, ctx: &FlowContext) -> (RouteDecision, &'static str, String) {
-        for step in &self.plan.steps {
+        let disabled = self.disabled_rules.read();
+        for (index, step) in self.plan.steps.iter().enumerate() {
+            if disabled.contains(&index) {
+                continue;
+            }
             if step_matches(
                 &step.matcher,
                 ctx,

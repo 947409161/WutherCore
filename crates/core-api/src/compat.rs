@@ -41,19 +41,22 @@
 //!   POST   /upgrade/ui                      Dashboard 升级占位
 //! ```
 
-use std::{convert::Infallible, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use axum::{
     Json, Router,
+    body::Body,
     extract::{
         Path, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, StatusCode},
-    response::{
-        IntoResponse,
-        sse::{Event, Sse},
-    },
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
 use bytes::Bytes;
@@ -115,6 +118,14 @@ pub fn router(state: NativeState) -> Router {
             "/providers/proxies/:name/healthcheck",
             get(provider_proxy_healthcheck),
         )
+        .route(
+            "/providers/proxies/:provider/:proxy",
+            get(provider_proxy_node),
+        )
+        .route(
+            "/providers/proxies/:provider/:proxy/healthcheck",
+            get(provider_proxy_node_healthcheck),
+        )
         .route("/providers/rules", get(providers_rules))
         .route(
             "/providers/rules/:name",
@@ -122,8 +133,9 @@ pub fn router(state: NativeState) -> Router {
         )
         // ---------- rules ----------
         .route("/rules", get(rules))
+        .route("/rules/disable", axum::routing::patch(rules_disable))
         // ---------- configs ----------
-        .route("/configs", get(configs).put(configs_put).patch(configs_put))
+        .route("/configs", get(configs).put(configs_reload).patch(configs_put))
         .route("/configs/geo", post(configs_geo))
         // ---------- DNS / cache ----------
         .route("/dns/query", get(dns_query))
@@ -132,7 +144,12 @@ pub fn router(state: NativeState) -> Router {
         // ---------- misc ----------
         .route("/restart", post(restart))
         .route("/upgrade", post(upgrade_kernel))
+        .route("/upgrade/geo", post(configs_geo))
         .route("/upgrade/ui", post(upgrade_ui))
+        .route(
+            "/storage/:key",
+            get(storage_get).put(storage_put).delete(storage_delete),
+        )
         .with_state(state)
 }
 
@@ -140,8 +157,7 @@ pub fn router(state: NativeState) -> Router {
 
 async fn version() -> Json<Value> {
     Json(json!({
-        "version": format!("wuthercore {}", env!("CARGO_PKG_VERSION")),
-        "premium": true,
+        "version": env!("CARGO_PKG_VERSION"),
         "meta": true,
     }))
 }
@@ -164,10 +180,8 @@ async fn traffic(
         let rx = s.ws_hubs.traffic.subscribe();
         return ws.on_upgrade(move |sock| watch_to_ws(sock, rx, permit));
     }
-    // 非 WS：build_now 同步出一份最新（这会同时 push 到 hub watch，让 WS
-    // subscriber 能立刻拿到）。
-    let payload = s.ws_hubs.traffic.build_now();
-    json_text(payload).into_response()
+    let hub = s.ws_hubs.traffic.clone();
+    ndjson_interval(Duration::from_secs(1), move || hub.build_now())
 }
 
 async fn memory(
@@ -185,8 +199,30 @@ async fn memory(
         let rx = s.ws_hubs.memory.subscribe();
         return ws.on_upgrade(move |sock| watch_to_ws(sock, rx, permit));
     }
-    let payload = s.ws_hubs.memory.build_now();
-    json_text(payload).into_response()
+    let hub = s.ws_hubs.memory.clone();
+    ndjson_interval(Duration::from_secs(1), move || hub.build_now())
+}
+
+fn ndjson_interval<F>(interval: Duration, build: F) -> Response
+where
+    F: Fn() -> String + Send + Sync + 'static,
+{
+    let build = Arc::new(build);
+    let stream = futures::stream::unfold((), move |_| {
+        let build = build.clone();
+        async move {
+            tokio::time::sleep(interval).await;
+            let mut line = build();
+            line.push('\n');
+            Some((Ok::<Bytes, Infallible>(Bytes::from(line)), ()))
+        }
+    });
+    let mut response = Response::new(Body::from_stream(stream));
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static(JSON_CT),
+    );
+    response
 }
 
 /// 把 watch::Receiver<String> 桥接到一条 WebSocket。
@@ -212,16 +248,6 @@ async fn watch_to_ws(
     }
 }
 
-/// 用 String 直接 build text/json 响应，避免再走一次 serde。
-fn json_text(s: String) -> axum::response::Response {
-    let mut h = HeaderMap::new();
-    h.insert(
-        axum::http::header::CONTENT_TYPE,
-        axum::http::HeaderValue::from_static(JSON_CT),
-    );
-    (StatusCode::OK, h, s).into_response()
-}
-
 /// 进程级 WS 连接上限 —— 避免 dashboard 滥连耗尽 fd 表。
 fn ws_limiter() -> &'static Arc<WsConnectionLimiter> {
     use std::sync::OnceLock;
@@ -233,6 +259,8 @@ fn ws_limiter() -> &'static Arc<WsConnectionLimiter> {
 struct LogQ {
     #[serde(default)]
     level: Option<String>,
+    #[serde(default)]
+    format: Option<String>,
 }
 
 async fn logs(
@@ -240,23 +268,38 @@ async fn logs(
     Query(q): Query<LogQ>,
     ws: Option<WebSocketUpgrade>,
 ) -> axum::response::Response {
-    let level_filter = q.level.unwrap_or_else(|| "info".into());
-    if let Some(ws) = ws {
-        return ws.on_upgrade(move |sock| logs_ws(sock, s, level_filter));
+    let level_filter = q.level.unwrap_or_else(|| "info".into()).to_lowercase();
+    if !matches!(
+        level_filter.as_str(),
+        "debug" | "info" | "warning" | "warn" | "error" | "silent"
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"message": "Body invalid"})),
+        )
+            .into_response();
     }
-    // 没升级 WS 时返回 SSE，razord/yacd 历史版本会用。
-    let stream = log_event_stream(s, level_filter);
-    Sse::new(stream).into_response()
+    let structured = q.format.as_deref() == Some("structured");
+    if let Some(ws) = ws {
+        return ws.on_upgrade(move |sock| logs_ws(sock, s, level_filter, structured));
+    }
+    let stream = log_event_stream(s, level_filter, structured);
+    let mut response = Response::new(Body::from_stream(stream));
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static(JSON_CT),
+    );
+    response
 }
 
-async fn logs_ws(mut sock: WebSocket, s: NativeState, level_filter: String) {
+async fn logs_ws(mut sock: WebSocket, s: NativeState, level_filter: String, structured: bool) {
     // 原子拿历史 + 订阅，避免 push 在两步之间发生导致同事件被双投递。
     let (history, mut rx) = s.runtime.logs.subscribe_with_history();
     for ev in history {
         if !level_pass(&level_filter, &ev.level) {
             continue;
         }
-        let payload = serde_json::to_string(&ev).unwrap_or_default();
+        let payload = format_log_event(&ev, structured);
         if sock.send(Message::Text(payload)).await.is_err() {
             return;
         }
@@ -265,7 +308,7 @@ async fn logs_ws(mut sock: WebSocket, s: NativeState, level_filter: String) {
         if !level_pass(&level_filter, &ev.level) {
             continue;
         }
-        let payload = serde_json::to_string(&ev).unwrap_or_default();
+        let payload = format_log_event(&ev, structured);
         if sock.send(Message::Text(payload)).await.is_err() {
             break;
         }
@@ -275,27 +318,52 @@ async fn logs_ws(mut sock: WebSocket, s: NativeState, level_filter: String) {
 fn log_event_stream(
     s: NativeState,
     level_filter: String,
-) -> impl Stream<Item = Result<Event, Infallible>> {
+    structured: bool,
+) -> impl Stream<Item = Result<Bytes, Infallible>> {
     use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 
     // 与 WS 路径同因——保持 snapshot/subscribe 原子化避免事件双发。
     let (snapshot, rx) = s.runtime.logs.subscribe_with_history();
     let history_filter = level_filter.clone();
-    let history =
-        tokio_stream::iter(snapshot).filter_map(move |ev| log_event_sse(&history_filter, ev));
+    let history = tokio_stream::iter(snapshot)
+        .filter_map(move |ev| log_event_line(&history_filter, ev, structured));
     let live = BroadcastStream::new(rx).filter_map(move |r| match r {
-        Ok(ev) => log_event_sse(&level_filter, ev),
+        Ok(ev) => log_event_line(&level_filter, ev, structured),
         _ => None,
     });
     history.chain(live)
 }
 
-fn log_event_sse(filter: &str, ev: core_observe::LogEvent) -> Option<Result<Event, Infallible>> {
+fn log_event_line(
+    filter: &str,
+    ev: core_observe::LogEvent,
+    structured: bool,
+) -> Option<Result<Bytes, Infallible>> {
     if !level_pass(filter, &ev.level) {
         return None;
     }
-    let body = serde_json::to_string(&ev).unwrap_or_default();
-    Some(Ok(Event::default().data(body)))
+    Some(Ok(Bytes::from(format!(
+        "{}\n",
+        format_log_event(&ev, structured)
+    ))))
+}
+
+fn format_log_event(ev: &core_observe::LogEvent, structured: bool) -> String {
+    if !structured {
+        return serde_json::to_string(ev).unwrap_or_else(|_| "{}".into());
+    }
+    let level = if ev.level == "warning" {
+        "warn"
+    } else {
+        ev.level.as_str()
+    };
+    serde_json::to_string(&json!({
+        "time": clock_now(),
+        "level": level,
+        "message": ev.payload,
+        "fields": [],
+    }))
+    .unwrap_or_else(|_| "{}".into())
 }
 
 fn level_pass(filter: &str, msg: &str) -> bool {
@@ -324,10 +392,6 @@ async fn connections(
     ws: Option<WebSocketUpgrade>,
 ) -> axum::response::Response {
     if let Some(ws) = ws {
-        // 注意：interval 参数只在历史代码里影响 per-client tick；现在 hub 全局
-        // 用 connections_interval（在 server.rs 启动时配置）。query 参数仍接受
-        // 为了向后兼容，但忽略。
-        let _ = q.interval;
         let Some(permit) = ws_limiter().try_acquire() else {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -335,6 +399,10 @@ async fn connections(
             )
                 .into_response();
         };
+        if let Some(interval) = q.interval {
+            let interval = Duration::from_millis(interval.max(100));
+            return ws.on_upgrade(move |sock| connections_to_ws(sock, s, interval, permit));
+        }
         let rx = s.ws_hubs.connections.subscribe();
         return ws.on_upgrade(move |sock| watch_to_ws(sock, rx, permit));
     }
@@ -345,6 +413,22 @@ async fn connections(
         .connections
         .fetch_bytes(move || build_connections_value(&runtime));
     json_bytes(bytes)
+}
+
+async fn connections_to_ws(
+    mut sock: WebSocket,
+    s: NativeState,
+    interval: Duration,
+    _permit: crate::compat_security::WsPermit,
+) {
+    loop {
+        let payload = serde_json::to_string(&build_connections_value(&s.runtime))
+            .unwrap_or_else(|_| "{}".into());
+        if sock.send(Message::Text(payload)).await.is_err() {
+            return;
+        }
+        tokio::time::sleep(interval).await;
+    }
 }
 
 fn build_connections_value(runtime: &Arc<Runtime>) -> Value {
@@ -380,10 +464,9 @@ fn build_connections_value(runtime: &Arc<Runtime>) -> Value {
 }
 
 async fn connections_close_all(State(s): State<NativeState>) -> impl IntoResponse {
-    let n = s.runtime.connections.close_all();
+    s.runtime.connections.close_all();
     s.caches.invalidate_connection_state();
-    // mihomo 在 200 OK 下返回空 body；这里返回 {closed} 兼容已有脚本。
-    Json(json!({"closed": n}))
+    StatusCode::NO_CONTENT
 }
 
 async fn connections_close_one(
@@ -393,13 +476,8 @@ async fn connections_close_one(
     // 同时兼容 numeric id 与 uuid 字符串（mihomo dashboard 传 uuid）。
     if s.runtime.connections.close_by_uuid_or_numeric(&id) {
         s.caches.invalidate_connection_state();
-        return (StatusCode::NO_CONTENT, Json(json!({}))).into_response();
     }
-    (
-        StatusCode::NOT_FOUND,
-        Json(json!({"message": "no such connection"})),
-    )
-        .into_response()
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn connections_smart_block(
@@ -534,6 +612,8 @@ struct DelayQ {
     url: Option<String>,
     #[serde(default)]
     timeout: Option<u64>,
+    #[serde(default)]
+    expected: Option<String>,
 }
 
 async fn proxy_delay(
@@ -541,6 +621,14 @@ async fn proxy_delay(
     Path(name): Path<String>,
     Query(q): Query<DelayQ>,
 ) -> axum::response::Response {
+    let Some(url) = q.url.as_deref().filter(|url| !url.is_empty()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"message": "Body invalid"})),
+        )
+            .into_response();
+    };
+    let _expected = q.expected.as_deref();
     let to = q.timeout.map(Duration::from_millis);
     // Mihomo `proxy.URLTest()` 对 group 名递归到当前选中成员；WutherCore 的
     // `test_node` 只查 outbounds 注册表（不含 group），group 名直接 UnknownNode，
@@ -566,7 +654,7 @@ async fn proxy_delay(
     for i in 0..MAX_SAMPLES {
         match s
             .urltest
-            .test_node(&s.runtime, &target, q.url.as_deref(), to)
+            .test_node(&s.runtime, &target, Some(url), to)
             .await
         {
             Ok(ms) => {
@@ -581,9 +669,13 @@ async fn proxy_delay(
 
     if samples.is_empty() {
         return (
-            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::GATEWAY_TIMEOUT,
             Json(json!({
-                "message": last_err.unwrap_or_else(|| "An error occurred in the delay test".into())
+                "message": if last_err.as_deref().is_some_and(|e| e.to_ascii_lowercase().contains("timeout")) {
+                    "Timeout".to_string()
+                } else {
+                    last_err.unwrap_or_else(|| "An error occurred in the delay test".into())
+                }
             })),
         )
             .into_response();
@@ -591,7 +683,7 @@ async fn proxy_delay(
 
     samples.sort_unstable();
     let median = samples[samples.len() / 2];
-    Json(json!({"delay": median, "meanDelay": median})).into_response()
+    Json(json!({"delay": median})).into_response()
 }
 
 /* ====================== group (mihomo meta API) ====================== */
@@ -630,6 +722,14 @@ async fn group_delay(
     Path(name): Path<String>,
     Query(q): Query<DelayQ>,
 ) -> axum::response::Response {
+    let Some(url) = q.url.clone().filter(|url| !url.is_empty()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"message": "Body invalid"})),
+        )
+            .into_response();
+    };
+    let _expected = q.expected.as_deref();
     let members = match s.runtime.groups.read().get(&name) {
         Some(g) => g.members().to_vec(),
         None => {
@@ -643,7 +743,7 @@ async fn group_delay(
     let to = q.timeout.map(Duration::from_millis);
     // sing-box GroupBase.URLTest: 并发上限 4，避免 1000 节点同时拨号互相
     // 抢带宽导致测速值被网络拥塞放大。
-    let body = group_delay_bounded(&s, &members, q.url, to, 4).await;
+    let body = group_delay_bounded(&s, &members, Some(url), to, 4).await;
     Json(Value::Object(body)).into_response()
 }
 
@@ -771,6 +871,7 @@ fn collect_proxy_map(s: &NativeState) -> Map<String, Value> {
                 "alive": alive,
                 "delay": delay,
                 "udp": true,
+                "uot": false,
                 "xudp": false,
                 "tfo": false,
                 "mptcp": false,
@@ -788,6 +889,8 @@ fn collect_proxy_map(s: &NativeState) -> Map<String, Value> {
             "type": "Direct", "name": "DIRECT",
             "history": [], "extra": {},
             "udp": true, "xudp": false, "tfo": false, "mptcp": false, "smux": false,
+            "uot": false, "interface": "", "routing-mark": 0,
+            "provider-name": "", "dialer-proxy": "",
             "alive": true, "delay": 0,
         }),
     );
@@ -797,6 +900,8 @@ fn collect_proxy_map(s: &NativeState) -> Map<String, Value> {
             "type": "Reject", "name": "REJECT",
             "history": [], "extra": {},
             "udp": true, "xudp": false, "tfo": false, "mptcp": false, "smux": false,
+            "uot": false, "interface": "", "routing-mark": 0,
+            "provider-name": "", "dialer-proxy": "",
             "alive": true, "delay": 0,
         }),
     );
@@ -821,6 +926,7 @@ fn collect_proxy_map(s: &NativeState) -> Map<String, Value> {
             "alive": global_alive,
             "delay": global_delay,
             "udp": true,
+            "uot": false,
             "xudp": false,
             "tfo": false,
             "mptcp": false,
@@ -830,6 +936,7 @@ fn collect_proxy_map(s: &NativeState) -> Map<String, Value> {
             "fixed": "",
             "expectedStatus": "",
             "testUrl": default_url,
+            "emptyFallback": false,
         }),
     );
     proxies
@@ -853,6 +960,11 @@ fn group_json(
         .filter(|s| !s.is_empty());
 
     if let Some(obj) = json.as_object_mut() {
+        if obj.get("type").and_then(Value::as_str) == Some("LoadBalance") {
+            obj.remove("now");
+            obj.remove("strategy");
+            obj.remove("fixed");
+        }
         // 默认填空 history / alive / delay，避免 dashboard 取不到字段
         // 时把 group 渲染为"超时"。
         if !obj.contains_key("history") {
@@ -861,6 +973,19 @@ fn group_json(
         if !obj.contains_key("delay") {
             obj.insert("delay".into(), Value::from(0u64));
         }
+        obj.entry("uot").or_insert(Value::Bool(false));
+        obj.entry("xudp").or_insert(Value::Bool(false));
+        obj.entry("tfo").or_insert(Value::Bool(false));
+        obj.entry("mptcp").or_insert(Value::Bool(false));
+        obj.entry("smux").or_insert(Value::Bool(false));
+        obj.entry("interface")
+            .or_insert(Value::String(String::new()));
+        obj.entry("routing-mark").or_insert(Value::from(0));
+        obj.entry("provider-name")
+            .or_insert(Value::String(String::new()));
+        obj.entry("dialer-proxy")
+            .or_insert(Value::String(String::new()));
+        obj.entry("emptyFallback").or_insert(Value::Bool(false));
         if let Some(now_node) = now.as_deref() {
             let history = node_history(urltest, runtime, now_node, default_url);
             let alive = urltest.alive_for_url(now_node, default_url);
@@ -1024,12 +1149,54 @@ async fn provider_proxy_healthcheck(
     Path(name): Path<String>,
 ) -> axum::response::Response {
     let nodes: Vec<String> = nodes_in_provider(&s, &name);
-    let res = s.urltest.test_many(&s.runtime, &nodes, None, None).await;
-    let body: Map<String, Value> = res
-        .into_iter()
-        .map(|(n, r)| (n, r.map(Value::from).unwrap_or(Value::from(0))))
-        .collect();
-    Json(Value::Object(body)).into_response()
+    if nodes.is_empty() && !s.runtime.plan.feeds.contains_key(&name) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"message": "Resource not found"})),
+        )
+            .into_response();
+    }
+    let runtime = s.runtime.clone();
+    let urltest = s.urltest.clone();
+    tokio::spawn(async move {
+        let _ = urltest.test_many(&runtime, &nodes, None, None).await;
+    });
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn provider_proxy_node(
+    State(s): State<NativeState>,
+    Path((provider, proxy)): Path<(String, String)>,
+) -> Response {
+    if !nodes_in_provider(&s, &provider)
+        .iter()
+        .any(|name| name == &proxy)
+    {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"message": "Resource not found"})),
+        )
+            .into_response();
+    }
+    proxy_one(State(s), Path(proxy)).await
+}
+
+async fn provider_proxy_node_healthcheck(
+    State(s): State<NativeState>,
+    Path((provider, proxy)): Path<(String, String)>,
+    Query(q): Query<DelayQ>,
+) -> Response {
+    if !nodes_in_provider(&s, &provider)
+        .iter()
+        .any(|name| name == &proxy)
+    {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"message": "Resource not found"})),
+        )
+            .into_response();
+    }
+    proxy_delay(State(s), Path(proxy), Query(q)).await
 }
 
 fn nodes_in_provider(s: &NativeState, name: &str) -> Vec<String> {
@@ -1076,9 +1243,19 @@ fn provider_json(s: &NativeState, name: &str) -> Value {
                         "type": map_proto(n.protocol.as_str()),
                         "name": n.name,
                         "history": history,
+                        "extra": {},
                         "alive": urltest.alive_for_url(&n.name, &default_url),
                         "delay": delay,
                         "udp": true,
+                        "uot": false,
+                        "xudp": false,
+                        "tfo": false,
+                        "mptcp": false,
+                        "smux": false,
+                        "interface": "",
+                        "routing-mark": 0,
+                        "provider-name": name,
+                        "dialer-proxy": "",
                     })
                 })
                 .collect();
@@ -1111,9 +1288,19 @@ fn provider_json(s: &NativeState, name: &str) -> Value {
                     "type": map_proto(n.protocol.as_str()),
                     "name": n.name,
                     "history": history,
+                    "extra": {},
                     "alive": urltest.alive_for_url(&n.name, &default_url),
                     "delay": delay,
                     "udp": true,
+                    "uot": false,
+                    "xudp": false,
+                    "tfo": false,
+                    "mptcp": false,
+                    "smux": false,
+                    "interface": "",
+                    "routing-mark": 0,
+                    "provider-name": name,
+                    "dialer-proxy": "",
                 })
             })
             .collect();
@@ -1133,45 +1320,41 @@ fn provider_json(s: &NativeState, name: &str) -> Value {
             )
         })
         .unwrap_or((0, 0, 0, false, 0, String::new(), None));
+    let configured_url = s
+        .runtime
+        .plan
+        .feeds
+        .get(name)
+        .map(|feed| feed.url.as_str())
+        .unwrap_or_default();
+    let url = if url.is_empty() {
+        configured_url.to_string()
+    } else {
+        url
+    };
     let vehicle_type = if url.is_empty() { "File" } else { "HTTP" };
-    let userinfo_json = userinfo
-        .map(|ui| {
+    let mut provider = json!({
+        "name": name,
+        "type": "Proxy",
+        "vehicleType": vehicle_type,
+        "proxies": nodes,
+        "testUrl": default_url,
+        "expectedStatus": "*",
+        "updatedAt": iso8601(last_ms / 1000),
+    });
+    if let Some(ui) = userinfo {
+        provider.as_object_mut().expect("provider object").insert(
+            "subscriptionInfo".into(),
             json!({
                 "Upload":   ui.upload,
                 "Download": ui.download,
                 "Total":    ui.total,
                 "Expire":   ui.expire,
-            })
-        })
-        .unwrap_or_else(|| {
-            json!({
-                "Upload":   0,
-                "Download": 0,
-                "Total":    0,
-                "Expire":   0,
-            })
-        });
-    json!({
-        "name": name,
-        "type": "Proxy",
-        "vehicleType": vehicle_type,
-        "proxies": nodes,
-        "updatedAt": iso8601(last_ms / 1000),
-        "expectedStatus": "*",
-        // 订阅用量四元组 —— 解析自 HTTP 响应的 Subscription-Userinfo
-        // 或同义头。机场没回该头时四字段全 0，dashboard 视为"无配额信息"。
-        "subscriptionInfo": userinfo_json,
-        "healthCheck": {
-            "enable":   true,
-            "url":      default_url,
-            "interval": every_secs,
-            "lazy":     false,
-        },
-        // 私有扩展字段（dashboard 有就显示，没有就忽略）
-        "nextDueAt": iso8601(next_ms / 1000),
-        "rawBytes": raw_bytes,
-        "fromCache": from_cache,
-    })
+            }),
+        );
+    }
+    let _ = (next_ms, raw_bytes, from_cache, every_secs);
+    provider
 }
 
 async fn providers_rules(State(s): State<NativeState>) -> axum::response::Response {
@@ -1219,14 +1402,12 @@ async fn provider_rule_refresh(
 }
 
 fn rule_provider_json(name: &str, set: &core_config::model::RuleSetSpec) -> Value {
-    // mihomo 字段：vehicleType ∈ {HTTP, FILE, INLINE} 全大写；behavior ∈
-    // {DOMAIN, IPCIDR, CLASSICAL} 全大写。
     let vehicle_type = if set.url.is_some() {
         "HTTP"
     } else if set.path.is_some() {
-        "FILE"
+        "File"
     } else {
-        "INLINE"
+        "Inline"
     };
     let lowered = set.r#type.to_lowercase();
     let behavior = match lowered.as_str() {
@@ -1240,7 +1421,11 @@ fn rule_provider_json(name: &str, set: &core_config::model::RuleSetSpec) -> Valu
         "type": "Rule",
         "vehicleType": vehicle_type,
         "behavior": behavior,
-        "format": set.format.clone().unwrap_or_else(|| "yaml".into()),
+        "format": match set.format.as_deref().unwrap_or("yaml").to_ascii_lowercase().as_str() {
+            "text" => "TextRule",
+            "mrs" => "MrsRule",
+            _ => "YamlRule",
+        },
         "ruleCount": set.payload.len(),
         "updatedAt": iso8601_now(),
     })
@@ -1260,7 +1445,7 @@ async fn rules(State(s): State<NativeState>) -> axum::response::Response {
 fn build_rules_value(runtime: &Arc<Runtime>) -> Value {
     use core_config::runtime_plan::{RouteAction, RouteMatcher};
     let mut out = Vec::new();
-    for st in &runtime.plan.route.steps {
+    for (index, st) in runtime.plan.route.steps.iter().enumerate() {
         let (rtype, payload) = match &st.matcher {
             RouteMatcher::Any => ("MATCH", String::new()),
             RouteMatcher::Home => ("DOMAIN-SUFFIX", "lan,local,arpa".into()),
@@ -1287,12 +1472,38 @@ fn build_rules_value(runtime: &Arc<Runtime>) -> Value {
             RouteAction::Group(g) => g.clone(),
         };
         out.push(json!({
+            "index": index,
             "type": rtype,
             "payload": payload,
             "proxy": proxy,
+            "size": -1,
         }));
     }
     json!({"rules": out})
+}
+
+async fn rules_disable(
+    State(s): State<NativeState>,
+    Json(body): Json<HashMap<String, bool>>,
+) -> Response {
+    for (index, disabled) in body {
+        let Ok(index) = index.parse::<usize>() else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"message": "Body invalid"})),
+            )
+                .into_response();
+        };
+        if !s.runtime.route.set_rule_disabled(index, disabled) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"message": "Body invalid"})),
+            )
+                .into_response();
+        }
+    }
+    s.caches.invalidate_rule_state();
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /* ====================== configs ====================== */
@@ -1337,13 +1548,14 @@ fn build_configs_value(s: &NativeState) -> Value {
         "tproxy-port": 0,
         "mixed-port": port,
         "authentication": authentication,
+        "skip-auth-prefixes": [],
+        "lan-allowed-ips": [],
+        "lan-disallowed-ips": [],
         "allow-lan": mc.allow_lan,
         "bind-address": "*",
+        "inbound-tfo": false,
+        "inbound-mptcp": false,
         "mode": mc.mode,
-        // sing-box 与 mihomo 的 dashboard 都看 mode-list；rule/global/direct 三态
-        // 是 mihomo 内核的标准三档；dashboard 用它生成下拉选项。
-        "mode-list": ["rule", "global", "direct"],
-        "modes": ["rule", "global", "direct"],
         "log-level": mc.log_level,
         "ipv6": mc.ipv6,
         "tun": {
@@ -1352,15 +1564,30 @@ fn build_configs_value(s: &NativeState) -> Value {
             "device": s.runtime.plan.capture.tun.interface_name.clone().unwrap_or_default(),
         },
         "find-process-mode": find_process_mode,
-        // mihomo 配置项；WutherCore 没有暴露开关时按 sing-box 默认行为返回。
         "unified-delay": false,
         "tcp-concurrent": true,
         "geo-update-interval": 24,
+        "geo-auto-update": false,
+        "geodata-mode": false,
+        "geodata-loader": "standard",
+        "geosite-matcher": "succinct",
         "interface-name": "",
-        "global-client-fingerprint": "",
-        // dashboard 通常会读这俩；空串表示走默认路由。
-        "geox-url": {},
+        "routing-mark": 0,
+        "geox-url": {
+            "geo-ip": "",
+            "mmdb": "",
+            "asn": "",
+            "geo-site": "",
+        },
+        "sniffing": false,
         "global-ua": "",
+        "etag-support": true,
+        "keep-alive-idle": 15,
+        "keep-alive-interval": 15,
+        "disable-keep-alive": false,
+        "tuic-server": {},
+        "ss-config": "",
+        "vmess-config": "",
     })
 }
 
@@ -1382,6 +1609,35 @@ struct ConfigsPut {
 struct TunPut {
     #[serde(default)]
     enable: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+struct ConfigReload {
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    payload: Option<String>,
+}
+
+async fn configs_reload(
+    State(_s): State<NativeState>,
+    Query(_query): Query<HashMap<String, String>>,
+    Json(body): Json<ConfigReload>,
+) -> Response {
+    if body.path.as_deref().unwrap_or_default().is_empty()
+        && body.payload.as_deref().unwrap_or_default().is_empty()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"message": "Body invalid"})),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({"message": "runtime config reload is not supported"})),
+    )
+        .into_response()
 }
 
 async fn configs_put(
@@ -1492,7 +1748,13 @@ async fn dns_query(
         "SRV" => 33,
         "HTTPS" => 65,
         "SVCB" => 64,
-        _ => 1,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"message": "invalid query type"})),
+            )
+                .into_response();
+        }
     };
     let answers = s
         .runtime
@@ -1500,7 +1762,7 @@ async fn dns_query(
         .resolve_compat(&name, qtype_label.as_str())
         .await;
     // sing-box `dnsRouter`: 用 mihomo `Question` 字段大写形式（Name/Qtype/Qclass）。
-    Json(json!({
+    let mut response = json!({
         "Status": 0,
         "TC": false,
         "RD": true,
@@ -1512,27 +1774,61 @@ async fn dns_query(
             "Qtype": qtype_num,
             "Qclass": 1,
         }],
-        "Answer": answers,
-        "Server": "internal",
-    }))
-    .into_response()
+    });
+    if let Value::Array(answers) = answers {
+        if !answers.is_empty() {
+            response
+                .as_object_mut()
+                .expect("dns response object")
+                .insert("Answer".into(), Value::Array(answers));
+        }
+    }
+    Json(response).into_response()
 }
 
 async fn cache_fakeip_flush(State(s): State<NativeState>) -> impl IntoResponse {
-    let n = s.runtime.resolver.flush_fakeip();
-    (StatusCode::OK, Json(json!({"flushed": n}))).into_response()
+    s.runtime.resolver.flush_fakeip();
+    StatusCode::NO_CONTENT
 }
 
 /// `POST /cache/dns/flush` —— 与 sing-box 的 `flushDNS` 等价，清掉 DNS 解析
 /// 缓存。这里同时清 fake-ip 池和 DNS cache（mihomo 的 `dnsRouter.ClearCache`）。
 async fn cache_dns_flush(State(s): State<NativeState>) -> impl IntoResponse {
     s.runtime.resolver.cache().clear();
-    let fakeip = s.runtime.resolver.flush_fakeip();
-    (
-        StatusCode::OK,
-        Json(json!({"flushed": true, "fakeip_flushed": fakeip})),
-    )
-        .into_response()
+    s.runtime.resolver.flush_fakeip();
+    StatusCode::NO_CONTENT
+}
+
+/* ====================== storage ====================== */
+
+fn dashboard_storage() -> &'static dashmap::DashMap<String, Bytes> {
+    static STORAGE: OnceLock<dashmap::DashMap<String, Bytes>> = OnceLock::new();
+    STORAGE.get_or_init(dashmap::DashMap::new)
+}
+
+async fn storage_get(Path(key): Path<String>) -> Response {
+    let bytes = dashboard_storage()
+        .get(&key)
+        .map(|value| value.clone())
+        .unwrap_or_else(|| Bytes::from_static(b"null"));
+    json_bytes(bytes)
+}
+
+async fn storage_put(Path(key): Path<String>, body: Bytes) -> Response {
+    if serde_json::from_slice::<Value>(&body).is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"message": "Body invalid"})),
+        )
+            .into_response();
+    }
+    dashboard_storage().insert(key, body);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn storage_delete(Path(key): Path<String>) -> StatusCode {
+    dashboard_storage().remove(&key);
+    StatusCode::NO_CONTENT
 }
 
 /* ====================== misc ====================== */
@@ -1602,6 +1898,20 @@ fn iso8601_now() -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     iso8601(secs)
+}
+
+fn clock_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        % 86_400;
+    format!(
+        "{:02}:{:02}:{:02}",
+        secs / 3600,
+        (secs / 60) % 60,
+        secs % 60
+    )
 }
 
 #[cfg(test)]

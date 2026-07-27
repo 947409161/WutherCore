@@ -200,8 +200,14 @@ impl WsHubs {
         let traffic_runtime = runtime.clone();
         let traffic = WsHub::new("traffic", Duration::from_secs(1), move || {
             let (up, down) = traffic_runtime.connections.now();
-            serde_json::to_string(&serde_json::json!({"up": up, "down": down}))
-                .unwrap_or_else(|_| String::from("{}"))
+            let (up_total, down_total) = traffic_runtime.connections.total();
+            serde_json::to_string(&serde_json::json!({
+                "up": up,
+                "down": down,
+                "upTotal": up_total,
+                "downTotal": down_total,
+            }))
+            .unwrap_or_else(|_| String::from("{}"))
         });
 
         let memory_runtime = runtime.clone();

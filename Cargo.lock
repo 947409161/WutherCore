@@ -1472,6 +1472,7 @@ dependencies = [
  "core-ruleset",
  "ipnet",
  "once_cell",
+ "parking_lot",
  "regex",
  "serde",
  "tracing",
