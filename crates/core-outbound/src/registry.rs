@@ -63,6 +63,21 @@ use crate::{
 
 pub type ResolveFn = Arc<dyn Fn(&str) -> Option<SharedOutbound> + Send + Sync>;
 
+/// Flat URI and subscription spellings predate Xray's strongly typed TLS
+/// object. Keep them as a transport compatibility switch instead of copying
+/// them into `tlsSettings.allowInsecure`, which modern Xray deliberately
+/// rejects.
+#[allow(dead_code)] // Feature-minimal builds can omit every TLS outbound.
+const LEGACY_TLS_INSECURE_KEYS: &[&str] = &[
+    "allowInsecure",
+    "allow-insecure",
+    "allow_insecure",
+    "insecure",
+    "skip-cert-verify",
+    "skip_cert_verify",
+    "skipCertVerify",
+];
+
 /// Canonical compile-time component tags accepted by `wuther-core`.
 pub const COMPONENT_TAGS: &[&str] = &[
     "with_anytls",
@@ -1060,6 +1075,10 @@ fn build_node_tls_options(
         "allowInsecure",
         "allow-insecure",
         "allow_insecure",
+        "insecure",
+        "skip-cert-verify",
+        "skip_cert_verify",
+        "skipCertVerify",
         "fingerprint",
         "fp",
         "utls",
@@ -1183,17 +1202,15 @@ fn build_node_tls_options(
         settings.server_name,
         true,
     )?;
-    settings.allow_insecure = merge_optional_bool_param(
-        node,
-        &["allowInsecure", "allow-insecure", "allow_insecure"],
-        "allowInsecure",
-        settings.allow_insecure,
-    )?;
-    if fallback_insecure {
-        if settings.allow_insecure == Some(false) {
-            return Err("typed TLS allowInsecure conflicts with protocol setting".into());
-        }
-        settings.allow_insecure = Some(true);
+    let legacy_insecure =
+        merge_optional_bool_param(node, LEGACY_TLS_INSECURE_KEYS, "allowInsecure", None)?;
+    let effective_insecure = fallback_insecure || legacy_insecure.unwrap_or(false);
+    if settings
+        .allow_insecure
+        .is_some_and(|typed| typed != effective_insecure)
+        && (fallback_insecure || legacy_insecure.is_some())
+    {
+        return Err("typed TLS allowInsecure conflicts with legacy protocol setting".into());
     }
     settings.enable_session_resumption = merge_optional_bool_param(
         node,
@@ -1304,7 +1321,10 @@ fn build_node_tls_options(
     settings
         .validate()
         .map_err(|error| format!("TLS settings: {error}"))?;
-    TlsOptions::from_xray_settings(settings).map_err(|error| error.to_string())
+    let mut options =
+        TlsOptions::from_xray_settings(settings).map_err(|error| error.to_string())?;
+    options.insecure = effective_insecure;
+    Ok(options)
 }
 
 fn reject_ordinary_tls_with_reality(node: &ParsedNode) -> Result<(), String> {
@@ -1492,18 +1512,16 @@ fn build_xhttp_options_with_tls_requirement(
         tls_settings.server_name,
         true,
     )?;
-    tls_settings.allow_insecure = merge_optional_bool_param(
-        node,
-        &[
-            "allowInsecure",
-            "allow-insecure",
-            "allow_insecure",
-            "insecure",
-            "skip-cert-verify",
-        ],
-        "allowInsecure",
-        tls_settings.allow_insecure,
-    )?;
+    let legacy_insecure =
+        merge_optional_bool_param(node, LEGACY_TLS_INSECURE_KEYS, "allowInsecure", None)?;
+    let insecure = insecure || legacy_insecure.unwrap_or(false);
+    if tls_settings
+        .allow_insecure
+        .is_some_and(|typed| typed != insecure)
+        && (insecure || legacy_insecure.is_some())
+    {
+        return Err("XHTTP typed TLS allowInsecure conflicts with legacy protocol setting".into());
+    }
     tls_settings.enable_session_resumption = merge_optional_bool_param(
         node,
         &[
@@ -1651,7 +1669,7 @@ fn build_xhttp_options_with_tls_requirement(
             .iter()
             .any(|key| node.params.contains_key(*key));
     let tls = require_tls || node.tls || has_reality;
-    if tls && !has_reality && (insecure || tls_settings.allow_insecure.unwrap_or(false)) {
+    if tls && !has_reality && tls_settings.allow_insecure.unwrap_or(false) {
         return Err(
             "XHTTP TLS allowInsecure=true has been removed by Xray; use pinnedPeerCertSha256 or verifyPeerCertByName"
                 .into(),
@@ -5325,24 +5343,6 @@ mod tests {
     }
 
     #[test]
-    fn xhttp_tls_rejects_removed_allow_insecure_and_defaults_alpn() {
-        let mut node = ParsedNode::new("tls", NodeProtocol::Vless, "origin.example", 443);
-        node.transport = "xhttp".into();
-        node.tls = true;
-
-        let error = build_xhttp_options(&node, None, true, Vec::new()).unwrap_err();
-        assert!(error.contains("allowInsecure=true has been removed"));
-
-        node.params.insert("skip-cert-verify".into(), "true".into());
-        let error = build_xhttp_options(&node, None, false, Vec::new()).unwrap_err();
-        assert!(error.contains("allowInsecure=true has been removed"));
-        node.params.remove("skip-cert-verify");
-
-        let options = build_xhttp_options(&node, None, false, Vec::new()).unwrap();
-        assert_eq!(options.alpn, ["h2", "http/1.1"]);
-    }
-
-    #[test]
     fn xhttp_download_mapper_normalizes_security_and_tls_default_alpn() {
         let mut node = ParsedNode::new("download", NodeProtocol::Vless, "origin.example", 443);
         node.transport = "xhttp".into();
@@ -5722,5 +5722,77 @@ mod tests {
                 .unwrap_err()
                 .contains("unknown-field-typo")
         );
+    }
+}
+
+#[cfg(all(test, feature = "with_vless", feature = "with_xhttp"))]
+mod legacy_tls_compat_tests {
+    use core_config::{
+        model::XhttpDownloadTlsSettings,
+        node_uri::{NodeProtocol, ParsedNode},
+    };
+
+    use super::{build_node_tls_options, build_outbound, build_xhttp_options};
+
+    #[test]
+    fn flat_subscription_tls_insecure_stays_outside_typed_xray_settings() {
+        let mut node = ParsedNode::new(
+            "provider-vless",
+            NodeProtocol::Vless,
+            "provider.example",
+            443,
+        );
+        node.uuid = Some("2dd61d93-75d8-4da4-ac0e-6aece7eac365".into());
+        node.tls = true;
+        node.params.insert("skip-cert-verify".into(), "true".into());
+
+        let options =
+            build_node_tls_options(&node, true, Some("provider.example".into()), false, vec![])
+                .unwrap();
+        assert!(options.insecure);
+        assert_eq!(
+            options
+                .xray_settings
+                .as_ref()
+                .and_then(|settings| settings.allow_insecure),
+            None
+        );
+        assert!(build_outbound(&node).is_ok());
+
+        node.tls_settings = Some(XhttpDownloadTlsSettings {
+            allow_insecure: Some(true),
+            ..Default::default()
+        });
+        let error =
+            build_node_tls_options(&node, true, Some("provider.example".into()), false, vec![])
+                .unwrap_err();
+        assert!(error.contains("allowInsecure=true"));
+    }
+
+    #[test]
+    fn xhttp_tls_accepts_flat_legacy_insecure_and_rejects_typed_removed_field() {
+        let mut node = ParsedNode::new("tls", NodeProtocol::Vless, "origin.example", 443);
+        node.transport = "xhttp".into();
+        node.tls = true;
+
+        let options = build_xhttp_options(&node, None, true, Vec::new()).unwrap();
+        assert!(options.insecure);
+        assert_eq!(options.alpn, ["h2", "http/1.1"]);
+
+        node.params.insert("skip-cert-verify".into(), "true".into());
+        let options = build_xhttp_options(&node, None, false, Vec::new()).unwrap();
+        assert!(options.insecure);
+        node.params.remove("skip-cert-verify");
+
+        node.tls_settings = Some(XhttpDownloadTlsSettings {
+            allow_insecure: Some(true),
+            ..Default::default()
+        });
+        let error = build_xhttp_options(&node, None, false, Vec::new()).unwrap_err();
+        assert!(error.contains("allowInsecure=true"));
+        node.tls_settings = None;
+
+        let options = build_xhttp_options(&node, None, false, Vec::new()).unwrap();
+        assert_eq!(options.alpn, ["h2", "http/1.1"]);
     }
 }

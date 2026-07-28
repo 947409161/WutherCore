@@ -400,16 +400,11 @@ impl XhttpClient {
         if let Some(settings) = tls_settings {
             validate_primary_tls_runtime(settings)?;
         }
-        let insecure = self.insecure
-            || tls_settings
-                .and_then(|settings| settings.allow_insecure)
-                .unwrap_or(false);
-        if self.tls && !has_reality && insecure {
-            return Err(invalid_input(
-                "xhttp TLS allowInsecure=true has been removed by Xray; use \
-                 pinnedPeerCertSha256 or verifyPeerCertByName",
-            ));
-        }
+        // `tlsSettings.allowInsecure=true` is rejected by
+        // `validate_primary_tls_runtime`. `self.insecure` is intentionally
+        // separate: it carries legacy URI and subscription compatibility into
+        // the executable TLS transport without mutating the typed Xray object.
+        let insecure = self.insecure;
         let configured_alpn = if self.alpn.is_empty() {
             tls_settings
                 .and_then(|settings| settings.alpn.clone())
@@ -439,9 +434,7 @@ impl XhttpClient {
                 .and_then(|settings| settings.server_name.clone())
                 .filter(|value| !value.is_empty())
                 .or_else(|| self.sni.clone()),
-            // Ordinary XHTTP TLS never reaches rustls's NoVerify path. Reality
-            // has its own authenticated handshake and is dispatched earlier.
-            insecure: false,
+            insecure,
             alpn,
             enable_session_resumption: tls_settings
                 .and_then(|settings| settings.enable_session_resumption)
@@ -2105,7 +2098,7 @@ mod tests {
     }
 
     #[test]
-    fn primary_tls_defaults_alpn_and_never_uses_removed_insecure_mode() {
+    fn primary_tls_supports_legacy_insecure_but_rejects_typed_removed_field() {
         let client = XhttpClient::new(Config::default(), "example.com", 443);
         let profile = client.primary_profile(&Config::default(), false).unwrap();
         assert_eq!(profile.version, HttpVersion::Http2);
@@ -2118,17 +2111,22 @@ mod tests {
         assert!(!tls.insecure);
         assert!(!tls.enable_session_resumption);
 
-        let mut removed = client;
-        removed.insecure = true;
-        let error = removed
+        let mut legacy = client;
+        legacy.insecure = true;
+        let profile = legacy.primary_profile(&Config::default(), false).unwrap();
+        assert!(profile.insecure);
+        assert!(tls_options_for_profile(&profile).insecure);
+
+        legacy.insecure = false;
+        legacy.tls_settings = Some(DownloadTlsSettings {
+            allow_insecure: Some(true),
+            ..Default::default()
+        });
+        let error = legacy
             .primary_profile(&Config::default(), false)
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert!(
-            error
-                .to_string()
-                .contains("allowInsecure=true has been removed")
-        );
+        assert!(error.to_string().contains("allowInsecure=true"));
     }
 
     #[test]

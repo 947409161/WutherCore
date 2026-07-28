@@ -1938,6 +1938,60 @@ route:
     }
 
     #[test]
+    fn provider_xhttp_node_with_legacy_insecure_tls_activates_atomically() {
+        if !core_outbound::registry::protocol_component_enabled(
+            &core_config::node_uri::NodeProtocol::Vless,
+        ) {
+            return;
+        }
+        let plan = load_plan(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+feeds:
+  provider-a: "https://example.invalid/sub.yaml"
+groups:
+  main:
+    choose: manual
+    use: [provider-a]
+route:
+  preset: global
+  final: main
+"#,
+        );
+        let runtime = Runtime::build(plan).unwrap();
+        let mut node = core_config::node_uri::ParsedNode::new(
+            "Provider-XHTTP",
+            core_config::node_uri::NodeProtocol::Vless,
+            "edge.example.com",
+            443,
+        );
+        node.uuid = Some("2dd61d93-75d8-4da4-ac0e-6aece7eac365".into());
+        node.tls = true;
+        node.transport = "xhttp".into();
+        node.params.insert("skip-cert-verify".into(), "true".into());
+        node.params.insert("allowInsecure".into(), "1".into());
+
+        runtime.apply_feed_nodes("provider-a", vec![node]).unwrap();
+
+        assert_eq!(runtime.node_revision(), 1);
+        assert_eq!(runtime.nodes_in_provider("provider-a").len(), 1);
+        assert!(
+            runtime
+                .outbound_names()
+                .contains(&"Provider-XHTTP".to_string())
+        );
+        assert_eq!(
+            runtime
+                .pick_outbound("www.example.com", 443, NetworkKind::Tcp)
+                .label,
+            "Provider-XHTTP"
+        );
+    }
+
+    #[test]
     fn feed_updates_expand_all_loaded_providers_without_erasing_each_other() {
         let plan = load_plan(
             r#"

@@ -1318,6 +1318,31 @@ proxies:
     }
 
     #[test]
+    fn clash_provider_preserves_legacy_tls_insecure_compatibility() {
+        let yaml = r#"
+proxies:
+  - name: Provider-XHTTP
+    type: vless
+    server: edge.example.com
+    port: 443
+    uuid: 2dd61d93-75d8-4da4-ac0e-6aece7eac365
+    tls: true
+    network: xhttp
+    skip-cert-verify: true
+"#;
+        let nodes = parse_feed_payload(yaml.as_bytes(), FormatHint::ClashYaml);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(
+            nodes[0].params.get("allowInsecure").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            nodes[0].params.get("skip-cert-verify").map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
     fn parse_naive_clash_headers_and_transport_options() {
         let yaml = r#"
 proxies:

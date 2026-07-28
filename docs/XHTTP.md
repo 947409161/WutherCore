@@ -104,7 +104,7 @@ TLS 配置完整注册：
 
 客户端支持系统根、附加验证 CA、证书/CA SHA-256 固定、按名称验证、会话恢复、uTLS ClientHello 指纹、直接 ECHConfigList 或通过 DNS HTTPS/H2C/UDP 获取 ECH 配置。H3 的 QUIC TLS 不伪装成 TCP uTLS ClientHello。
 
-Xray 26.7.11 已移除 `allowInsecure=true`；WutherCore 同样拒绝该值。需要私有 CA 时使用 `certificates[].usage=verify`，需要固定证书时使用 `pinnedPeerCertSha256`。
+Xray 26.7.11 已从强类型 TLS 对象移除 `allowInsecure=true`，因此 WutherCore 仍拒绝 `tlsSettings.allowInsecure=true`。为了兼容旧订阅，URI 和 Clash provider 顶层的 `allowInsecure`，`allow-insecure`，`insecure`，`skip-cert-verify` 会通过独立的传输兼容开关关闭证书校验，不会写回强类型 TLS 对象。新配置应使用 `certificates[].usage=verify`，`pinnedPeerCertSha256` 或 `verifyPeerCertByName`。
 
 ## 验证范围
 

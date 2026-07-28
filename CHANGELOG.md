@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- provider 中的 `skip-cert-verify`，`allowInsecure` 等旧式扁平 TLS 字段不再被错误写入严格的 Xray `tlsSettings`。它们现在通过独立的传输兼容开关生效，包含 XHTTP 节点的订阅可以正常原子激活；结构化 `tlsSettings.allowInsecure=true` 仍保持拒绝。
+
 ## [0.3.2] - 2026-07-28
 
 ### Fixed

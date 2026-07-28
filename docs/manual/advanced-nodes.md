@@ -191,7 +191,7 @@ VMess 和 VLESS 都从 `login.uuid` 读取用户标识。VMess 额外接受：
 | `aid` | `0` | 大于零时启用旧版 VMess |
 | `security` 或 `scy` | 实现默认值 | VMess 加密方式 |
 | `tls` | 继承安全配置 | URI 兼容开关 |
-| `allowInsecure` | `false` | 旧格式兼容值，优先使用强类型 TLS |
+| `allowInsecure` | `false` | URI 和 provider 的旧格式兼容值，会实际关闭证书校验；新配置优先使用证书固定或名称验证 |
 | `alpn` | 自动 | ALPN 列表 |
 | `network` 或 `net` | `tcp` | 传输类型兼容写法 |
 
