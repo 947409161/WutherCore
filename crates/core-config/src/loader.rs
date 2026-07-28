@@ -605,4 +605,32 @@ route:
     fn advanced_dns_example_loads() {
         load_from_str(include_str!("../../../examples/dns-advanced.yaml")).unwrap();
     }
+
+    #[test]
+    fn android_root_examples_deserialize_with_explicit_data_planes() {
+        let cases = [
+            (
+                include_str!("../../../examples/advanced/android-root-tun.yaml"),
+                CaptureMethod::VirtualNic,
+            ),
+            (
+                include_str!("../../../examples/advanced/android-root-tproxy.yaml"),
+                CaptureMethod::Tproxy,
+            ),
+            (
+                include_str!("../../../examples/advanced/android-root-redirect.yaml"),
+                CaptureMethod::Redirect,
+            ),
+        ];
+
+        for (yaml, expected_method) in cases {
+            let config: UserConfig = serde_yaml::from_str(yaml).unwrap();
+            let capture = config
+                .capture
+                .expect("Android root example enables capture");
+            assert!(capture.on);
+            assert_eq!(capture.method, expected_method);
+            assert!(!capture.tun.auto_redirect);
+        }
+    }
 }

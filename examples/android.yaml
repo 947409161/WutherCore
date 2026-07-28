@@ -184,8 +184,10 @@ resolver:
 # ---------------------------------------------------------------------------
 # 6. capture —— TUN / VpnService 透明接管
 #
-#    A. 未 root + 宿主 App（VpnService）—— 默认配置；JNI 导出 Builder 配置并注入 fd
-#    B. root + KernelSU —— 见下方 6.B 注释模板
+#    A. 未 root + 宿主 App（VpnService）是本文件的默认配置
+#    B. root TUN 完整配置见 examples/advanced/android-root-tun.yaml
+#    C. root TPROXY 完整配置见 examples/advanced/android-root-tproxy.yaml
+#    D. root REDIRECT 完整配置见 examples/advanced/android-root-redirect.yaml
 #    VpnService 不是桥接网卡；必须使用 VpnBridge.vpnServiceConfigJson(configPath)
 #    返回的 routes/dns 配置 Builder，native 侧只负责读写 establish() 后的 TUN fd。
 # ---------------------------------------------------------------------------
@@ -301,14 +303,18 @@ capture:
           - "*.local"
 
 # -----------------------------------------------------------------------------
-# 6.B Android auto_redirect 说明
+# 6.B Android root 模式
 # -----------------------------------------------------------------------------
-# 当前安全实现只接受 Linux root-managed TUN + virtual_nic + traffic=system。
-# Android/VpnService、method=tproxy、identity 过滤、input/reset mark 和动态 route
-# set 组合会在配置阶段明确拒绝，不能把这些字段当作已经生效。
+# Android root 支持三条独立数据面：
+#   1. method=virtual_nic，native 直接打开 /dev/net/tun，支持 TCP 与 UDP
+#   2. method=tproxy，使用 iptables/ip6tables 和策略路由，支持 TCP 与 UDP
+#   3. method=redirect，使用 nftables NAT，只支持 TCP
 #
-# Android 请继续使用上方 6 节的 VpnService/TUN 配置；Linux root-managed 主机参见：
-# docs/LINUX-TUN-AUTO-REDIRECT.md
+# tun.auto_redirect 仍然只属于 Linux root-managed TUN，不是 Android root 开关。
+# Android root daemon 必须由 root shell、KernelSU 或 Magisk service 启动整个进程。
+# native 内部的 su -c id 只做权限探测，不会把普通 App 进程变成 root。
+#
+# 完整手册：docs/manual/android.md
 
 # ---------------------------------------------------------------------------
 # 7. route —— 分流规则

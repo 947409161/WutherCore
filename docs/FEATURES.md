@@ -24,12 +24,12 @@
 
 | 平台 | HTTP / SOCKS5 | TUN | TPROXY | REDIRECT | 特殊接入 |
 | --- | :---: | :---: | :---: | :---: | --- |
-| Windows | 是 | 是 | 无 |，| Wintun 与系统路由 |
+| Windows | 是 | 是 | 无 | 无 | Wintun 与系统路由 |
 | Linux | 是 | 是 | 是 | 是 | 策略路由、iptables/nftables 环境 |
-| macOS | 是 | 是 | 无 |，| 系统 TUN 与路由 |
-| Android | 宿主决定 | 是 | root | root | VpnService 文件描述符 |
+| macOS | 是 | 是 | 无 | 无 | 系统 TUN 与路由 |
+| Android | 宿主决定 | root 或 VpnService | root，TCP 与 UDP | root，仅 TCP | root daemon 或 VpnService fd |
 
-符号“-”表示该平台没有对应实现路径。透明代理通常需要管理员或 root 权限，并可能受防火墙、虚拟网卡和其他 VPN 软件影响。
+表中的“无”表示该平台没有对应实现路径。透明代理通常需要管理员或 root 权限，并可能受防火墙、虚拟网卡和其他 VPN 软件影响。
 
 ## 出站实现
 
@@ -79,6 +79,7 @@ WireGuard 的字段、约束和完整示例见 [WireGuard 配置](WIREGUARD.md)�
 - 透明代理依赖系统权限和外部网络状态，无法只靠单元测试覆盖。
 - 当前配置与 API 尚未承诺 1.0 级别的长期稳定性。
 - Android VpnService 需要宿主应用负责生命周期、权限申请和文件描述符传递。
+- Android root 模式要求 daemon 自身持有 UID 0 或有效 `CAP_NET_ADMIN`。内部 `su` 探测不会提升当前进程。
 - Naive 依赖 GPL-3.0-or-later 的 Cronet 组件和平台动态库，默认 MIT 构建与默认 Release 不启用。
 - CodeQL 初始告警正在 [Issue #9](https://github.com/MiChongs/WutherCore/issues/9) 中逐条分类。
 

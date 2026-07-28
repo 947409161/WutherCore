@@ -27,6 +27,7 @@ description: 从配置加载到运行时行为的完整使用手册
 | 导入订阅或手动节点 | [订阅与节点](feeds-nodes.md) | [节点字段索引](generated/feeds-nodes.md) |
 | 配置分组、路由和 DNS | [路由与 DNS](routing-dns.md) | [路由与 DNS 字段索引](generated/routing-dns.md) |
 | 启用 TUN 或透明接管 | [系统接管](capture.md) | [接管字段索引](generated/capture-runtime.md) |
+| 部署 Android root 或 VpnService | [Android 完整部署](android.md) | [接管字段索引](generated/capture-runtime.md) |
 | 配置 Smart、API 或 Mesh | [运行管理](runtime-management.md) | [运行字段索引](generated/capture-runtime.md) |
 | 配置 XHTTP 或 socket 行为 | [XHTTP 与 StreamSettings](xhttp-stream.md) | [XHTTP 字段索引](generated/xhttp.md) |
 | 写全协议结构化节点 | [高级节点与协议参数](advanced-nodes.md) | [节点字段索引](generated/feeds-nodes.md) |
@@ -50,6 +51,7 @@ description: 从配置加载到运行时行为的完整使用手册
 - [订阅与节点](feeds-nodes.md)
 - [路由与 DNS](routing-dns.md)
 - [系统接管](capture.md)
+- [Android root 与 VpnService](android.md)
 - [运行管理](runtime-management.md)
 - [XHTTP 与 StreamSettings](xhttp-stream.md)
 

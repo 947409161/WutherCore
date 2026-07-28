@@ -19,7 +19,8 @@ description: Windows、macOS、Linux、路由器、Android 和服务端的完整
 | macOS 桌面 | 本地 Mixed 代理 | 先用系统代理，TUN 依赖授权与宿主集成 |
 | Linux 桌面 | Mixed 或 TUN | 可由进程管理 TUN |
 | Linux 路由器 | TUN `auto_redirect` | 需要 root、nftables 和策略路由 |
-| Android | VpnService 提供 TUN fd | 宿主必须配置 Builder 并 protect 出站 |
+| Android root | root TUN、TPROXY 或 REDIRECT | daemon 必须真正持有 root 或有效 `CAP_NET_ADMIN` |
+| Android 非 root | VpnService 提供 TUN fd | 宿主必须配置 Builder 并 protect 出站 |
 | 服务端 | XHTTP、gRPC、REALITY 或协议入站 | 不启用客户端 capture |
 
 ## Windows 桌面
@@ -494,7 +495,111 @@ cargo build --release -p wuther-core \
 
 公开面板监听必须配置强 secret，并由防火墙限制管理网段。
 
-## Android VpnService
+## Android
+
+Android 不是只有 VpnService。native 核心提供三种 root 数据面和一种非 root 数据面：
+
+| 模式 | 配置 | 能力 |
+| --- | --- | --- |
+| root TUN | `method: virtual_nic` | TCP、UDP、DNS 劫持、UID、GID、Android user 和包名过滤 |
+| root TPROXY | `method: tproxy` | 双栈 TCP 和 UDP 透明代理 |
+| root REDIRECT | `method: redirect` | 双栈 TCP NAT REDIRECT，UDP 不接管 |
+| VpnService | `method: virtual_nic` | 宿主创建 TUN fd，native 负责数据面 |
+
+完整权限模型、源码调用链、过滤器边界、Magisk 与 KernelSU 启动方式见
+[Android 完整部署](android.md)。
+
+### root TUN
+
+```yaml
+capture:
+  on: true
+  method: virtual_nic
+  traffic: system
+  resolver: hijack
+  stack: mixed
+  mtu: 1400
+  tun:
+    interface_name: rpktun0
+    address:
+      - 172.19.0.1/30
+      - fdfe:dcba:9876::1/126
+    inet6: true
+    auto_route: true
+    auto_redirect: false
+    strict_route: false
+    include_android_user: [0]
+    exclude_package:
+      - com.android.captiveportallogin
+```
+
+native 会优先打开 `/dev/net/tun`，成功后自行管理接口、路由和出站 fwmark。
+完整配置见
+[`android-root-tun.yaml`](https://github.com/MiChongs/WutherCore/blob/main/examples/advanced/android-root-tun.yaml)。
+
+### root TPROXY
+
+```yaml
+capture:
+  on: true
+  method: tproxy
+  traffic: system
+  resolver: hijack
+  stack: mixed
+  exclude:
+    cidr:
+      - 127.0.0.0/8
+      - ::1/128
+      - 10.0.0.0/8
+      - 172.16.0.0/12
+      - 192.168.0.0/16
+  tun:
+    inet6: true
+    auto_redirect: false
+    auto_redirect_output_mark: "0x2024"
+```
+
+这条路径使用固定端口 `7894`，固定 TPROXY mark 和路由表 `0x2d0`，同时处理 TCP
+和 UDP。它要求当前 daemon 具有有效 `CAP_NET_ADMIN`，并能调用 iptables 和
+ip6tables。完整配置见
+[`android-root-tproxy.yaml`](https://github.com/MiChongs/WutherCore/blob/main/examples/advanced/android-root-tproxy.yaml)。
+
+### root REDIRECT
+
+```yaml
+capture:
+  on: true
+  method: redirect
+  traffic: system
+  resolver: off
+  stack: system
+  exclude:
+    cidr:
+      - 127.0.0.0/8
+      - ::1/128
+  tun:
+    inet6: true
+    auto_redirect: false
+    include_android_user: [0]
+    exclude_uid: [1000]
+```
+
+REDIRECT 使用 nftables 原子发布 TCP NAT 规则。它不接管 UDP，也不能直接消费包名
+过滤，包名需要先转换成 UID。完整配置见
+[`android-root-redirect.yaml`](https://github.com/MiChongs/WutherCore/blob/main/examples/advanced/android-root-redirect.yaml)。
+
+### root 启动要求
+
+内核启动时的 `su -c id` 只做探测，不会改变当前进程身份。root 模式必须由 root
+shell、Magisk service 或 KernelSU service 启动整个 daemon，或者让 daemon
+真正持有有效 capability。
+
+```bash
+adb shell su -c '/data/local/tmp/wuther-core check /data/local/tmp/config.yaml'
+adb shell su -c '/data/local/tmp/wuther-core run --config /data/local/tmp/config.yaml'
+```
+
+### VpnService
 
 Android 的 native 核心不负责调用 `VpnService.Builder.establish()`。宿主必须：
 
@@ -504,7 +609,7 @@ Android 的 native 核心不负责调用 `VpnService.Builder.establish()`。宿�
 4. 把 fd 交给 native 核心。
 5. 让所有代理出站 socket 调用 `VpnService.protect(fd)`。
 
-### 配置
+#### 配置
 
 ```yaml
 version: 1
@@ -602,10 +707,14 @@ ui:
   secret: REPLACE_WITH_RANDOM_TOKEN
 ```
 
-不要在 Android 打开 `auto_redirect`。应用筛选由 Builder 与 native 数据面共同
-实现，宿主不能只把字段交给内核就假定系统已经执行。
+不要在 Android 打开 `tun.auto_redirect`。它是 Linux root TUN 的混合数据面，
+不是 Android root 模式开关。Android root 使用显式 `method: virtual_nic`、
+`method: tproxy` 或 `method: redirect`。
 
-### 构建
+VpnService 的应用筛选由 Builder 与 native 数据面共同实现，宿主不能只把字段交给
+内核就假定系统已经执行。
+
+### Android 构建
 
 ```powershell
 pwsh -File scripts/build-all.ps1 `
@@ -621,8 +730,9 @@ pwsh -File scripts/build-all.ps1 `
   -Targets "aarch64-linux-android"
 ```
 
-推荐 Android NDK r26 或更新版本，并设置 `ANDROID_NDK_HOME`。完整宿主调用顺序和
-更多包过滤示例见 [Android 完整示例](https://github.com/MiChongs/WutherCore/blob/main/examples/android.yaml)。
+推荐 Android NDK r26 或更新版本，并设置 `ANDROID_NDK_HOME`。三种 root 数据面和
+VpnService 都要求编译 `with_tun`。完整宿主调用顺序和更多包过滤示例见
+[Android 完整部署](android.md)。
 
 ## XHTTP 服务端
 

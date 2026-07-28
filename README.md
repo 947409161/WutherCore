@@ -225,7 +225,8 @@ Linux 自动接管细节见 [Linux TUN auto_redirect](docs/LINUX-TUN-AUTO-REDIRE
 * 非 root 模式通过宿主应用提供 VpnService 文件描述符。
 * JNI 接口可导出 VpnService.Builder 所需的地址、路由、DNS 和应用过滤配置。
 * 所有出站套接字可调用真实的 `VpnService.protect(fd)`。
-* root 模式支持 `/dev/net/tun`、nftables、iptables、TPROXY 和 REDIRECT 能力分级。
+* root daemon 支持直接 `/dev/net/tun`、双栈 TPROXY 和 TCP REDIRECT。
+* `su -c id` 只做能力探测，root 数据面要求整个 daemon 以 root 或有效 capability 运行。
 * 支持 UID/GID 查询和 Binder 包名解析。
 * 物理网络变化可以通过 JNI 通知内核刷新默认接口和绕行绑定。
 
@@ -302,6 +303,9 @@ resolver:
 * [`examples/desktop.yaml`](examples/desktop.yaml) 用于桌面普通代理。
 * [`examples/router.yaml`](examples/router.yaml) 用于路由器和透明代理。
 * [`examples/android.yaml`](examples/android.yaml) 用于 Android VpnService。
+* [`examples/advanced/android-root-tun.yaml`](examples/advanced/android-root-tun.yaml) 用于 Android root TUN。
+* [`examples/advanced/android-root-tproxy.yaml`](examples/advanced/android-root-tproxy.yaml) 用于 Android root TPROXY。
+* [`examples/advanced/android-root-redirect.yaml`](examples/advanced/android-root-redirect.yaml) 用于 Android root REDIRECT。
 * [`examples/dns-advanced.yaml`](examples/dns-advanced.yaml) 展示分层 DNS 与命名出口。
 * [`examples/with_feed.yaml`](examples/with_feed.yaml) 展示订阅过滤和重命名。
 * [`examples/manual_only.yaml`](examples/manual_only.yaml) 只使用手动节点。

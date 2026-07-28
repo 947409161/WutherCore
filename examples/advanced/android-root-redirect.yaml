@@ -1,0 +1,66 @@
+version: 1
+profile: mobile
+name: android-root-redirect
+
+listen:
+  local:
+    host: 127.0.0.1
+    port: 7890
+    udp: true
+  share: false
+
+nodes:
+  - name: upstream
+    protocol: socks5
+    address: 127.0.0.1:1080
+
+groups:
+  main:
+    choose: manual
+    use: [nodes]
+
+route:
+  preset: custom
+  steps:
+    - "ip:127.0.0.0/8 -> direct"
+    - "ip:10.0.0.0/8 -> direct"
+    - "ip:172.16.0.0/12 -> direct"
+    - "ip:192.168.0.0/16 -> direct"
+  final: main
+
+resolver:
+  mode: secure
+  fake: off
+  servers:
+    bootstrap: https://223.5.5.5/dns-query
+  nameserver: [bootstrap]
+  proxy-server-nameserver: [bootstrap]
+  direct-nameserver: [bootstrap]
+
+capture:
+  on: true
+  method: redirect
+  traffic: system
+  resolver: off
+  stack: system
+  exclude:
+    cidr:
+      - 127.0.0.0/8
+      - ::1/128
+      - 10.0.0.0/8
+      - 172.16.0.0/12
+      - 192.168.0.0/16
+      - 223.5.5.5/32
+  tun:
+    inet6: true
+    auto_redirect: false
+    route_exclude_address:
+      - 127.0.0.0/8
+      - ::1/128
+      - 223.5.5.5/32
+    include_android_user: [0]
+    exclude_uid:
+      - 1000
+
+ui:
+  on: false

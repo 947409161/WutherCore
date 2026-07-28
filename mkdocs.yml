@@ -173,6 +173,7 @@ nav:
       - 订阅与节点: manual/feeds-nodes.md
       - 策略组、路由与 DNS: manual/routing-dns.md
       - 系统接管: manual/capture.md
+      - Android 完整部署: manual/android.md
       - 运行管理: manual/runtime-management.md
       - XHTTP 与 StreamSettings: manual/xhttp-stream.md
       - 高级配置:

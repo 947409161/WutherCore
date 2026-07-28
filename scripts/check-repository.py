@@ -37,6 +37,7 @@ REQUIRED_FILES = (
     "docs/manual/feeds-nodes.md",
     "docs/manual/routing-dns.md",
     "docs/manual/capture.md",
+    "docs/manual/android.md",
     "docs/manual/runtime-management.md",
     "docs/manual/xhttp-stream.md",
     "docs/manual/advanced-nodes.md",
@@ -57,6 +58,9 @@ REQUIRED_FILES = (
     "examples/advanced/routing-dns.yaml",
     "examples/advanced/xhttp-finalmask.yaml",
     "examples/advanced/xhttp-server.yaml",
+    "examples/advanced/android-root-tun.yaml",
+    "examples/advanced/android-root-tproxy.yaml",
+    "examples/advanced/android-root-redirect.yaml",
     "scripts/config-reference.py",
 )
 

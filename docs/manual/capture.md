@@ -46,12 +46,16 @@ capture:
 | --- | --- | --- |
 | `auto` | 让运行计划按平台选择 | 生产配置仍应检查 `explain` 的最终结果 |
 | `virtual_nic` | TUN 虚拟网卡 | 兼容别名为 `tun`，要求组件 `with_tun` |
-| `tproxy` | Linux 透明代理 | 需要策略路由、防火墙权限和内核支持 |
-| `redirect` | Linux TCP REDIRECT | UDP 需要其它数据面配合 |
+| `tproxy` | Linux 或 Android root 透明代理 | 需要策略路由、防火墙权限和内核支持 |
+| `redirect` | Linux 或 Android root TCP REDIRECT | UDP 需要其它数据面配合 |
 
 `virtual_nic` 是跨平台配置入口，但设备创建方式不同。Linux 可以由进程创建和管理
-设备；Android 通常由 `VpnService` 提供文件描述符；macOS 和 Windows 受系统扩展、
-签名、权限和宿主集成约束。不要把 Linux 的 root-managed 参数直接复制到移动端。
+设备。Android root daemon 优先直接打开 `/dev/net/tun`，打开失败后才使用宿主
+注入的 VpnService 文件描述符。macOS 和 Windows 受系统扩展、签名、权限和宿主
+集成约束。
+
+Android 的 root TUN、TPROXY、REDIRECT、VpnService、权限边界和完整配置见
+[Android 完整部署](android.md)。
 
 ## 流量范围
 
@@ -233,10 +237,13 @@ reset mark、NFQUEUE、fallback rule index、动态路由集合及平台过滤�
 | 能力 | Linux | Android | macOS | Windows |
 | --- | --- | --- | --- | --- |
 | `virtual_nic` 配置模型 | 支持 | 支持 | 支持 | 支持 |
-| 进程自行创建 TUN | 支持，需要权限 | 通常由 VpnService 提供 | 取决于宿主集成 | 取决于宿主集成 |
+| 进程自行创建 TUN | 支持，需要权限 | root daemon 支持 `/dev/net/tun` | 取决于宿主集成 | 取决于宿主集成 |
+| 非 root TUN | 不适用 | VpnService fd | 取决于宿主集成 | 取决于宿主集成 |
+| 显式 TPROXY | 支持 | root daemon 支持 TCP 和 UDP | 不支持 | 不支持 |
+| 显式 REDIRECT | 支持 TCP | root daemon 支持 TCP | 不支持 | 不支持 |
 | `auto_redirect` 安全子集 | 支持 | 不支持 | 不支持 | 不支持 |
 | UID/GID 过滤 | 支持部分数据面 | 支持部分数据面 | 不支持 | 不支持 |
-| Android user 与包名 | 不支持 | 支持宿主提供的数据面 | 不支持 | 不支持 |
+| Android user 与包名 | 不支持 | root TUN 和 VpnService 支持，透明模式有单独限制 | 不支持 | 不支持 |
 | `platform.http_proxy` | 无需使用 | 支持宿主桥接 | 支持宿主桥接 | 无需使用 |
 
 该表描述配置入口，不替代运行时能力检查。最终结果以 `check`、`explain` 和启动日志
