@@ -5,6 +5,10 @@ description: 候选节点选择、路由规则、规则集、DNS 服务和 Fake 
 
 # 策略组、路由与 DNS
 
+本页说明通用模型。复合 AND 和 OR 规则、Mihomo classical 兼容边界、规则集、
+DNS 多出口、`evaluate` 与 `respond` 响应链见
+[高级路由、策略组与 DNS](advanced-routing-dns.md)。
+
 数据连接先由路由规则决定出站或分组，再由分组策略选择具体节点。DNS 有独立的服务、
 出口和组调度，但 DNS 命名出口可以引用同一节点集合。
 

@@ -1,0 +1,95 @@
+version: 1
+profile: desktop
+name: advanced-xhttp-finalmask
+
+listen:
+  local: 7890
+  share: false
+
+nodes:
+  - name: vless-xhttp
+    protocol: vless
+    address: upload.example.com:443
+    login:
+      uuid: 00000000-0000-0000-0000-000000000000
+    secure:
+      tls: true
+      tls-settings:
+        serverName: upload.example.com
+        alpn: [h2]
+        fingerprint: chrome
+    transport:
+      kind: xhttp
+      xhttp:
+        host: upload.example.com
+        path: /api
+        mode: packet-up
+        headers:
+          Accept-Language: zh-CN,zh;q=0.9
+        xPaddingBytes: 100-1000
+        xPaddingPlacement: queryInHeader
+        xPaddingMethod: tokenish
+        sessionIDPlacement: cookie
+        sessionIDKey: sid
+        sessionIDTable: alphanumeric
+        sessionIDLength: 16-24
+        seqPlacement: header
+        seqKey: X-Sequence
+        uplinkHTTPMethod: POST
+        uplinkDataPlacement: body
+        uplinkChunkSize: 65536-262144
+        scMaxEachPostBytes: 1048576
+        scMinPostsIntervalMs: 20
+        scMaxBufferedPosts: 64
+        serverMaxHeaderBytes: 32768
+        xmux:
+          maxConnections: 2-4
+          cMaxReuseTimes: 32-64
+          hMaxRequestTimes: 100-200
+          hMaxReusableSecs: 300-600
+          hKeepAlivePeriod: 30
+    streamSettings:
+      network: xhttp
+      sockopt:
+        domainStrategy: UseIPv4v6
+        tcpFastOpen: true
+        tcpKeepAliveIdle: 60
+        tcpKeepAliveInterval: 15
+        happyEyeballs:
+          prioritizeIPv6: false
+          interleave: 1
+          tryDelayMs: 250
+          maxConcurrentTry: 4
+      finalmask:
+        tcp:
+          - type: fragment
+            settings:
+              packets: tlshello
+              length: 20-80
+              delay: 0-5
+              maxSplit: 4
+
+groups:
+  main:
+    choose: stable
+    use: [nodes]
+    check: https://www.gstatic.com/generate_204
+    sticky: site
+
+route:
+  preset: global
+  final: main
+
+resolver:
+  mode: smart
+  fake: off
+  servers:
+    bootstrap: https://223.5.5.5/dns-query
+  nameserver: [bootstrap]
+  proxy-server-nameserver: [bootstrap]
+
+capture:
+  on: false
+
+ui:
+  on: false

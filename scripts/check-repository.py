@@ -39,6 +39,10 @@ REQUIRED_FILES = (
     "docs/manual/capture.md",
     "docs/manual/runtime-management.md",
     "docs/manual/xhttp-stream.md",
+    "docs/manual/advanced-nodes.md",
+    "docs/manual/advanced-routing-dns.md",
+    "docs/manual/advanced-xhttp-finalmask.md",
+    "docs/manual/deployment-recipes.md",
     "docs/manual/cli.md",
     "docs/manual/generated/core.md",
     "docs/manual/generated/inbounds.md",
@@ -48,6 +52,11 @@ REQUIRED_FILES = (
     "docs/manual/generated/xhttp.md",
     "docs/manual/generated/stream.md",
     "docs/assets/wuthercore-hero.jpg",
+    "examples/advanced/vless-grpc.yaml",
+    "examples/advanced/hysteria2-structured.yaml",
+    "examples/advanced/routing-dns.yaml",
+    "examples/advanced/xhttp-finalmask.yaml",
+    "examples/advanced/xhttp-server.yaml",
     "scripts/config-reference.py",
 )
 

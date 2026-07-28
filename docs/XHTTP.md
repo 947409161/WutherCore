@@ -49,7 +49,8 @@ listen:
   xhttp:
     address: 0.0.0.0
     port: 443
-    alpn: [h2, http/1.1, h3]
+    allow-unauthenticated-non-loopback: true
+    alpn: [h2, http/1.1]
     tls:
       certificates:
         - certificateFile: /etc/wuther/fullchain.pem
@@ -71,7 +72,7 @@ listen:
       mode: auto
 ```
 
-没有 `target` 时，服务端只允许显式启用的本机安全用法；非回环裸转发必须明确设置 `allow-unauthenticated-non-loopback`。生产环境应配置 TLS、目标端认证协议及连接/流并发限制。
+没有 `target` 时，服务端只允许显式启用的本机安全用法；非回环裸转发必须明确设置 `allow-unauthenticated-non-loopback`。这个确认不提供认证，生产环境应配置 TLS、目标端认证协议及连接/流并发限制。H3 必须使用独立监听项，并让该项 `alpn` 只包含 `h3`。
 
 ## XHTTP 字段
 

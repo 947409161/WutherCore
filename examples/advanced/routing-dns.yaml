@@ -1,0 +1,76 @@
+version: 1
+profile: desktop
+name: advanced-routing-dns
+
+listen:
+  local: 7890
+  share: false
+
+nodes:
+  - name: local-socks
+    protocol: socks5
+    address: 127.0.0.1:1080
+    network:
+      udp: true
+
+groups:
+  main:
+    choose: stable
+    use: [nodes]
+    check: https://www.gstatic.com/generate_204
+    sticky: site
+
+route:
+  preset: custom
+  sets:
+    private:
+      type: ipcidr
+      payload:
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+    internal:
+      type: domain
+      payload:
+        - internal.example
+  steps:
+    - "set:private -> direct"
+    - "set:internal -> direct"
+    - "ads -> block"
+    - "github -> main"
+  final: main
+
+resolver:
+  mode: smart
+  fake: off
+  servers:
+    bootstrap: https://223.5.5.5/dns-query
+    public:
+      endpoint: https://1.1.1.1/dns-query
+      exits: [main, DIRECT]
+      strategy: adaptive
+      timeout: 3s
+      max-parallel: 2
+  groups:
+    default:
+      members: [public, bootstrap]
+      strategy: sequential
+      timeout: 4s
+      max-parallel: 2
+  nameserver: [default]
+  proxy-server-nameserver: [bootstrap]
+  direct-nameserver: [bootstrap]
+  nameserver-policy:
+    "rule-set:internal": bootstrap
+  rules:
+    - "suffix:internal.example -> direct?nocache"
+    - "suffix:service.example -> evaluate:default?nooptcache"
+    - "match_response:10.0.0.0/8 -> reject?no_drop"
+    - "suffix:service.example -> respond"
+    - "any -> proxy:default?strategy=adaptive"
+
+capture:
+  on: false
+
+ui:
+  on: false

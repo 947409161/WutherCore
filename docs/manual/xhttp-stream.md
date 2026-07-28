@@ -5,6 +5,9 @@ description: XHTTP、SplitHTTP、下载通道、FinalMask 与 socket 策略的�
 
 # XHTTP 与 StreamSettings
 
+本页说明基础结构。XHTTP 模式状态、独立下载通道、XMUX、平台 socket 限制和全部
+FinalMask 组合见[高级 XHTTP、StreamSettings 与 FinalMask](advanced-xhttp-finalmask.md)。
+
 XHTTP 是节点传输层，也可以作为服务端监听。`streamSettings` 是更底层的 socket
 和 FinalMask 策略。两者都保持 Xray 兼容字段名，并由强类型模型拒绝未知字段。
 
@@ -103,7 +106,7 @@ snake_case 别名，新配置应使用标准字段。
 | --- | --- |
 | 并发 | `maxConcurrency` |
 | 连接数量 | `maxConnections` |
-| 连接寿命 | `cMaxReuseTimes`、`cMaxLifetimeMs` |
+| 连接寿命 | `cMaxReuseTimes`、`hMaxReusableSecs` |
 | 请求数量 | `hMaxRequestTimes` |
 | 保活 | `hKeepAlivePeriod` |
 
@@ -117,7 +120,8 @@ listen:
   xhttp:
     address: 0.0.0.0
     port: 443
-    alpn: [h2, http/1.1, h3]
+    allow-unauthenticated-non-loopback: true
+    alpn: [h2, http/1.1]
     tls:
       certificates:
         - certificateFile: /etc/wuther/fullchain.pem
@@ -152,6 +156,7 @@ listen:
 
 没有 `target` 时只应使用明确支持的本机安全场景。非回环裸转发需要显式
 `allow-unauthenticated-non-loopback`，生产环境仍应在目标协议层配置认证。
+H3 必须使用独立监听项，该项 `alpn` 只能包含 `h3`。
 
 ## TLS 与 REALITY 下载通道
 

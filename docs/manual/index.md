@@ -12,9 +12,11 @@ description: 从配置加载到运行时行为的完整使用手册
 2. 完整字段索引从 Rust Serde 模型生成，列出实际接受的字段名、类型、默认规则、
    兼容别名、枚举写法和源码位置。
 
-当前字段索引覆盖 **744 个可反序列化字段**和 **53 个枚举类型**。CI 会重新扫描
+当前字段索引覆盖 **744 个可反序列化字段**和 **53 个枚举类型**。节点 `params`
+由协议注册器动态解析，不属于 Serde 字段计数，它们的完整写法、默认值和约束集中在
+[高级节点与协议参数](advanced-nodes.md)。CI 会重新扫描
 `crates/core-config/src/model.rs` 与 `stream_settings.rs`。代码增加、删除或重命名
-字段后，如果参考页没有同步，文档检查会失败。
+强类型字段后，如果参考页没有同步，文档检查会失败。
 
 ## 按任务阅读
 
@@ -27,6 +29,10 @@ description: 从配置加载到运行时行为的完整使用手册
 | 启用 TUN 或透明接管 | [系统接管](capture.md) | [接管字段索引](generated/capture-runtime.md) |
 | 配置 Smart、API 或 Mesh | [运行管理](runtime-management.md) | [运行字段索引](generated/capture-runtime.md) |
 | 配置 XHTTP 或 socket 行为 | [XHTTP 与 StreamSettings](xhttp-stream.md) | [XHTTP 字段索引](generated/xhttp.md) |
+| 写全协议结构化节点 | [高级节点与协议参数](advanced-nodes.md) | [节点字段索引](generated/feeds-nodes.md) |
+| 写复合路由、DNS DSL 和响应策略 | [高级路由、策略组与 DNS](advanced-routing-dns.md) | [路由与 DNS 字段索引](generated/routing-dns.md) |
+| 组合独立下载、XMUX 和 FinalMask | [高级 XHTTP 与 FinalMask](advanced-xhttp-finalmask.md) | [StreamSettings 字段索引](generated/stream.md) |
+| 部署到各操作系统或服务端 | [完整部署方案](deployment-recipes.md) | [组件化构建](../BUILDING.md) |
 | 查命令和退出行为 | [命令行参考](cli.md) | [构建组件](../BUILDING.md) |
 
 ## 完整分类
@@ -46,6 +52,13 @@ description: 从配置加载到运行时行为的完整使用手册
 - [系统接管](capture.md)
 - [运行管理](runtime-management.md)
 - [XHTTP 与 StreamSettings](xhttp-stream.md)
+
+### 高级配置
+
+- [全协议节点、动态参数和叠加规则](advanced-nodes.md)
+- [复合路由、规则集、DNS 多出口和响应链](advanced-routing-dns.md)
+- [XHTTP 模式、独立下载、socket 和 FinalMask](advanced-xhttp-finalmask.md)
+- [Windows、macOS、Linux、路由器、Android 和服务端方案](deployment-recipes.md)
 
 ### 源码生成的逐字段索引
 

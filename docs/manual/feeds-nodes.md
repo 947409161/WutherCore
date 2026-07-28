@@ -9,6 +9,8 @@ description: 订阅源、过滤、重命名、节点短写、结构化节点和�
 路由、DNS 命名出口和运行时注册器。
 
 完整字段见[订阅与节点字段索引](generated/feeds-nodes.md)。
+协议注册器动态解析的 `params`、节点叠加优先级和全协议高级示例见
+[高级节点与协议参数](advanced-nodes.md)。
 
 ## 数据流
 

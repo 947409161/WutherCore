@@ -175,6 +175,11 @@ nav:
       - 系统接管: manual/capture.md
       - 运行管理: manual/runtime-management.md
       - XHTTP 与 StreamSettings: manual/xhttp-stream.md
+      - 高级配置:
+          - 全协议节点与订阅覆盖: manual/advanced-nodes.md
+          - 高级路由、策略组与 DNS: manual/advanced-routing-dns.md
+          - 高级 XHTTP 与 FinalMask: manual/advanced-xhttp-finalmask.md
+          - Windows、macOS、Linux、Android 与服务端方案: manual/deployment-recipes.md
       - 命令行参考: manual/cli.md
       - 逐字段索引:
           - 根配置与日志: manual/generated/core.md

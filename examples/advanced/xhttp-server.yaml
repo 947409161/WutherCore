@@ -1,0 +1,59 @@
+version: 1
+profile: server
+name: xhttp-server
+
+log:
+  on: true
+  level: info
+  stdout: true
+  format: json
+
+listen:
+  panel: 127.0.0.1:9090
+  share: false
+  xhttp:
+    address: 0.0.0.0
+    port: 443
+    allow-unauthenticated-non-loopback: true
+    alpn: [h2, http/1.1]
+    tls:
+      certificates:
+        - certificateFile: /etc/wuther/tls/fullchain.pem
+          keyFile: /etc/wuther/tls/private.key
+          usage: encipherment
+          ocspStapling: 3600
+      minVersion: "1.2"
+      maxVersion: "1.3"
+      rejectUnknownSni: true
+    target:
+      host: 127.0.0.1
+      port: 10000
+    max-active-connections: 4096
+    max-concurrent-streams: 128
+    max-active-http-streams: 4096
+    http-idle-timeout: 90s
+    settings:
+      host: edge.example.com
+      path: /api
+      mode: auto
+      xPaddingBytes: 100-1000
+      xmux:
+        maxConcurrency: 8-16
+
+route:
+  preset: direct
+  final: direct
+
+resolver:
+  mode: secure
+  fake: off
+  servers:
+    primary: https://1.1.1.1/dns-query
+  nameserver: [primary]
+
+capture:
+  on: false
+
+ui:
+  on: true
+  secret: REPLACE_WITH_LONG_RANDOM_TOKEN
