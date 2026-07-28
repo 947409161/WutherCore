@@ -117,6 +117,6 @@ gh attestation verify .\wuther-core-0.4.0-windows-amd64-msvc.zip --repo MiChongs
 需要验证裁剪构建时，在 `CI` 或 `Build Matrix` 工作流中选择 `Run workflow`，
 并在 `tags` 中填写逗号分隔的组件标签，例如
 `with_quic,with_vless,with_grpc,with_utls`。留空执行各目标支持的默认组件集。标签含义、
-本地等价命令和许可边界见[构建脚本](../scripts/README.md#按组件标签编译)。
+本地等价命令和许可边界见[组件化构建](BUILDING.md)。
 Build Matrix 的 `platforms` 可只重跑一个平台组；`macos` 会同时覆盖 Intel
 和 Apple Silicon。

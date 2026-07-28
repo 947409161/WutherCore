@@ -1,0 +1,283 @@
+:root {
+  --wuther-ink: #171a1b;
+  --wuther-paper: #f3f0e9;
+  --wuther-rust: #a8452c;
+  --wuther-rust-light: #da6b4b;
+  --wuther-line: #cbc5ba;
+}
+
+[data-md-color-scheme="wuther-light"] {
+  color-scheme: light;
+  --md-default-fg-color: #242728;
+  --md-default-fg-color--light: #5f625f;
+  --md-default-bg-color: var(--wuther-paper);
+  --md-primary-fg-color: var(--wuther-ink);
+  --md-primary-bg-color: #f5f1e9;
+  --md-accent-fg-color: #8f3823;
+  --md-code-bg-color: #e8e3d9;
+  --md-typeset-a-color: #8f3823;
+}
+
+[data-md-color-scheme="wuther-dark"] {
+  color-scheme: dark;
+  --md-default-fg-color: #e6e0d7;
+  --md-default-fg-color--light: #aaa69f;
+  --md-default-bg-color: #121415;
+  --md-primary-fg-color: #181b1c;
+  --md-primary-bg-color: #eee8dd;
+  --md-accent-fg-color: var(--wuther-rust-light);
+  --md-code-bg-color: #202324;
+  --md-typeset-a-color: #dc7659;
+}
+
+body,
+input {
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    "Microsoft YaHei", sans-serif;
+}
+
+body,
+.md-typeset {
+  color: var(--md-default-fg-color);
+}
+
+code,
+kbd,
+pre {
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}
+
+.md-header {
+  background: var(--wuther-ink);
+  border-bottom: 1px solid #363a3b;
+}
+
+.md-tabs {
+  background: var(--wuther-ink);
+  border-bottom: 2px solid var(--wuther-rust);
+}
+
+.md-banner {
+  background: #272a2b;
+}
+
+.md-typeset h1,
+.md-typeset h2,
+.md-typeset h3 {
+  font-weight: 730;
+  letter-spacing: -0.025em;
+}
+
+.md-typeset .md-button {
+  border-radius: 0.1rem;
+  border-color: var(--wuther-rust);
+  color: var(--md-default-fg-color);
+}
+
+.md-typeset .md-button--primary {
+  border-color: var(--wuther-rust);
+  background: var(--wuther-rust);
+  color: #fffaf2;
+}
+
+.md-content__button {
+  color: var(--md-default-fg-color--light);
+}
+
+.wuther-announce {
+  display: block;
+  text-align: center;
+}
+
+.wuther-announce a {
+  color: inherit;
+  font-weight: 700;
+  text-decoration: underline;
+  text-underline-offset: 0.18rem;
+}
+
+.wuther-hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1.08fr) minmax(17rem, 0.92fr);
+  gap: clamp(2rem, 6vw, 5rem);
+  align-items: center;
+  margin: 0 0 2.8rem;
+  padding: clamp(2.5rem, 6vw, 5rem) 0;
+  border-top: 1px solid var(--wuther-line);
+  border-bottom: 1px solid var(--wuther-line);
+}
+
+.wuther-hero h1 {
+  margin: 0.25rem 0 1rem;
+  font-size: clamp(2.5rem, 4.8vw, 4.5rem);
+  line-height: 1.02;
+}
+
+.wuther-nowrap {
+  white-space: nowrap;
+}
+
+.wuther-hero__content > p {
+  max-width: 42rem;
+  font-size: 1.05rem;
+}
+
+.wuther-eyebrow {
+  color: var(--wuther-rust);
+  font-size: 0.7rem;
+  font-weight: 800;
+  letter-spacing: 0.16em;
+}
+
+.wuther-actions p {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  margin: 1.25rem 0 0;
+}
+
+.wuther-actions .md-button {
+  margin: 0;
+}
+
+.wuther-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0;
+  margin-top: 1.5rem;
+  color: var(--md-default-fg-color--light);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 0.66rem;
+  letter-spacing: 0.08em;
+}
+
+.wuther-meta span {
+  padding: 0.25rem 0.7rem;
+  border-left: 1px solid var(--wuther-line);
+}
+
+.wuther-meta span:first-child {
+  padding-left: 0;
+  border-left: 0;
+}
+
+.wuther-kernel-panel {
+  border: 1px solid #3e4243;
+  background: #1a1d1e;
+  color: #e8e2d9;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  box-shadow: 0.65rem 0.65rem 0 #d8d1c5;
+}
+
+[data-md-color-scheme="wuther-dark"] .wuther-kernel-panel {
+  box-shadow: 0.65rem 0.65rem 0 #292d2e;
+}
+
+.wuther-kernel-panel__head,
+.wuther-kernel-panel__foot {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.65rem 0.8rem;
+  font-size: 0.62rem;
+  letter-spacing: 0.12em;
+}
+
+.wuther-kernel-panel__head {
+  border-bottom: 1px solid #3e4243;
+  color: #d46b4e;
+}
+
+.wuther-kernel-panel__foot {
+  align-items: center;
+  border-top: 1px solid #3e4243;
+  color: #a9acab;
+}
+
+.wuther-kernel-panel__foot code {
+  background: transparent;
+  color: #e8e2d9;
+  font-size: 0.65rem;
+}
+
+.wuther-pipeline > div {
+  display: grid;
+  grid-template-columns: 2rem 1fr;
+  padding: 0.85rem 0.8rem;
+  border-bottom: 1px solid #303435;
+}
+
+.wuther-pipeline > div:last-child {
+  border-bottom: 0;
+}
+
+.wuther-pipeline b {
+  grid-row: 1 / span 2;
+  color: #d46b4e;
+  font-size: 0.65rem;
+  font-weight: 500;
+}
+
+.wuther-pipeline span {
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+}
+
+.wuther-pipeline small {
+  margin-top: 0.18rem;
+  color: #858a8a;
+  font-size: 0.58rem;
+  letter-spacing: 0.04em;
+}
+
+.grid.cards > ul > li {
+  border: 1px solid var(--wuther-line);
+  border-radius: 0;
+  box-shadow: none;
+  transition: border-color 120ms ease;
+}
+
+.grid.cards > ul > li:hover {
+  border-color: var(--wuther-rust);
+  box-shadow: none;
+  transform: none;
+}
+
+.md-typeset table:not([class]) {
+  border-radius: 0;
+  overflow: hidden;
+}
+
+.md-footer {
+  background: var(--wuther-ink);
+}
+
+@media screen and (max-width: 60rem) {
+  .wuther-hero {
+    grid-template-columns: 1fr;
+  }
+
+  .wuther-hero__visual {
+    max-width: 38rem;
+  }
+}
+
+@media screen and (max-width: 36rem) {
+  .wuther-kernel-panel {
+    box-shadow: 0.35rem 0.35rem 0 #d8d1c5;
+  }
+
+  .wuther-meta span {
+    padding: 0.25rem 0.45rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition: none !important;
+  }
+}

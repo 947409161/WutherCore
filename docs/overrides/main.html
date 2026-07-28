@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+
+{% block announce %}
+  <span class="wuther-announce">
+    WutherCore {{ config.extra.release.version }} 已正式发布
+    ·
+    <a href="{{ config.extra.release.url }}">下载与校验</a>
+  </span>
+{% endblock %}

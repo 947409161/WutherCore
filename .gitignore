@@ -23,9 +23,11 @@ data/rrs-test/
 
 # 构建产物 / 发布归档
 dist/
+/site/
 
 # 工具/脚本缓存
 scripts/.cache/
+.cache/
 __pycache__/
 *.py[cod]
 

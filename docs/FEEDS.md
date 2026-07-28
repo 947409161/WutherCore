@@ -101,7 +101,8 @@ nodes:
 
 Base64 解码后会重新执行同一套探测，所以 Base64 包装的原生 YAML、JSON、Mihomo YAML、SIP008 和 URI 列表均可使用。无效正文会使本次更新失败并回退缓存，不会把正在使用的节点替换为空列表。提供者确实需要发布空订阅时应明确返回 `nodes: []`。
 
-可直接用于生成器和解析测试的完整正文见 [`examples/subscription-native.yaml`](../examples/subscription-native.yaml)。
+可直接用于生成器和解析测试的完整正文见
+[`examples/subscription-native.yaml`](https://github.com/MiChongs/WutherCore/blob/main/examples/subscription-native.yaml)。
 
 ## Age 加密订阅
 

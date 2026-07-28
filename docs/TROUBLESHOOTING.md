@@ -105,5 +105,5 @@ wuther-core ruleset refresh config.yaml
 - 错误前后的脱敏日志；
 - 已尝试的排查步骤。
 
-安全漏洞请按照 [SECURITY.md](../SECURITY.md) 私下报告。
+安全漏洞请按照[安全策略](project/security.md)私下报告。
 

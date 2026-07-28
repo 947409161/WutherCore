@@ -7,16 +7,16 @@
 
 | 优化项 | 位置 | 效果 |
 |---|---|---|
-| `incremental = true` (dev) | [Cargo.toml](../Cargo.toml) | 二次编译跳过未改动 crate 的 codegen |
-| `codegen-units = 256` (dev) | [Cargo.toml](../Cargo.toml) | 单 crate 内部并行 codegen |
-| `debug = "line-tables-only"` (dev) | [Cargo.toml](../Cargo.toml) | 调试信息缩小一个量级，链接更快 |
-| `split-debuginfo = "unpacked"` (dev, Windows) | [Cargo.toml](../Cargo.toml) | 单独 .pdb，热修改不重写主二进制 |
-| `[profile.dev.package."*"]` opt-level=1 | [Cargo.toml](../Cargo.toml) | 依赖只编一次，运行时也快 |
-| `lto = "thin"` + `codegen-units=16` (release) | [Cargo.toml](../Cargo.toml) | 与 codegen-units=1 + fat LTO 性能差 ~1%，但 release 构建时间 -60% |
-| `release-fast` profile | [Cargo.toml](../Cargo.toml) | CI 验证用：lto=off + codegen-units=256 |
-| `rust-lld` Windows 链接器 | [.cargo/config.toml](../.cargo/config.toml) | link.exe → rust-lld，链接 -50%~-70% |
-| `mold` / `lld` Linux 链接器 | [.cargo/config.toml](../.cargo/config.toml) | bfd-ld → mold，链接 -80%+ |
-| `git-fetch-with-cli = true` | [.cargo/config.toml](../.cargo/config.toml) | 大仓 git deps 抓取不卡顿 |
+| `incremental = true` (dev) | [Cargo.toml](https://github.com/MiChongs/WutherCore/blob/main/Cargo.toml) | 二次编译跳过未改动 crate 的 codegen |
+| `codegen-units = 256` (dev) | [Cargo.toml](https://github.com/MiChongs/WutherCore/blob/main/Cargo.toml) | 单 crate 内部并行 codegen |
+| `debug = "line-tables-only"` (dev) | [Cargo.toml](https://github.com/MiChongs/WutherCore/blob/main/Cargo.toml) | 调试信息缩小一个量级，链接更快 |
+| `split-debuginfo = "unpacked"` (dev, Windows) | [Cargo.toml](https://github.com/MiChongs/WutherCore/blob/main/Cargo.toml) | 单独 .pdb，热修改不重写主二进制 |
+| `[profile.dev.package."*"]` opt-level=1 | [Cargo.toml](https://github.com/MiChongs/WutherCore/blob/main/Cargo.toml) | 依赖只编一次，运行时也快 |
+| `lto = "thin"` + `codegen-units=16` (release) | [Cargo.toml](https://github.com/MiChongs/WutherCore/blob/main/Cargo.toml) | 与 codegen-units=1 + fat LTO 性能差 ~1%，但 release 构建时间 -60% |
+| `release-fast` profile | [Cargo.toml](https://github.com/MiChongs/WutherCore/blob/main/Cargo.toml) | CI 验证用：lto=off + codegen-units=256 |
+| `rust-lld` Windows 链接器 | [.cargo/config.toml](https://github.com/MiChongs/WutherCore/blob/main/.cargo/config.toml) | link.exe → rust-lld，链接 -50%~-70% |
+| `mold` / `lld` Linux 链接器 | [.cargo/config.toml](https://github.com/MiChongs/WutherCore/blob/main/.cargo/config.toml) | bfd-ld → mold，链接 -80%+ |
+| `git-fetch-with-cli = true` | [.cargo/config.toml](https://github.com/MiChongs/WutherCore/blob/main/.cargo/config.toml) | 大仓 git deps 抓取不卡顿 |
 
 ## 2. 用户主机一次性安装（强烈推荐）
 

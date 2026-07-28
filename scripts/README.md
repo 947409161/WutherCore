@@ -1,6 +1,6 @@
 # WutherCore 多平台构建
 
-仓库的 GitHub Release 使用 [Release 工作流](../.github/workflows/release.yml) 自动构建并发布；本页脚本用于本地构建、调试工具链或复现单个平台问题。正式版与预发布的标签规则见 [发版指南](../docs/RELEASING.md)。
+仓库的 GitHub Release 使用 [Release 工作流](https://github.com/MiChongs/WutherCore/blob/main/.github/workflows/release.yml) 自动构建并发布；本页脚本用于本地构建、调试工具链或复现单个平台问题。正式版与预发布的标签规则见 [发版指南](https://michongs.github.io/WutherCore/RELEASING/)。
 
 ## 一键构建（Windows 主机）
 
@@ -29,8 +29,8 @@ pwsh -File scripts/build-all.ps1 -Backend cross    -Targets "aarch64-linux-andro
 
 WutherCore 使用 Cargo features 提供与 Go `-tags` 等价的编译期组件裁剪。未指定
 `--tags` 时，本机脚本使用 `standard`，行为与引入组件标签前一致（除需单独许可
-的 Naive 外全部启用）。CI 中无法嵌入 Mozilla NSS 的交叉编译和 Android 目标使用
-`portable`，原生 Linux、Windows 和 macOS 仍使用 `standard`。`portable` 不包含
+的 Naive 外全部启用）。CI 中 Linux musl、Android 与 Windows 目标使用
+`portable`，原生 Linux GNU 与 macOS 使用 `standard`。`portable` 不包含
 上游无法覆盖全部 musl/交叉架构的 BoringSSL 传输；支持 BoringSSL 的目标可选择
 `portable_boringssl`，或显式加入对应标签。一旦指定 `--tags`，
 脚本和 CI 都会自动添加 `--no-default-features`，只有列出的标签及其依赖会进入构建。
@@ -94,7 +94,7 @@ wuther-core components --json
 
 GitHub Actions 的 **Build Matrix** 和 **CI** 手动运行入口也提供 `tags` 输入，
 显式填写时语义与本地 `--tags` 完全相同。Build Matrix 留空时会按目标选择上述
-`standard` 或 `portable` 预设，并把最终选择写进归档。它还可用 `platforms`
+`standard` 或 `portable` 平台预设，并把最终选择写进归档。它还可用 `platforms`
 只运行 `linux`、`android`、`windows` 或 `macos` 子矩阵；`all` 会并行构建
 10 个目标。macOS 使用 GitHub 原生 Intel 与 Apple Silicon runner，分别产出
 `x86_64-apple-darwin` 和 `aarch64-apple-darwin`，不依赖不完整的 Darwin
@@ -151,16 +151,16 @@ pwsh -File scripts/build-all.ps1 -Backend cross    -Targets "x86_64-unknown-linu
 
 ```
 dist/
-  wuther-core-0.3.0-x86_64-pc-windows-msvc.zip
-  wuther-core-0.3.0-x86_64-pc-windows-msvc.zip.sha256
-  wuther-core-0.3.0-x86_64-unknown-linux-musl.tar.gz
-  wuther-core-0.3.0-x86_64-unknown-linux-musl.tar.gz.sha256
+  wuther-core-0.3.1-x86_64-pc-windows-msvc.zip
+  wuther-core-0.3.1-x86_64-pc-windows-msvc.zip.sha256
+  wuther-core-0.3.1-x86_64-unknown-linux-musl.zip
+  wuther-core-0.3.1-x86_64-unknown-linux-musl.zip.sha256
   ...
 ```
 
 每个归档包含：
 - `wuther-core[.exe]` —— 内核可执行文件
-- `README.md`、`RP内核设计文档.md`
+- `README.md`、`LICENSE` 与 `BUILD-COMPONENTS.txt`
 - `examples/` —— 桌面、路由器、Android、订阅和手动节点模板
 
 GitHub Release 还会统一生成 `SHA256SUMS`，并为所有归档写入 GitHub Artifact Attestation。
@@ -187,8 +187,8 @@ GitHub Release 还会统一生成 `SHA256SUMS`，并为所有归档写入 GitHub
 
 ```cmd
 :: 验证
-certutil -hashfile dist\wuther-core-0.3.0-x86_64-pc-windows-msvc.zip SHA256
-type    dist\wuther-core-0.3.0-x86_64-pc-windows-msvc.zip.sha256
+certutil -hashfile dist\wuther-core-0.3.1-x86_64-pc-windows-msvc.zip SHA256
+type    dist\wuther-core-0.3.1-x86_64-pc-windows-msvc.zip.sha256
 ```
 
 ## 常见问题

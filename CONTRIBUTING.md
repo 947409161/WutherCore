@@ -6,8 +6,8 @@
 
 - Bug、回归和明确的小改动可以直接提交 Pull Request。
 - 新协议、大范围配置变更或架构调整，请先开 Discussion 或 Feature Request 对齐方案。
-- 安全漏洞不要提交公开 Issue，按照 [SECURITY.md](SECURITY.md) 私下报告。
-- 参与项目即表示同意遵守 [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)。
+- 安全漏洞不要提交公开 Issue，按照[安全策略](https://michongs.github.io/WutherCore/project/security/)私下报告。
+- 参与项目即表示同意遵守[社区行为准则](https://michongs.github.io/WutherCore/project/code-of-conduct/)。
 
 ## 开发环境
 

@@ -1,0 +1,199 @@
+# yaml-language-server: $schema=https://squidfunk.github.io/mkdocs-material/schema.json
+
+site_name: WutherCore
+site_url: https://michongs.github.io/WutherCore/
+site_description: 面向桌面、服务器、路由器和 Android 的模块化 Rust 代理内核文档
+site_author: WutherCore contributors
+repo_url: https://github.com/MiChongs/WutherCore
+repo_name: MiChongs/WutherCore
+edit_uri: edit/main/docs/
+copyright: Copyright &copy; 2026 WutherCore contributors · MIT License
+
+docs_dir: docs
+site_dir: site
+strict: true
+use_directory_urls: true
+exclude_docs: |
+  README.md
+
+theme:
+  name: material
+  custom_dir: docs/overrides
+  language: zh
+  logo: assets/wuthercore-mark.svg
+  favicon: assets/wuthercore-mark.svg
+  font: false
+  icon:
+    repo: fontawesome/brands/github
+    edit: material/pencil
+    view: material/eye
+  features:
+    - announce.dismiss
+    - content.action.edit
+    - content.action.view
+    - content.code.annotate
+    - content.code.copy
+    - content.tabs.link
+    - navigation.footer
+    - navigation.indexes
+    - navigation.instant
+    - navigation.instant.prefetch
+    - navigation.instant.progress
+    - navigation.path
+    - navigation.prune
+    - navigation.sections
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.top
+    - search.highlight
+    - search.share
+    - search.suggest
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: wuther-light
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-night
+        name: 切换到深色模式
+    - media: "(prefers-color-scheme: dark)"
+      scheme: wuther-dark
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-sunny
+        name: 切换到浅色模式
+
+plugins:
+  - search:
+      lang:
+        - zh
+        - en
+  - blog:
+      blog_dir: blog
+      post_url_format: "{date}/{slug}"
+      archive: true
+      categories: true
+      pagination_per_page: 8
+  - git-revision-date-localized:
+      type: timeago
+      timezone: Asia/Shanghai
+      locale: zh
+      fallback_to_build_date: true
+      enable_creation_date: false
+      enable_git_follow: false
+  - minify:
+      minify_html: true
+
+validation:
+  omitted_files: ignore
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      permalink_title: 链接到本节
+      toc_depth: 4
+  - pymdownx.betterem
+  - pymdownx.caret
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.magiclink:
+      repo_url_shorthand: true
+      user: MiChongs
+      repo: WutherCore
+  - pymdownx.mark
+  - pymdownx.smartsymbols
+  - pymdownx.snippets:
+      base_path:
+        - .
+      check_paths: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.tilde
+
+extra_css:
+  - stylesheets/extra.css
+
+extra_javascript:
+  - javascripts/extra.js
+
+extra:
+  status:
+    stable: 稳定
+    experimental: 实验性
+  release:
+    version: 0.3.1
+    url: https://github.com/MiChongs/WutherCore/releases/tag/v0.3.1
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/MiChongs/WutherCore
+      name: WutherCore on GitHub
+    - icon: fontawesome/brands/telegram
+      link: https://t.me/wuther_core_chat
+      name: WutherCore Telegram
+
+nav:
+  - 首页: index.md
+  - 快速开始:
+      - 安装与运行: getting-started.md
+      - 示例配置: examples.md
+      - 功能矩阵: FEATURES.md
+      - 配置指南: CONFIGURATION.md
+      - 排错手册: TROUBLESHOOTING.md
+  - 协议与传输:
+      - 协议概览: protocols/index.md
+      - AnyTLS: ANYTLS.md
+      - Hysteria 1 / 2: HYSTERIA.md
+      - Shadowsocks: SHADOWSOCKS.md
+      - WireGuard: WIREGUARD.md
+      - Young: YOUNG_PROTOCOL.md
+      - XHTTP / SplitHTTP: XHTTP.md
+      - Naive: NAIVE.md
+      - FinalMask 验证: finalmask-xray-oracle.md
+  - 数据与接管:
+      - 自由订阅与 Provider: FEEDS.md
+      - Linux TUN auto_redirect: LINUX-TUN-AUTO-REDIRECT.md
+      - 管理 API: API.md
+  - 开发与发布:
+      - 架构说明: ARCHITECTURE.md
+      - 组网后端基础设施: mesh-backend-foundation.md
+      - 组件化构建: BUILDING.md
+      - 构建性能: BUILD-PERF.md
+      - 发版指南: RELEASING.md
+  - 项目:
+      - 参与贡献: project/contributing.md
+      - 项目治理: project/governance.md
+      - 路线图: project/roadmap.md
+      - 安全策略: project/security.md
+      - 获取帮助: project/support.md
+      - 行为准则: project/code-of-conduct.md
+      - 变更日志: project/changelog.md
+  - 动态:
+      - blog/index.md
+  - GitHub: https://github.com/MiChongs/WutherCore

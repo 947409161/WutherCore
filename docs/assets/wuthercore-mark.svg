@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title">
+  <title id="title">WutherCore</title>
+  <rect width="64" height="64" rx="8" fill="#171a1b"/>
+  <path d="M13 18h9l5.5 23L34 22h8l5 19 5-23h8L52 50h-9l-5.3-19L31 50h-9L13 18Z" fill="#d35f3f"/>
+  <circle cx="47" cy="14" r="4" fill="#eee8dd"/>
+</svg>
