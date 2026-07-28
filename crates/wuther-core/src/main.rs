@@ -263,9 +263,7 @@ fn main() -> anyhow::Result<()> {
     }
     match cli.cmd {
         Cmd::Run { config } => {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()?;
+            let rt = build_multi_thread_runtime()?;
             rt.block_on(cmd_run(config))
         }
         Cmd::Check { config } => cmd_check(config),
@@ -276,9 +274,7 @@ fn main() -> anyhow::Result<()> {
             output,
         } => cmd_migrate(kind, input, output),
         Cmd::Feeds { action } => {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()?;
+            let rt = build_multi_thread_runtime()?;
             rt.block_on(cmd_feeds(action))
         }
         Cmd::Store { action } => {
@@ -306,13 +302,36 @@ fn main() -> anyhow::Result<()> {
             ))
         }
         Cmd::Ruleset { action } => {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()?;
+            let rt = build_multi_thread_runtime()?;
             rt.block_on(cmd_ruleset(action))
         }
         Cmd::Components { json } => cmd_components(json),
     }
+}
+
+fn build_multi_thread_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder
+        .enable_all()
+        .thread_name("wuther-worker")
+        // Bound blocking expansion. Network connects no longer use this pool;
+        // it remains available for filesystem and resolver implementations.
+        .max_blocking_threads(128)
+        // Drain a substantial ready-I/O batch per reactor turn while retaining
+        // Tokio's cooperative task scheduling.
+        .max_io_events_per_tick(1024);
+    #[cfg(target_os = "android")]
+    {
+        // Android commonly reports every big.LITTLE CPU. Driving one runtime
+        // thread per logical CPU increases migrations and heat for a proxy
+        // workload whose hot path is asynchronous I/O.
+        let workers = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(2)
+            .clamp(2, 4);
+        builder.worker_threads(workers);
+    }
+    builder.build()
 }
 
 fn compiled_component_tags() -> Vec<&'static str> {

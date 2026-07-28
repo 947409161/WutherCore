@@ -983,6 +983,14 @@ async fn run_accept_loop(
                         continue;
                     }
                 };
+                if let Err(error) = conn.set_nodelay(true) {
+                    debug!(
+                        target: "capture::system",
+                        family,
+                        %error,
+                        "failed to enable TCP_NODELAY on intercepted stream"
+                    );
+                }
                 let nat_port = peer.port();
                 let session = match stack.tcp_nat.lookup_back(nat_port) {
                     Some(s) => s,

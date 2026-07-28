@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 use crate::{
     eim_nat::EimNatTable,
     engine::CapturePlan,
-    frame_cache::{TunFrameFormatCache, write_ip_packet_to_tun},
+    frame_cache::{TunFrameFormatCache, write_ip_packets_to_tun_batch},
     nat::NatTable,
     packet::parse_tun_frame,
     stack_system::{ProcessOutcome, SystemStack, SystemStackHandle},
@@ -188,7 +188,7 @@ impl SystemDispatcher {
         let buf_cap = mtu + 64;
         // 预分配 PUMP_BATCH_N 个固定容量 buffer；read_batch 内填充实际字节，
         // sizes[i] 记录 IP 包长度。drain-on-ready 后端一次 wakeup 可消费多包。
-        let mut storage: Vec<Vec<u8>> = (0..PUMP_BATCH_N).map(|_| vec![0u8; buf_cap]).collect();
+        let mut storage: [Vec<u8>; PUMP_BATCH_N] = std::array::from_fn(|_| vec![0u8; buf_cap]);
         let mut sizes = [0usize; PUMP_BATCH_N];
         let iface = device.name().to_string();
         let mut traffic = TrafficLog::new(Instant::now());
@@ -203,9 +203,9 @@ impl SystemDispatcher {
         );
 
         loop {
-            // 每轮重建可变借用集合 —— Vec<&mut [u8]> 与 storage 同生命周期，
+            // 每轮在栈上重建固定长度的可变借用数组，不产生堆分配。
             // 在 select! 完成后必须显式 drop 让 storage 可重新 index。
-            let mut bufs: Vec<&mut [u8]> = storage.iter_mut().map(|v| v.as_mut_slice()).collect();
+            let mut bufs = storage.each_mut().map(|v| v.as_mut_slice());
 
             let count = tokio::select! {
                 _ = &mut stop_rx => break,
@@ -240,17 +240,32 @@ impl SystemDispatcher {
             };
             drop(bufs); // 释放 storage 可变借用，让下面 for 循环可单元素 index
 
+            let mut writebacks = Vec::with_capacity(count);
             for i in 0..count {
                 let raw_frame = &mut storage[i][..sizes[i]];
-                self.process_one_ip_packet(
-                    raw_frame,
-                    &device,
-                    &stack,
-                    &handler,
-                    &iface,
-                    &mut traffic,
-                )
-                .await;
+                if let Some(packet) = self
+                    .process_one_ip_packet(
+                        raw_frame,
+                        &device,
+                        &stack,
+                        &handler,
+                        &iface,
+                        &mut traffic,
+                    )
+                    .await
+                {
+                    writebacks.push(packet);
+                }
+            }
+            if let Err(e) = write_ip_packets_to_tun_batch(
+                &device,
+                &self.frame_formats,
+                writebacks,
+                "capture::system",
+            )
+            .await
+            {
+                warn!(target: "capture::system", error = %e, "tun write batch failed");
             }
         }
         info!(
@@ -271,7 +286,7 @@ impl SystemDispatcher {
         handler: &ListenerHandler,
         iface: &str,
         traffic: &mut TrafficLog,
-    ) {
+    ) -> Option<Vec<u8>> {
         let n = raw_frame.len();
         if traffic.record_read(n) {
             info!(
@@ -292,7 +307,7 @@ impl SystemDispatcher {
                     error = %e,
                     "drop unparsable tun frame"
                 );
-                return;
+                return None;
             }
         };
         let parsed = parsed_frame.packet;
@@ -302,7 +317,7 @@ impl SystemDispatcher {
         let ip_end = ip_offset.saturating_add(ip_len);
         if ip_end > raw_frame.len() {
             traffic.record_unparsable();
-            return;
+            return None;
         }
 
         let packet = match self.inbound.classify_packet(&parsed) {
@@ -316,7 +331,7 @@ impl SystemDispatcher {
                     ?reason,
                     "packet skipped by TUN inbound policy"
                 );
-                return;
+                return None;
             }
         };
 
@@ -325,33 +340,11 @@ impl SystemDispatcher {
                 traffic.record_tcp();
                 let outcome = stack.process_packet(&mut raw_frame[ip_offset..ip_end]);
                 match outcome {
-                    ProcessOutcome::WriteBack => {
-                        let pkt_owned = raw_frame[ip_offset..ip_end].to_vec();
-                        if let Err(e) = write_ip_packet_to_tun(
-                            device,
-                            &self.frame_formats,
-                            &pkt_owned,
-                            "capture::system",
-                        )
-                        .await
-                        {
-                            warn!(target: "capture::system", error = %e, "tun write failed");
-                        }
-                    }
-                    ProcessOutcome::Reply(reply) => {
-                        if let Err(e) = write_ip_packet_to_tun(
-                            device,
-                            &self.frame_formats,
-                            &reply,
-                            "capture::system",
-                        )
-                        .await
-                        {
-                            warn!(target: "capture::system", error = %e, "tun reply write failed");
-                        }
-                    }
+                    ProcessOutcome::WriteBack => Some(raw_frame[ip_offset..ip_end].to_vec()),
+                    ProcessOutcome::Reply(reply) => Some(reply),
                     ProcessOutcome::Consumed | ProcessOutcome::Drop => {
                         traffic.record_drop();
+                        None
                     }
                 }
             }
@@ -370,15 +363,17 @@ impl SystemDispatcher {
                 let payload_end = payload_off + payload_len;
                 if payload_end > raw_frame.len() {
                     traffic.record_drop();
-                    return;
+                    return None;
                 }
                 let payload = raw_frame[payload_off..payload_end].to_vec();
                 self.handle_udp(device, handler, source, destination, payload)
                     .await;
+                None
             }
             TunPacket::Other => {
                 traffic.record_other();
                 traffic.record_drop();
+                None
             }
         }
     }

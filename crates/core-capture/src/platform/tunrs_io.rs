@@ -259,8 +259,13 @@ pub fn open(plan: &CapturePlan) -> Result<Arc<TunRsDevice>, TunIoError> {
     }
 
     #[cfg(target_os = "linux")]
-    if plan.offload {
-        builder = builder.offload(true);
+    {
+        // A larger kernel TX queue absorbs short packet bursts so the async
+        // pump can drain them in batches instead of oscillating between wakeups.
+        builder = builder.tx_queue_len(4096);
+        if plan.offload {
+            builder = builder.offload(true);
+        }
     }
 
     let device = builder.build_async().map_err(TunIoError::Read)?;

@@ -61,6 +61,109 @@ fn classify_read(r: io::Result<usize>) -> ReadOutcome {
     }
 }
 
+#[derive(Debug)]
+struct DirectionResult {
+    bytes: u64,
+    error: Option<io::Error>,
+}
+
+async fn copy_direction<R, W, F>(
+    reader: &mut R,
+    writer: &mut W,
+    external_cancel: CancellationToken,
+    relay_cancel: CancellationToken,
+    mut record: F,
+) -> DirectionResult
+where
+    R: AsyncRead + Unpin + ?Sized,
+    W: AsyncWrite + Unpin + ?Sized,
+    F: FnMut(u64),
+{
+    let mut buffer = vec![0u8; INITIAL_BUF_SIZE];
+    let mut total = 0u64;
+    loop {
+        let read = tokio::select! {
+            biased;
+            () = external_cancel.cancelled() => {
+                let _ = writer.shutdown().await;
+                return DirectionResult { bytes: total, error: None };
+            }
+            () = relay_cancel.cancelled() => {
+                let _ = writer.shutdown().await;
+                return DirectionResult { bytes: total, error: None };
+            }
+            result = reader.read(&mut buffer) => result,
+        };
+        let bytes_read = match classify_read(read) {
+            ReadOutcome::Data(bytes_read) => bytes_read,
+            ReadOutcome::Eof => {
+                let _ = writer.shutdown().await;
+                return DirectionResult {
+                    bytes: total,
+                    error: None,
+                };
+            }
+            ReadOutcome::Err(error) => {
+                relay_cancel.cancel();
+                let _ = writer.shutdown().await;
+                return DirectionResult {
+                    bytes: total,
+                    error: Some(error),
+                };
+            }
+        };
+        let write = tokio::select! {
+            biased;
+            () = external_cancel.cancelled() => {
+                let _ = writer.shutdown().await;
+                return DirectionResult { bytes: total, error: None };
+            }
+            () = relay_cancel.cancelled() => {
+                let _ = writer.shutdown().await;
+                return DirectionResult { bytes: total, error: None };
+            }
+            result = writer.write_all(&buffer[..bytes_read]) => result,
+        };
+        if let Err(error) = write {
+            relay_cancel.cancel();
+            let _ = writer.shutdown().await;
+            return DirectionResult {
+                bytes: total,
+                error: Some(error),
+            };
+        }
+        let bytes = bytes_read as u64;
+        total = total.saturating_add(bytes);
+        record(bytes);
+        grow_buffer_after_full_read(&mut buffer, bytes_read);
+    }
+}
+
+/// A TCP peer commonly closes a completed HTTP/download stream with RST
+/// instead of a FIN. Once useful payload has crossed the relay, Linux
+/// ECONNRESET, connection-aborted and the matching write-side errors are
+/// terminal close signals rather than a failed transfer.
+fn is_graceful_terminal_error(error: &io::Error, transferred: u64) -> bool {
+    transferred > 0
+        && matches!(
+            error.kind(),
+            io::ErrorKind::ConnectionReset
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::BrokenPipe
+                | io::ErrorKind::NotConnected
+        )
+}
+
+fn finish_directions(upload: DirectionResult, download: DirectionResult) -> io::Result<(u64, u64)> {
+    let transferred = upload.bytes.saturating_add(download.bytes);
+    if let Some(error) = upload.error.or(download.error)
+        && !is_graceful_terminal_error(&error, transferred)
+    {
+        return Err(error);
+    }
+    Ok((upload.bytes, download.bytes))
+}
+
 /// 双向拷贝 a ↔ b，每段透传到 per-conn + 全局 counter。
 ///
 /// 返回 `(up_total, down_total)` —— 即便一方提前出错也会尽量返回到那一刻为止
@@ -83,70 +186,27 @@ where
     let up_metrics = metrics.clone();
     let up_counter = up.clone();
     let cancel_up = cancel.clone();
-    let up_task = async move {
-        let mut buf = vec![0u8; INITIAL_BUF_SIZE];
-        let mut total: u64 = 0;
-        loop {
-            tokio::select! {
-                biased;
-                _ = cancel_up.cancelled() => {
-                    let _ = bw.shutdown().await;
-                    break;
-                }
-                r = ar.read(&mut buf) => {
-                    let n = match classify_read(r) {
-                        ReadOutcome::Data(n) => n,
-                        ReadOutcome::Eof => { let _ = bw.shutdown().await; break; }
-                        ReadOutcome::Err(e) => return Err(e),
-                    };
-                    if let Err(e) = bw.write_all(&buf[..n]).await {
-                        return Err(e);
-                    }
-                    total = total.saturating_add(n as u64);
-                    up_counter.fetch_add(n as u64, Ordering::Relaxed);
-                    if let Some(m) = &up_metrics { m.add_up(n as u64); }
-                    grow_buffer_after_full_read(&mut buf, n);
-                }
-            }
+    let relay_cancel = CancellationToken::new();
+    let relay_cancel_up = relay_cancel.clone();
+    let up_task = copy_direction(&mut ar, &mut bw, cancel_up, relay_cancel_up, move |bytes| {
+        up_counter.fetch_add(bytes, Ordering::Relaxed);
+        if let Some(metrics) = &up_metrics {
+            metrics.add_up(bytes);
         }
-        Ok::<u64, io::Error>(total)
-    };
+    });
 
     let down_metrics = metrics.clone();
     let down_counter = down.clone();
     let cancel_down = cancel.clone();
-    let down_task = async move {
-        let mut buf = vec![0u8; INITIAL_BUF_SIZE];
-        let mut total: u64 = 0;
-        loop {
-            tokio::select! {
-                biased;
-                _ = cancel_down.cancelled() => {
-                    let _ = aw.shutdown().await;
-                    break;
-                }
-                r = br.read(&mut buf) => {
-                    let n = match classify_read(r) {
-                        ReadOutcome::Data(n) => n,
-                        ReadOutcome::Eof => { let _ = aw.shutdown().await; break; }
-                        ReadOutcome::Err(e) => return Err(e),
-                    };
-                    if let Err(e) = aw.write_all(&buf[..n]).await {
-                        return Err(e);
-                    }
-                    total = total.saturating_add(n as u64);
-                    down_counter.fetch_add(n as u64, Ordering::Relaxed);
-                    if let Some(m) = &down_metrics { m.add_down(n as u64); }
-                    grow_buffer_after_full_read(&mut buf, n);
-                }
-            }
+    let down_task = copy_direction(&mut br, &mut aw, cancel_down, relay_cancel, move |bytes| {
+        down_counter.fetch_add(bytes, Ordering::Relaxed);
+        if let Some(metrics) = &down_metrics {
+            metrics.add_down(bytes);
         }
-        Ok::<u64, io::Error>(total)
-    };
+    });
 
-    // try_join：任一方向出错立刻短路；正常 EOF 双方各自 break 后 join。
-    let (n_up, n_down) = tokio::try_join!(up_task, down_task)?;
-    Ok((n_up, n_down))
+    let (upload, download) = tokio::join!(up_task, down_task);
+    finish_directions(upload, download)
 }
 
 /// 双向拷贝并通过完整连接管理器计数。
@@ -170,69 +230,27 @@ where
     let up_metrics = metrics.clone();
     let up_accounting = accounting.clone();
     let cancel_up = accounting.cancel_token();
-    let up_task = async move {
-        let mut buf = vec![0u8; INITIAL_BUF_SIZE];
-        let mut total: u64 = 0;
-        loop {
-            tokio::select! {
-                biased;
-                _ = cancel_up.cancelled() => {
-                    let _ = bw.shutdown().await;
-                    break;
-                }
-                r = ar.read(&mut buf) => {
-                    let n = match classify_read(r) {
-                        ReadOutcome::Data(n) => n,
-                        ReadOutcome::Eof => { let _ = bw.shutdown().await; break; }
-                        ReadOutcome::Err(e) => return Err(e),
-                    };
-                    if let Err(e) = bw.write_all(&buf[..n]).await {
-                        return Err(e);
-                    }
-                    total = total.saturating_add(n as u64);
-                    up_accounting.record_upload(n as u64);
-                    if let Some(m) = &up_metrics { m.add_up(n as u64); }
-                    grow_buffer_after_full_read(&mut buf, n);
-                }
-            }
+    let relay_cancel = CancellationToken::new();
+    let relay_cancel_up = relay_cancel.clone();
+    let up_task = copy_direction(&mut ar, &mut bw, cancel_up, relay_cancel_up, move |bytes| {
+        up_accounting.record_upload(bytes);
+        if let Some(metrics) = &up_metrics {
+            metrics.add_up(bytes);
         }
-        Ok::<u64, io::Error>(total)
-    };
+    });
 
     let down_metrics = metrics.clone();
     let down_accounting = accounting.clone();
     let cancel_down = accounting.cancel_token();
-    let down_task = async move {
-        let mut buf = vec![0u8; INITIAL_BUF_SIZE];
-        let mut total: u64 = 0;
-        loop {
-            tokio::select! {
-                biased;
-                _ = cancel_down.cancelled() => {
-                    let _ = aw.shutdown().await;
-                    break;
-                }
-                r = br.read(&mut buf) => {
-                    let n = match classify_read(r) {
-                        ReadOutcome::Data(n) => n,
-                        ReadOutcome::Eof => { let _ = aw.shutdown().await; break; }
-                        ReadOutcome::Err(e) => return Err(e),
-                    };
-                    if let Err(e) = aw.write_all(&buf[..n]).await {
-                        return Err(e);
-                    }
-                    total = total.saturating_add(n as u64);
-                    down_accounting.record_download(n as u64);
-                    if let Some(m) = &down_metrics { m.add_down(n as u64); }
-                    grow_buffer_after_full_read(&mut buf, n);
-                }
-            }
+    let down_task = copy_direction(&mut br, &mut aw, cancel_down, relay_cancel, move |bytes| {
+        down_accounting.record_download(bytes);
+        if let Some(metrics) = &down_metrics {
+            metrics.add_down(bytes);
         }
-        Ok::<u64, io::Error>(total)
-    };
+    });
 
-    let (n_up, n_down) = tokio::try_join!(up_task, down_task)?;
-    Ok((n_up, n_down))
+    let (upload, download) = tokio::join!(up_task, down_task);
+    finish_directions(upload, download)
 }
 
 #[cfg(test)]
@@ -258,6 +276,39 @@ mod tests {
     fn classify_other_io_errors_propagate() {
         let err = io::Error::new(io::ErrorKind::ConnectionReset, "RST");
         assert!(matches!(classify_read(Err(err)), ReadOutcome::Err(_)));
+    }
+
+    #[test]
+    fn reset_after_payload_is_a_graceful_terminal_close() {
+        let result = finish_directions(
+            DirectionResult {
+                bytes: 1024,
+                error: None,
+            },
+            DirectionResult {
+                bytes: 40 * 1024 * 1024,
+                error: Some(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "ECONNRESET (os error 104)",
+                )),
+            },
+        );
+        assert_eq!(result.unwrap(), (1024, 40 * 1024 * 1024));
+    }
+
+    #[test]
+    fn reset_before_any_payload_still_reports_failure() {
+        let result = finish_directions(
+            DirectionResult {
+                bytes: 0,
+                error: None,
+            },
+            DirectionResult {
+                bytes: 0,
+                error: Some(io::Error::new(io::ErrorKind::ConnectionReset, "RST")),
+            },
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::ConnectionReset);
     }
 
     #[test]

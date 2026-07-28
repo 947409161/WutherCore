@@ -502,25 +502,17 @@ pub fn apply_outbound_mark(_sock: &socket2::Socket) -> std::io::Result<()> {
     Ok(())
 }
 
-/// TCP connect 专用：对齐 mihomo `bindMarkToControl`，非 global-unicast
-/// 目标不打 mark，避免本机/LAN/组播等连接被路由标记污染。
+/// Apply the capture-bypass mark to a socket with a known peer.
+///
+/// The mark is required for private/LAN proxy endpoints too: a catch-all Root
+/// TUN can otherwise recapture its own carrier. Linux's local rule and main
+/// table still preserve loopback and LAN routing, so address filtering belongs
+/// to physical-interface binding, not to the fwmark.
 pub fn apply_outbound_mark_for_addr(
     sock: &socket2::Socket,
     addr: std::net::SocketAddr,
 ) -> std::io::Result<()> {
-    let mark = outbound_fwmark();
-    if mark == 0 {
-        return Ok(());
-    }
-    if !should_mark_outbound_addr(addr.ip()) {
-        tracing::trace!(
-            target: "dial",
-            peer = %addr,
-            mark,
-            "skip SO_MARK for non-global direct target"
-        );
-        return Ok(());
-    }
+    let _ = addr;
     apply_outbound_mark(sock)
 }
 

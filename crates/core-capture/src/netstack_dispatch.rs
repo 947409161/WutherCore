@@ -178,7 +178,7 @@ impl NetstackDispatcher {
     ) {
         let mtu = usize::from(self.plan.mtu.get());
         let buf_cap = mtu + 64;
-        let mut storage: Vec<Vec<u8>> = (0..PUMP_BATCH_N).map(|_| vec![0u8; buf_cap]).collect();
+        let mut storage: [Vec<u8>; PUMP_BATCH_N] = std::array::from_fn(|_| vec![0u8; buf_cap]);
         let mut sizes = [0usize; PUMP_BATCH_N];
         let iface = device.name().to_string();
         let mut traffic = TrafficLog::new(Instant::now());
@@ -194,7 +194,7 @@ impl NetstackDispatcher {
         );
 
         loop {
-            let mut bufs: Vec<&mut [u8]> = storage.iter_mut().map(|v| v.as_mut_slice()).collect();
+            let mut bufs = storage.each_mut().map(|v| v.as_mut_slice());
             let count = tokio::select! {
                 _ = &mut stop_rx => break,
                 _ = log_tick.tick() => {

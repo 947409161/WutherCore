@@ -17,8 +17,7 @@ use tracing::{debug, warn};
 
 use crate::{
     adapter::{
-        BoxedStream, apply_outbound_mark_for_addr, protect_socket, resolve_host,
-        resolve_host_for_direct,
+        BoxedStream, apply_outbound_mark, protect_socket, resolve_host, resolve_host_for_direct,
     },
     loopback::{LoopbackTcpGuard, TrackedTcpStream, register_tcp},
     socket_policy,
@@ -792,33 +791,82 @@ async fn marked_connect_raw_with_config(
     timeout: Duration,
     cfg: Option<OutboundSocketConfig>,
 ) -> std::io::Result<(TcpStream, LoopbackTcpGuard)> {
-    let std_stream = tokio::task::spawn_blocking(move || {
-        let domain = if addr.is_ipv4() {
-            Domain::IPV4
-        } else {
-            Domain::IPV6
-        };
-        let protocol = if cfg.as_ref().is_some_and(|c| c.tcp_mptcp) {
-            Protocol::from(262)
-        } else {
-            Protocol::TCP
-        };
-        let sock = Socket::new(domain, Type::STREAM, Some(protocol))?;
-        protect_socket(&sock)?;
-        apply_outbound_mark_for_addr(&sock, addr)?;
-        crate::adapter::bind_outbound_socket(&sock, addr)?;
-        if let Some(cfg) = cfg.as_ref() {
-            apply_socket_config(&sock, addr, cfg)?;
-        }
-        sock.connect_timeout(&addr.into(), timeout)?;
-        sock.set_nonblocking(true)?;
-        Ok::<std::net::TcpStream, std::io::Error>(sock.into())
-    })
-    .await
-    .map_err(|error| std::io::Error::other(format!("spawn_blocking: {error}")))??;
+    let domain = if addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let protocol = if cfg.as_ref().is_some_and(|c| c.tcp_mptcp) {
+        Protocol::from(262)
+    } else {
+        Protocol::TCP
+    };
+    let sock = Socket::new(domain, Type::STREAM, Some(protocol))?;
+    sock.set_nonblocking(true)?;
+    protect_socket(&sock)?;
+    // Every carrier socket must bypass Root TUN, including private/LAN proxy
+    // endpoints. The main routing table still preserves the correct LAN route.
+    apply_outbound_mark(&sock)?;
+    crate::adapter::bind_outbound_socket(&sock, addr)?;
+    if let Some(cfg) = cfg.as_ref() {
+        apply_socket_config(&sock, addr, cfg)?;
+        // Node/custom socket options may contain SO_MARK. The capture bypass mark
+        // must win or the proxy's own carrier is captured again as a user flow.
+        apply_outbound_mark(&sock)?;
+    }
+
+    match sock.connect(&addr.into()) {
+        Ok(()) => {}
+        Err(error) if connect_is_pending(&error) => {}
+        Err(error) => return Err(error),
+    }
+
+    let std_stream: std::net::TcpStream = sock.into();
     let stream = TcpStream::from_std(std_stream)?;
+    tokio::time::timeout(timeout, stream.writable())
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "TCP connect to {addr} timed out after {}ms",
+                    timeout.as_millis()
+                ),
+            )
+        })??;
+    if let Some(error) = stream.take_error()? {
+        return Err(error);
+    }
+    // A writable socket can also represent an exceptional completion. Confirm
+    // that the non-blocking connect reached a real peer before publishing it.
+    stream.peer_addr()?;
     let local = stream.local_addr()?;
     Ok((stream, register_tcp(local)))
+}
+
+fn connect_is_pending(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        matches!(
+            error.raw_os_error(),
+            Some(libc::EINPROGRESS) | Some(libc::EALREADY)
+        )
+    }
+    #[cfg(windows)]
+    {
+        // WSAEWOULDBLOCK / WSAEINPROGRESS / WSAEALREADY.
+        matches!(
+            error.raw_os_error(),
+            Some(10035) | Some(10036) | Some(10037)
+        )
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
 }
 
 fn apply_socket_config(
@@ -1004,7 +1052,7 @@ pub(crate) fn apply_current_udp_socket_config(
     peer: Option<SocketAddr>,
 ) -> std::io::Result<()> {
     let Some(cfg) = socket_policy::current().and_then(|policy| policy.socket().cloned()) else {
-        return Ok(());
+        return apply_outbound_mark(sock);
     };
     apply_node_mark(sock, cfg.mark)?;
     let family_addr = match peer {
@@ -1027,7 +1075,10 @@ pub(crate) fn apply_current_udp_socket_config(
             "udp6"
         },
         &cfg,
-    )
+    )?;
+    // Keep Root TUN bypass authoritative even when a provider supplied its own
+    // mark through either `mark` or customSockopt.
+    apply_outbound_mark(sock)
 }
 
 #[cfg(target_os = "freebsd")]
@@ -1205,6 +1256,26 @@ fn raw_setsockopt_bytes(sock: &Socket, level: i32, opt: i32, value: &[u8]) -> st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nonblocking_connect_recognizes_reactor_pending_state() {
+        let error = std::io::Error::from(std::io::ErrorKind::WouldBlock);
+        assert!(connect_is_pending(&error));
+    }
+
+    #[tokio::test]
+    async fn marked_connect_uses_tokio_reactor_to_complete() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (connected, accepted) = tokio::join!(
+            marked_connect_raw(address, Duration::from_secs(1)),
+            listener.accept()
+        );
+        let (stream, _guard) = connected.unwrap();
+        let (_peer, peer_address) = accepted.unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), address);
+        assert_eq!(stream.local_addr().unwrap(), peer_address);
+    }
 
     #[test]
     fn rfc8305_interleave_matches_xray_order() {

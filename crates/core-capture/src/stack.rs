@@ -27,9 +27,10 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::{Arc, atomic::Ordering},
+    sync::{Arc, OnceLock, atomic::Ordering},
 };
 
+use futures::task::AtomicWaker;
 use parking_lot::Mutex;
 use smoltcp::{
     iface::{Config, Interface, SocketHandle, SocketSet},
@@ -140,6 +141,15 @@ pub struct UserSpaceStack {
     listeners_by_port: HashMap<u16, Vec<SocketHandle>>,
     /// 已上报过 accept 的 handle（避免重复）。
     accepted_set: HashSet<SocketHandle>,
+    /// 每条流各自的 read/write waker。避免在每次 Pending 时 spawn 一个
+    /// 等待 Notify 的任务，在海量连接下形成任务风暴。
+    stream_wakers: HashMap<SocketHandle, Arc<SocketWakeState>>,
+}
+
+#[derive(Default)]
+struct SocketWakeState {
+    read: AtomicWaker,
+    write: AtomicWaker,
 }
 
 impl UserSpaceStack {
@@ -164,6 +174,7 @@ impl UserSpaceStack {
             sockets: SocketSet::new(Vec::new()),
             listeners_by_port: HashMap::new(),
             accepted_set: HashSet::new(),
+            stream_wakers: HashMap::new(),
         }
     }
 
@@ -199,10 +210,28 @@ impl UserSpaceStack {
 
     pub fn poll(&mut self) -> bool {
         let now = SmolInstant::from_millis(now_millis());
-        matches!(
+        let changed = matches!(
             self.iface.poll(now, &mut self.device, &mut self.sockets),
             smoltcp::iface::PollResult::SocketStateChanged
-        )
+        );
+        if changed {
+            for wake in self.stream_wakers.values() {
+                wake.read.wake();
+                wake.write.wake();
+            }
+        }
+        changed
+    }
+
+    pub fn poll_delay(&mut self) -> Option<std::time::Duration> {
+        let now = SmolInstant::from_millis(now_millis());
+        self.iface
+            .poll_delay(now, &self.sockets)
+            .map(|delay| std::time::Duration::from_millis(delay.total_millis()))
+    }
+
+    fn stream_wakers(&mut self, handle: SocketHandle) -> Arc<SocketWakeState> {
+        self.stream_wakers.entry(handle).or_default().clone()
     }
     pub fn drain_outbound(&mut self) -> Vec<Vec<u8>> {
         self.device.drain_outbound().collect()
@@ -246,6 +275,10 @@ impl UserSpaceStack {
     pub fn close_socket(&mut self, handle: SocketHandle) {
         let s = self.sockets.get_mut::<tcp::Socket>(handle);
         s.close();
+        if let Some(wake) = self.stream_wakers.get(&handle) {
+            wake.read.wake();
+            wake.write.wake();
+        }
     }
 
     /// 从 socket 收数据到 buf；返回收到字节数（0 = 关闭）。
@@ -286,10 +319,11 @@ fn endpoint_to_addr(ep: smoltcp::wire::IpEndpoint) -> Option<std::net::SocketAdd
 }
 
 fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as i64
 }
 
 /* ============================================================
@@ -303,7 +337,7 @@ pub type SharedStack = Arc<Mutex<UserSpaceStack>>;
 pub type StackNotify = Arc<Notify>;
 
 /// 默认 listener 池大小 —— 越大并发 SYN 接受能力越强，但内存增长。
-pub const DEFAULT_LISTENER_POOL: usize = 32;
+pub const DEFAULT_LISTENER_POOL: usize = 4;
 
 // 旧的 `run_user_stack` / `step` / `replenish_listeners(0, …)` / `add_tcp_listener(port)`
 // 已删除：tun_dispatch::run_stack_driver + ensure_listener_for(port) 完全替代。
@@ -323,16 +357,19 @@ pub struct SmolStream {
     handle: SocketHandle,
     stack: SharedStack,
     notify: StackNotify,
+    wakers: Arc<SocketWakeState>,
     closed_read: bool,
     closed_write: bool,
 }
 
 impl SmolStream {
     pub fn new(handle: SocketHandle, stack: SharedStack, notify: StackNotify) -> Self {
+        let wakers = stack.lock().stream_wakers(handle);
         Self {
             handle,
             stack,
             notify,
+            wakers,
             closed_read: false,
             closed_write: false,
         }
@@ -356,6 +393,7 @@ impl AsyncRead for SmolStream {
         if me.closed_read {
             return std::task::Poll::Ready(Ok(()));
         }
+        me.wakers.read.register(cx.waker());
         let mut tmp = [0u8; 8192];
         let cap = tmp.len().min(buf.remaining());
         let n = {
@@ -373,13 +411,6 @@ impl AsyncRead for SmolStream {
             me.notify.notify_one();
             std::task::Poll::Ready(Ok(()))
         } else {
-            // 安排一次唤醒：监听 stack notify
-            let waker = cx.waker().clone();
-            let notify = me.notify.clone();
-            tokio::spawn(async move {
-                notify.notified().await;
-                waker.wake();
-            });
             std::task::Poll::Pending
         }
     }
@@ -398,6 +429,7 @@ impl AsyncWrite for SmolStream {
                 "smoltcp send half closed",
             )));
         }
+        me.wakers.write.register(cx.waker());
         let n = {
             let mut s = me.stack.lock();
             match s.try_send(me.handle, buf) {
@@ -415,12 +447,6 @@ impl AsyncWrite for SmolStream {
             me.notify.notify_one();
             std::task::Poll::Ready(Ok(n))
         } else {
-            let waker = cx.waker().clone();
-            let notify = me.notify.clone();
-            tokio::spawn(async move {
-                notify.notified().await;
-                waker.wake();
-            });
             std::task::Poll::Pending
         }
     }

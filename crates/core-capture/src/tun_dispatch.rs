@@ -206,7 +206,7 @@ impl TunDispatcher {
     ) {
         let mtu = usize::from(self.plan.mtu.get());
         let buf_cap = mtu + 64;
-        let mut storage: Vec<Vec<u8>> = (0..PUMP_BATCH_N).map(|_| vec![0u8; buf_cap]).collect();
+        let mut storage: [Vec<u8>; PUMP_BATCH_N] = std::array::from_fn(|_| vec![0u8; buf_cap]);
         let mut sizes = [0usize; PUMP_BATCH_N];
         let iface = device.name().to_string();
         let summary = crate::tun_logging::root_tun_summary(&self.plan);
@@ -226,7 +226,7 @@ impl TunDispatcher {
             "tun pump loop started"
         );
         loop {
-            let mut bufs: Vec<&mut [u8]> = storage.iter_mut().map(|v| v.as_mut_slice()).collect();
+            let mut bufs = storage.each_mut().map(|v| v.as_mut_slice());
 
             let count = tokio::select! {
                 _ = &mut stop_rx => break,
@@ -472,6 +472,8 @@ async fn run_stack_driver(
     accept_tx: mpsc::Sender<AcceptedTcp>,
     mut stop_rx: oneshot::Receiver<()>,
 ) {
+    let poll_timer = tokio::time::sleep(Duration::from_secs(1));
+    tokio::pin!(poll_timer);
     loop {
         tokio::select! {
             _ = &mut stop_rx => break,
@@ -515,7 +517,7 @@ async fn run_stack_driver(
                     warn!(target: "capture::stack", error = %e, "tun write batch failed (notify)");
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(20)) => {
+            _ = &mut poll_timer => {
                 let outs;
                 {
                     let mut s = stack.lock();
@@ -531,6 +533,17 @@ async fn run_stack_driver(
                 .await;
             }
         }
+        // Use smoltcp's own next deadline instead of waking every 20ms. Active
+        // streams are still driven immediately by packet input and Notify.
+        let delay = {
+            let mut s = stack.lock();
+            s.poll_delay()
+                .unwrap_or(Duration::from_secs(1))
+                .clamp(Duration::from_millis(1), Duration::from_secs(1))
+        };
+        poll_timer
+            .as_mut()
+            .reset(tokio::time::Instant::now() + delay);
     }
     // 退出前清理（旧 dead code 占位移除）
     let _ = device;

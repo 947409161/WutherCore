@@ -4,6 +4,32 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Linux 与 Android Root TUN 强制校验 `CAP_NET_ADMIN`，启用完整批量收发、
+  GSO/GRO、4096 包发送队列和批量回写。TUN 热路径不再逐批分配借用向量。
+- TCP 拨号改为 Tokio reactor 原生非阻塞 connect，不再为每条连接创建
+  `spawn_blocking` 任务。Android 运行时限制为 2 至 4 个 worker，减少大小核迁移。
+- smoltcp fallback 改用每连接 `AtomicWaker` 与协议栈 deadline 驱动，移除
+  `Pending` 时逐次创建任务和固定 20ms 空转。
+- groups 系统新增 `proxies`, glob 成员来源, 嵌套 Manual 分流组, 候选上下限,
+  默认选择, 显式空组回退, 常驻探活和成员权重。新增 Random 与 Weighted 策略。
+- 组依赖使用 petgraph 做拓扑检查与循环路径定位，成员使用 IndexMap 保持声明顺序，
+  globset 预编译选择器。订阅刷新通过 ArcSwap 原子发布，选择链使用 SmallVec。
+- 路由, DNS, Clash API 与原生 API 统一递归解析策略组。API 现在返回直接选择,
+  最终节点和完整选择链，组测速会展开到实际叶子节点。
+- 官方多平台配置改为 23 个中文策略组，加入主要国家与地区节点过滤，并使用
+  `luestr/IconResource` 远程图标。
+- 官方 DNS 基线改为国内主解析与国外 fallback。已知国内外规则集分别进入对应
+  DNS 组，未分类域名按 GeoIP 结果回退，节点域名使用独立直连引导解析。
+
+### Fixed
+
+- 修复节点或 provider 自定义 `SO_MARK` 覆盖 Root TUN 绕行标记后，节点连接被
+  TUN 再次接管并作为普通目标写进连接表的问题。TCP 与 UDP 均以接管绕行标记为最终值。
+- TCP relay 支持真正的双向半关闭。已经传输有效数据后的 `ECONNRESET`
+  不再中断已完成的另一方向，也不再作为失败连接输出 `os error 104`。
+
 ## [0.3.6] - 2026-07-29
 
 ### Added

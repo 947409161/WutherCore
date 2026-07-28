@@ -649,6 +649,8 @@ impl CaptureEngine for LinuxTun {
             ));
         }
         if manage_linux_config {
+            crate::platform::linux_caps::require_net_admin("Linux/Android Root TUN")
+                .map_err(CaptureError::DeviceFailed)?;
             // The device is now known to be root-managed rather than an
             // Android VpnService fd. Persist crash ownership before the first
             // route, rule, firewall, or interface mutation.

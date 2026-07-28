@@ -51,6 +51,7 @@ const IFNAMSIZ: usize = 16;
 // SIOCSIFMTU = 0x8922（<linux/sockios.h>），通过控制 socket(AF_INET, SOCK_DGRAM)
 // 调用即可；与 sing-tun 保持一致，避免 `ip link set` 命令路径在阉割工具链下静默失败。
 const SIOCSIFMTU: libc::Ioctl = 0x8922 as libc::Ioctl;
+const SIOCSIFTXQLEN: libc::Ioctl = 0x8943 as libc::Ioctl;
 const SIOCGIFFLAGS: libc::Ioctl = 0x8913 as libc::Ioctl;
 const SIOCSIFFLAGS: libc::Ioctl = 0x8914 as libc::Ioctl;
 const SIOCSIFADDR: libc::Ioctl = 0x8916 as libc::Ioctl;
@@ -223,6 +224,14 @@ impl LinuxTunIo {
                 "ioctl SIOCSIFMTU failed for {final_name} (mtu={mtu}): {e}"
             ))
         })?;
+        if let Err(error) = unsafe_set_tx_queue_len(&final_name, 4096) {
+            tracing::warn!(
+                target: "capture::linux::tun",
+                iface = %final_name,
+                %error,
+                "unable to enlarge TUN transmit queue; continuing with kernel default"
+            );
+        }
 
         // 6. 包装成 AsyncFd
         let final_raw = final_owned.as_raw_fd();
@@ -557,6 +566,40 @@ fn unsafe_set_mtu(name: &str, mtu: u32) -> std::io::Result<()> {
         libc::ioctl(
             s,
             SIOCSIFMTU,
+            &mut req as *mut IfReqMtu as *mut libc::c_void,
+        )
+    };
+    let saved = std::io::Error::last_os_error();
+    unsafe {
+        libc::close(s);
+    }
+    if rc < 0 {
+        return Err(saved);
+    }
+    Ok(())
+}
+
+#[allow(unsafe_code)]
+fn unsafe_set_tx_queue_len(name: &str, queue_len: u32) -> std::io::Result<()> {
+    let s = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if s < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut req = IfReqMtu {
+        ifr_name: [0u8; IFNAMSIZ],
+        ifr_mtu: queue_len as i32,
+        _pad: [0u8; 20],
+    };
+    if let Err(error) = fill_if_name(&mut req.ifr_name, name) {
+        unsafe {
+            libc::close(s);
+        }
+        return Err(error);
+    }
+    let rc = unsafe {
+        libc::ioctl(
+            s,
+            SIOCSIFTXQLEN,
             &mut req as *mut IfReqMtu as *mut libc::c_void,
         )
     };
