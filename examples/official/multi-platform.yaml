@@ -59,18 +59,130 @@ nodes:
     network:
       udp: true
 
-# 所有已实现的组策略都在这里给出。chain 当前未实现，因此官方配置不使用它。
+# 两层结构：上层分流策略组只引用节点组，下层节点组才引用订阅或静态节点。
+# 地区节点组使用严格 filter。图标来自 luestr/IconResource 的 120px 资源。
 groups:
-  proxy:
+  节点选择:
     choose: manual
-    use: [primary, nodes]
+    proxies:
+      - 智能节点
+      - 最低延迟节点
+      - 故障转移节点
+      - 负载均衡节点
+      - 香港节点
+      - 台湾节点
+      - 日本节点
+      - 新加坡节点
+      - 韩国节点
+      - 美国节点
+      - 加拿大节点
+      - 英国节点
+      - 德国节点
+      - 法国节点
+      - 澳大利亚节点
+      - 印度节点
+      - 其他地区
+    hidden: false
+    icon: "https://raw.githubusercontent.com/luestr/IconResource/main/Other_icon/120px/Switch.png"
+
+  人工智能:
+    choose: manual
+    proxies:
+      - 美国节点
+      - 新加坡节点
+      - 日本节点
+      - 台湾节点
+      - 英国节点
+      - 德国节点
+    hidden: false
+    icon: "https://raw.githubusercontent.com/luestr/IconResource/main/App_icon/120px/ChatGPT.png"
+
+  流媒体:
+    choose: manual
+    proxies:
+      - 香港节点
+      - 台湾节点
+      - 日本节点
+      - 新加坡节点
+      - 美国节点
+      - 英国节点
+      - 澳大利亚节点
+    hidden: false
+    icon: "https://raw.githubusercontent.com/luestr/IconResource/main/App_icon/120px/Netflix.png"
+
+  游戏加速:
+    choose: manual
+    proxies:
+      - 香港节点
+      - 日本节点
+      - 新加坡节点
+      - 韩国节点
+      - 台湾节点
+      - 美国节点
+    disable-udp: false
+    hidden: false
+    icon: "https://raw.githubusercontent.com/luestr/IconResource/main/App_icon/120px/ValorantBible.png"
+
+  开发服务:
+    choose: manual
+    proxies:
+      - 香港节点
+      - 日本节点
+      - 新加坡节点
+      - 美国节点
+      - 德国节点
+      - 英国节点
+      - 加拿大节点
+    hidden: false
+    icon: "https://raw.githubusercontent.com/luestr/IconResource/main/App_icon/120px/GitHub.png"
+
+  即时通信:
+    choose: manual
+    proxies:
+      - 新加坡节点
+      - 香港节点
+      - 日本节点
+      - 美国节点
+      - 台湾节点
+    hidden: false
+    icon: "https://raw.githubusercontent.com/luestr/IconResource/main/App_icon/120px/Telegram.png"
+
+  智能节点:
+    choose: smart
+    include-all: true
+    prefer: [香港, HK, 日本, JP, 新加坡, SG]
+    avoid: [DIRECT-FALLBACK, 过期, 到期, 剩余]
     check: https://www.gstatic.com/generate_204
     expected-status: 200-299
+    interval: 1m
+    idle-timeout: 10m
+    tolerance: 50
+    unified-delay: true
+    max-failed-times: 3
+    test-timeout: 5s
+    sticky: site
+    hidden: false
+    icon: "https://raw.githubusercontent.com/luestr/IconResource/main/Other_icon/120px/Node_detection_tool.png"
 
-  auto:
-    choose: smart
-    use: [primary, nodes]
-    prefer: [香港, HK, 日本, JP, 新加坡, SG]
+  最低延迟节点:
+    choose: fast
+    include-all: true
+    avoid: [DIRECT-FALLBACK, 过期, 到期, 剩余]
+    check: https://www.gstatic.com/generate_204
+    expected-status: 200-299
+    interval: 30s
+    idle-timeout: 5m
+    tolerance: 35
+    unified-delay: true
+    max-failed-times: 3
+    test-timeout: 5s
+    hidden: false
+    icon: "https://raw.githubusercontent.com/luestr/IconResource/main/App_icon/120px/OoklaSpeedtest.png"
+
+  故障转移节点:
+    choose: stable
+    include-all: true
+    prefer: [香港, HK, 新加坡, SG, 日本, JP, 美国, US]
     avoid: [DIRECT-FALLBACK, 过期, 到期, 剩余]
     check: https://www.gstatic.com/generate_204
     expected-status: 200-299
@@ -79,89 +191,204 @@ groups:
     unified-delay: true
     max-failed-times: 3
     test-timeout: 5s
-    sticky: site
+    hidden: false
+    icon: "https://raw.githubusercontent.com/luestr/IconResource/main/Other_icon/120px/HTTPDNS.png"
 
-  low-latency:
-    choose: fast
-    use: [primary, nodes]
-    check: https://www.gstatic.com/generate_204
-    expected-status: 200-299
-    interval: 30s
-    idle-timeout: 5m
-    tolerance: 50
-    unified-delay: true
-
-  failover:
-    choose: stable
-    use: [primary, nodes]
-    check: https://www.gstatic.com/generate_204
-    expected-status: 200-299
-    interval: 1m
-    idle-timeout: 10m
-    max-failed-times: 3
-    test-timeout: 5s
-
-  load-balance:
+  负载均衡节点:
     choose: spread
-    use: [primary, nodes]
+    include-all: true
+    avoid: [DIRECT-FALLBACK, 过期, 到期, 剩余]
     check: https://www.gstatic.com/generate_204
     expected-status: 200-299
     interval: 1m
     idle-timeout: 10m
     strategy: sticky-sessions
+    max-failed-times: 3
+    test-timeout: 5s
+    hidden: false
+    icon: "https://raw.githubusercontent.com/luestr/IconResource/main/App_icon/120px/1.1.1.1.png"
 
-  ai:
+  香港节点:
     choose: smart
-    use: [primary, nodes]
-    prefer: [美国, US, 新加坡, SG, 日本, JP]
-    avoid: [DIRECT-FALLBACK, 香港, HK, 过期, 到期]
+    include-all: true
+    filter: '(?i)(香港|港区|港服|\bHK\b|Hong[ _-]?Kong|🇭🇰)'
+    empty-fallback: DIRECT-FALLBACK
     check: https://www.gstatic.com/generate_204
     expected-status: 200-299
-    interval: 1m
-    idle-timeout: 10m
+    interval: 2m
+    idle-timeout: 15m
+    tolerance: 50
     unified-delay: true
-    sticky: site
+    hidden: false
+    icon: "https://raw.githubusercontent.com/luestr/IconResource/main/Flag_icon/120px/HK.png"
 
-  streaming:
+  台湾节点:
     choose: smart
-    use: [primary, nodes]
-    prefer: [香港, HK, 新加坡, SG, 日本, JP, 美国, US]
-    avoid: [DIRECT-FALLBACK, 过期, 到期]
+    include-all: true
+    filter: '(?i)(台湾|台灣|台北|新北|高雄|台中|\bTW\b|Taiwan|🇹🇼)'
+    empty-fallback: DIRECT-FALLBACK
     check: https://www.gstatic.com/generate_204
     expected-status: 200-299
-    interval: 1m
-    idle-timeout: 10m
+    interval: 2m
+    idle-timeout: 15m
+    tolerance: 50
     unified-delay: true
-    sticky: site
+    hidden: false
+    icon: "https://raw.githubusercontent.com/luestr/IconResource/main/Flag_icon/120px/TW.png"
 
-  gaming:
-    choose: fast
-    use: [primary, nodes]
-    prefer: [香港, HK, 日本, JP, 新加坡, SG]
+  日本节点:
+    choose: smart
+    include-all: true
+    filter: '(?i)(日本|东京|東京|大阪|埼玉|\bJP\b|Japan|🇯🇵)'
+    empty-fallback: DIRECT-FALLBACK
     check: https://www.gstatic.com/generate_204
     expected-status: 200-299
-    interval: 20s
-    idle-timeout: 5m
-    tolerance: 35
+    interval: 2m
+    idle-timeout: 15m
+    tolerance: 50
     unified-delay: true
+    hidden: false
+    icon: "https://raw.githubusercontent.com/luestr/IconResource/main/Flag_icon/120px/JP.png"
 
-  development:
-    choose: stable
-    use: [primary, nodes]
-    prefer: [香港, HK, 日本, JP, 新加坡, SG, 美国, US]
+  新加坡节点:
+    choose: smart
+    include-all: true
+    filter: '(?i)(新加坡|狮城|獅城|\bSG\b|Singapore|🇸🇬)'
+    empty-fallback: DIRECT-FALLBACK
     check: https://www.gstatic.com/generate_204
     expected-status: 200-299
-    interval: 1m
-    idle-timeout: 10m
+    interval: 2m
+    idle-timeout: 15m
+    tolerance: 50
+    unified-delay: true
+    hidden: false
+    icon: "https://raw.githubusercontent.com/luestr/IconResource/main/Flag_icon/120px/SG.png"
 
-  messaging:
-    choose: stable
-    use: [primary, nodes]
-    prefer: [新加坡, SG, 香港, HK, 日本, JP]
+  韩国节点:
+    choose: smart
+    include-all: true
+    filter: '(?i)(韩国|韓國|首尔|首爾|\bKR\b|Korea|🇰🇷)'
+    empty-fallback: DIRECT-FALLBACK
     check: https://www.gstatic.com/generate_204
     expected-status: 200-299
-    interval: 1m
-    idle-timeout: 10m
+    interval: 2m
+    idle-timeout: 15m
+    tolerance: 60
+    unified-delay: true
+    hidden: false
+    icon: "https://raw.githubusercontent.com/luestr/IconResource/main/Flag_icon/120px/KR.png"
+
+  美国节点:
+    choose: smart
+    include-all: true
+    filter: '(?i)(美国|美國|洛杉矶|洛杉磯|硅谷|矽谷|西雅图|西雅圖|芝加哥|达拉斯|達拉斯|纽约|紐約|\bUS\b|\bUSA\b|United[ _-]?States|🇺🇸)'
+    empty-fallback: DIRECT-FALLBACK
+    check: https://www.gstatic.com/generate_204
+    expected-status: 200-299
+    interval: 2m
+    idle-timeout: 15m
+    tolerance: 80
+    unified-delay: true
+    hidden: false
+    icon: "https://raw.githubusercontent.com/luestr/IconResource/main/Flag_icon/120px/US.png"
+
+  加拿大节点:
+    choose: smart
+    include-all: true
+    filter: '(?i)(加拿大|多伦多|多倫多|温哥华|溫哥華|\bCA\b|Canada|🇨🇦)'
+    empty-fallback: DIRECT-FALLBACK
+    check: https://www.gstatic.com/generate_204
+    expected-status: 200-299
+    interval: 2m
+    idle-timeout: 15m
+    tolerance: 80
+    unified-delay: true
+    hidden: false
+    icon: "https://raw.githubusercontent.com/luestr/IconResource/main/Flag_icon/120px/CA.png"
+
+  英国节点:
+    choose: smart
+    include-all: true
+    filter: '(?i)(英国|英國|伦敦|倫敦|\bUK\b|\bGB\b|Britain|United[ _-]?Kingdom|🇬🇧)'
+    empty-fallback: DIRECT-FALLBACK
+    check: https://www.gstatic.com/generate_204
+    expected-status: 200-299
+    interval: 2m
+    idle-timeout: 15m
+    tolerance: 80
+    unified-delay: true
+    hidden: false
+    icon: "https://raw.githubusercontent.com/luestr/IconResource/main/Flag_icon/120px/GB.png"
+
+  德国节点:
+    choose: smart
+    include-all: true
+    filter: '(?i)(德国|德國|法兰克福|法蘭克福|\bDE\b|Germany|🇩🇪)'
+    empty-fallback: DIRECT-FALLBACK
+    check: https://www.gstatic.com/generate_204
+    expected-status: 200-299
+    interval: 2m
+    idle-timeout: 15m
+    tolerance: 80
+    unified-delay: true
+    hidden: false
+    icon: "https://raw.githubusercontent.com/luestr/IconResource/main/Flag_icon/120px/DE.png"
+
+  法国节点:
+    choose: smart
+    include-all: true
+    filter: '(?i)(法国|法國|巴黎|\bFR\b|France|🇫🇷)'
+    empty-fallback: DIRECT-FALLBACK
+    check: https://www.gstatic.com/generate_204
+    expected-status: 200-299
+    interval: 2m
+    idle-timeout: 15m
+    tolerance: 80
+    unified-delay: true
+    hidden: false
+    icon: "https://raw.githubusercontent.com/luestr/IconResource/main/Flag_icon/120px/FR.png"
+
+  澳大利亚节点:
+    choose: smart
+    include-all: true
+    filter: '(?i)(澳大利亚|澳大利亞|澳洲|悉尼|墨尔本|墨爾本|\bAU\b|Australia|🇦🇺)'
+    empty-fallback: DIRECT-FALLBACK
+    check: https://www.gstatic.com/generate_204
+    expected-status: 200-299
+    interval: 2m
+    idle-timeout: 15m
+    tolerance: 90
+    unified-delay: true
+    hidden: false
+    icon: "https://raw.githubusercontent.com/luestr/IconResource/main/Flag_icon/120px/AU.png"
+
+  印度节点:
+    choose: smart
+    include-all: true
+    filter: '(?i)(印度|孟买|孟買|\bIN\b|India|🇮🇳)'
+    empty-fallback: DIRECT-FALLBACK
+    check: https://www.gstatic.com/generate_204
+    expected-status: 200-299
+    interval: 2m
+    idle-timeout: 15m
+    tolerance: 90
+    unified-delay: true
+    hidden: false
+    icon: "https://raw.githubusercontent.com/luestr/IconResource/main/Flag_icon/120px/IN.png"
+
+  其他地区:
+    choose: smart
+    include-all: true
+    exclude-filter: '(?i)(香港|港区|港服|\bHK\b|Hong[ _-]?Kong|台湾|台灣|台北|\bTW\b|Taiwan|日本|东京|東京|大阪|\bJP\b|Japan|新加坡|狮城|獅城|\bSG\b|Singapore|韩国|韓國|首尔|首爾|\bKR\b|Korea|美国|美國|\bUS\b|\bUSA\b|United[ _-]?States|加拿大|\bCA\b|Canada|英国|英國|\bUK\b|\bGB\b|Britain|德国|德國|\bDE\b|Germany|法国|法國|\bFR\b|France|澳大利亚|澳大利亞|澳洲|\bAU\b|Australia|印度|\bIN\b|India|🇭🇰|🇹🇼|🇯🇵|🇸🇬|🇰🇷|🇺🇸|🇨🇦|🇬🇧|🇩🇪|🇫🇷|🇦🇺|🇮🇳|DIRECT-FALLBACK)'
+    empty-fallback: DIRECT-FALLBACK
+    check: https://www.gstatic.com/generate_204
+    expected-status: 200-299
+    interval: 2m
+    idle-timeout: 15m
+    tolerance: 80
+    unified-delay: true
+    hidden: false
+    icon: "https://raw.githubusercontent.com/luestr/IconResource/main/Flag_icon/120px/WW.png"
 
 route:
   preset: custom
@@ -185,7 +412,7 @@ route:
       every: 24h
       via: direct
 
-    private-ip:
+    geoip-private:
       type: ipcidr
       format: mrs
       url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geoip/private.mrs"
@@ -201,7 +428,7 @@ route:
       every: 24h
       via: direct
 
-    cn-ip:
+    geoip-cn:
       type: ipcidr
       format: mrs
       url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geoip/cn.mrs"
@@ -365,33 +592,34 @@ route:
   steps:
     - {set: user-direct, outbound: direct}
     - {set: private-domain, outbound: direct}
-    - {set: private-ip, outbound: direct}
+    - {set: geoip-private, outbound: direct}
     - {set: ads, outbound: block}
+    - {process: [wuther-core, wuther-core.exe], outbound: direct}
+    - {process: [git, git.exe, ssh, ssh.exe], outbound: 开发服务}
+    - {port: [22, 9418], network: tcp, outbound: 开发服务}
     - {set: apple-cn, outbound: direct}
     - {set: microsoft-cn, outbound: direct}
     - {set: games-cn, outbound: direct}
-    - {set: ai-global, outbound: ai}
-    - {set: youtube, outbound: streaming}
-    - {set: netflix-domain, outbound: streaming}
-    - {set: netflix-ip, outbound: streaming}
-    - {set: disney, outbound: streaming}
-    - {set: spotify, outbound: streaming}
-    - {set: telegram-domain, outbound: messaging}
-    - {set: telegram-ip, outbound: messaging}
-    - {set: github, outbound: development}
-    - {set: development, outbound: development}
-    - {set: games-global, outbound: gaming}
-    - {set: tiktok, outbound: streaming}
-    - {set: google, outbound: auto}
-    - {set: encrypted-dns, outbound: auto}
+    - {set: ai-global, outbound: 人工智能}
+    - {set: youtube, outbound: 流媒体}
+    - {set: netflix-domain, outbound: 流媒体}
+    - {set: netflix-ip, outbound: 流媒体}
+    - {set: disney, outbound: 流媒体}
+    - {set: spotify, outbound: 流媒体}
+    - {set: telegram-domain, outbound: 即时通信}
+    - {set: telegram-ip, outbound: 即时通信}
+    - {set: github, outbound: 开发服务}
+    - {set: development, outbound: 开发服务}
+    - {set: games-global, outbound: 游戏加速}
+    - {set: tiktok, outbound: 流媒体}
+    - {set: google, outbound: 节点选择}
+    - {set: encrypted-dns, outbound: 节点选择}
     - {set: cn-domain, outbound: direct}
-    - {set: cn-ip, outbound: direct}
-    - {set: global, outbound: auto}
-    - {network: udp, port: [443], proto: quic, outbound: auto}
-    - {process: [git, git.exe, ssh, ssh.exe], outbound: development}
-    - {port: [22, 9418], network: tcp, outbound: development}
-    - "any -> auto"
-  final: auto
+    - {set: geoip-cn, outbound: direct}
+    - {set: global, outbound: 节点选择}
+    - {network: udp, port: [443], proto: quic, outbound: 节点选择}
+    - "any -> 节点选择"
+  final: 节点选择
 
 resolver:
   mode: normal
@@ -429,38 +657,54 @@ resolver:
 
     cloudflare:
       endpoint: https://1.1.1.1/dns-query
-      exits: [auto, failover, DIRECT]
+      exits: [节点选择, 故障转移节点, DIRECT]
       strategy: adaptive
       timeout: 4s
       max-parallel: 2
 
     google:
       endpoint: tls://8.8.8.8
-      exits: [auto, failover, DIRECT]
+      exits: [节点选择, 故障转移节点, DIRECT]
       strategy: round-robin
       timeout: 4s
       max-parallel: 2
 
+    quad9:
+      endpoint: tls://9.9.9.9:853
+      exits: [故障转移节点, 节点选择, DIRECT]
+      strategy: sequential
+      timeout: 4s
+      max-parallel: 1
+
   groups:
-    domestic:
+    国内DNS:
       members: [alidns, dnspod]
       strategy: parallel
       timeout: 3s
       max-parallel: 2
 
-    public:
-      members: [cloudflare, google]
+    国外DNS:
+      members: [cloudflare, google, quad9]
       strategy: adaptive
       timeout: 5s
-      max-parallel: 2
+      max-parallel: 3
 
-  nameserver: [public]
-  fallback: [domestic]
+    # 节点域名不能依赖尚未建立的代理。这里只使用 IP 字面地址的国内 DoH。
+    节点域名DNS:
+      members: [alidns, dnspod]
+      strategy: sequential
+      timeout: 4s
+      max-parallel: 1
+
+  # 默认先使用国内 DNS。已知国外域名由下方有序规则直接送往国外 DNS。
+  # 未分类域名若返回非中国大陆地址，再由 fallback-filter 切换到国外 DNS。
+  nameserver: [国内DNS]
+  fallback: [国外DNS]
   default-nameserver:
     - udp://223.5.5.5
     - udp://1.12.12.12
-  proxy-server-nameserver: [domestic]
-  direct-nameserver: [domestic]
+  proxy-server-nameserver: [节点域名DNS]
+  direct-nameserver: [国内DNS]
   direct-nameserver-follow-policy: true
 
   fallback-filter:
@@ -469,27 +713,46 @@ resolver:
     ipcidr:
       - 0.0.0.0/8
       - 127.0.0.0/8
+      - 198.18.0.0/15
       - 240.0.0.0/4
     domain:
       - +.google.com
+      - +.googleapis.com
+      - +.gstatic.com
       - +.youtube.com
+      - +.facebook.com
+      - +.twitter.com
+      - +.x.com
+      - +.github.com
+      - +.openai.com
+      - +.chatgpt.com
+      - +.anthropic.com
+      - +.claude.ai
+      - +.telegram.org
 
-  nameserver-policy:
-    "rule-set:user-direct": domestic
-    "rule-set:private-domain": domestic
-    "rule-set:cn-domain": domestic
-    "rule-set:apple-cn": domestic
-    "rule-set:microsoft-cn": domestic
-    "rule-set:ai-global": public
-    "rule-set:global": public
-
+  # DNS 规则与流量路由使用相同的 MRS 集合。广告必须排在所有 DNS 路由之前。
   rules:
     - "set:ads -> nxdomain"
-    - "set:user-direct -> direct?nocache"
-    - "set:private-domain -> direct?nocache"
-    - "set:cn-domain -> direct"
-    - "set:ai-global -> proxy:public?strategy=adaptive"
-    - "any -> proxy:public?strategy=adaptive"
+    - "set:user-direct -> route:国内DNS?nocache"
+    - "set:private-domain -> route:国内DNS?nocache"
+    - "set:cn-domain -> route:国内DNS?strategy=parallel"
+    - "set:apple-cn -> route:国内DNS?strategy=parallel"
+    - "set:microsoft-cn -> route:国内DNS?strategy=parallel"
+    - "set:games-cn -> route:国内DNS?strategy=parallel"
+    - "set:ai-global -> route:国外DNS?strategy=adaptive"
+    - "set:youtube -> route:国外DNS?strategy=adaptive"
+    - "set:netflix-domain -> route:国外DNS?strategy=adaptive"
+    - "set:disney -> route:国外DNS?strategy=adaptive"
+    - "set:spotify -> route:国外DNS?strategy=adaptive"
+    - "set:telegram-domain -> route:国外DNS?strategy=adaptive"
+    - "set:github -> route:国外DNS?strategy=adaptive"
+    - "set:development -> route:国外DNS?strategy=adaptive"
+    - "set:games-global -> route:国外DNS?strategy=adaptive"
+    - "set:tiktok -> route:国外DNS?strategy=adaptive"
+    - "set:google -> route:国外DNS?strategy=adaptive"
+    - "set:encrypted-dns -> route:国外DNS?strategy=adaptive"
+    - "set:global -> route:国外DNS?strategy=adaptive"
+    - "any -> route:default?strategy=parallel"
 
 capture:
   on: true

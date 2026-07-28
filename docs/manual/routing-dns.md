@@ -18,13 +18,19 @@ DNS 多出口、`evaluate` 与 `respond` 响应链见
 
 ```yaml
 groups:
-  main:
+  香港节点:
     choose: smart
-    use: [primary, nodes]
-    prefer: [香港, 日本]
-    avoid: [过期, 直连]
+    include-all-providers: true
+    filter: '(?i)(香港|\bHK\b|Hong[ _-]?Kong)'
+    empty-fallback: DIRECT
     check: https://www.gstatic.com/generate_204
     sticky: site
+
+  节点选择:
+    choose: manual
+    proxies: [香港节点, 日本节点]
+    default-selected: 香港节点
+    empty-fallback: DIRECT
 ```
 
 ### 字段
@@ -32,7 +38,19 @@ groups:
 | 字段 | 说明 |
 | --- | --- |
 | `choose` | 选择算法 |
-| `use` | 订阅名、`nodes` 或其它候选来源 |
+| `proxies` | 显式节点或下级策略组，也接受 `members` |
+| `use` | provider 名，兼容 `nodes`, 节点名或组名 |
+| `include-all` | 纳入全部静态节点和 provider |
+| `include-all-proxies` | 纳入全部静态节点 |
+| `include-all-providers` | 纳入全部 provider |
+| `include-nodes`, `exclude-nodes` | 使用 glob 纳入或排除静态节点 |
+| `include-providers`, `exclude-providers` | 使用 glob 纳入或排除 provider |
+| `include-groups`, `exclude-groups` | 使用 glob 纳入或排除下级组 |
+| `min-members`, `max-members` | 设置最少和最多可用候选数 |
+| `default-selected` | Manual 没有 pin 时的默认直接成员 |
+| `empty-fallback` | 候选不足时使用的直连, 阻断或静态节点 |
+| `weights` | Weighted 使用的成员名 glob 权重表 |
+| `lazy` | 闲置时是否停止周期健康检查 |
 | `prefer` | 节点名偏好模式 |
 | `avoid` | 节点名回避模式 |
 | `check` | 健康检查 URL |
@@ -48,10 +66,16 @@ groups:
 | `fast` | 更强调当前延迟 |
 | `stable` | 更强调历史稳定性 |
 | `spread` | 在可用节点间分散负载 |
+| `random` | 在健康候选之间无偏随机选择 |
+| `weighted` | 按 `weights` 中的 glob 权重随机选择 |
 | `chain` | 多跳链路入口，当前实现不完整的组合会在编译期拒绝 |
 
 `prefer` 和 `avoid` 作用于订阅完成重命名后的最终节点名。候选集为空时不会凭空生成
-代理节点。是否允许直连兜底取决于组引用和路由配置。
+代理节点。是否允许直连兜底由 `empty-fallback` 明确决定。
+
+上层分流组可以引用下级节点组。上层必须使用 `manual`，下级自动组直接管理节点和
+provider。路由与 DNS 会递归得到最终节点，并把完整选择链暴露给 Clash API。配置
+编译器会拒绝循环引用并返回实际循环路径。
 
 ## 路由执行顺序
 

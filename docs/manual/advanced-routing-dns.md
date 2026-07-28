@@ -16,51 +16,93 @@ description: 分组选择、复合路由、规则集、DNS 多出口、策略语
 
 ```yaml
 groups:
-  latency:
-    choose: fast
-    use: [primary, backup]
-    prefer: [HK, JP, SG]
-    avoid: [expired, traffic]
+  香港节点:
+    choose: smart
+    include-all-providers: true
+    filter: '(?i)(香港|\bHK\b|Hong[ _-]?Kong)'
+    exclude-filter: '到期|流量'
+    min-members: 1
+    max-members: 20
+    empty-fallback: DIRECT
     check: https://www.gstatic.com/generate_204
     expected-status: 200-299
-    interval: 30s
-    idle-timeout: 5m
+    interval: 1m
+    idle-timeout: 10m
     tolerance: 50
     unified-delay: true
-    filter: "^(HK|JP|SG)"
-    exclude-filter: "到期|流量"
-    exclude-type: "direct|http"
     max-failed-times: 3
     test-timeout: 5s
+    lazy: true
 
-  quality:
-    choose: smart
-    use: [primary]
-    prefer: [premium]
-    avoid: [expired]
-    check: https://www.gstatic.com/generate_204
-    sticky: site
+  低成本节点:
+    choose: weighted
+    include-all: true
+    exclude-nodes: ["DIRECT-*"]
+    weights:
+      "*0.1x*": 10
+      "*0.5x*": 4
+      "*": 1
+    empty-fallback: DIRECT
 
-  manual:
+  节点选择:
     choose: manual
-    use: [nodes, primary]
+    proxies: [香港节点, 日本节点, 低成本节点]
+    include-groups: ["*节点"]
+    exclude-groups: [节点选择]
+    default-selected: 香港节点
+    empty-fallback: DIRECT
     hidden: false
-    icon: "base64:iVBORw0KGgoAAAANSUhEUg..."
-
-  spread:
-    choose: spread
-    use: [primary]
-    avoid: [trial]
-    strategy: sticky-sessions
-    disable-udp: false
+    icon: "https://example.com/icons/select.png"
 ```
 
-字段含义：
+`节点选择` 是上层分流策略组，成员是下级节点组。路由规则只需要引用上层组。运行时
+继续进入 `香港节点` 或其它节点组，最后得到实际节点。Clash API 的 `now` 保留直接
+选择，`resolvedNow` 和 `selectedChain` 暴露最终节点与完整选择链。
+
+### 成员来源
 
 | 字段 | 作用 |
 | --- | --- |
-| `choose` | `manual`、`smart`、`fast`、`stable`、`spread`。`chain` 仍在解析枚举中，但当前会在编译期拒绝 |
-| `use` | 候选来源，可引用 feed 名、保留来源 `nodes` 或具体节点 |
+| `proxies` | 明确列出的节点或下级策略组，等价于 Mihomo 的同名字段，也接受别名 `members` |
+| `use` | provider 来源。为兼容旧配置，也能写 `nodes`, 具体节点或组名 |
+| `include-all` | 纳入全部静态节点和全部 provider |
+| `include-all-proxies` | 纳入全部静态节点 |
+| `include-all-providers` | 纳入全部 provider，并随订阅刷新重新展开 |
+| `include-nodes` | 使用 glob 批量纳入静态节点 |
+| `exclude-nodes` | 使用 glob 排除静态节点 |
+| `include-providers` | 使用 glob 批量纳入 provider |
+| `exclude-providers` | 使用 glob 排除 provider |
+| `include-groups` | 使用 glob 批量引用其它组，仅允许上层 `manual` 分流组使用 |
+| `exclude-groups` | 使用 glob 排除下级组 |
+| `min-members` | 可用候选少于该数量时直接执行 `empty-fallback` |
+| `max-members` | 过滤后最多保留的候选数，`0` 表示不限 |
+| `default-selected` | 没有持久 pin 时，Manual 组默认选择的直接成员 |
+| `empty-fallback` | 候选不足时使用 `DIRECT`, `BLOCK`, `REJECT` 或静态节点，不允许引用另一个组 |
+
+显式成员, 批量来源和兼容来源会按配置顺序合并并去重。`exclude-*` 在全部来源展开后
+统一生效。provider 占位符不会出现在最终节点选择中，订阅刷新后组候选会原子替换。
+
+### 选择策略
+
+| `choose` | 行为 |
+| --- | --- |
+| `manual` | 使用持久 pin 或 `default-selected`，可以引用下级组 |
+| `smart` | 综合延迟分位数, 抖动, 成功率, 吞吐, 活跃连接和粘性记忆 |
+| `fast` | 按健康检查延迟选择，使用 `tolerance` 抑制频繁切换 |
+| `stable` | 按优先层级选择第一个健康候选 |
+| `spread` | 按 `strategy` 在健康候选之间分配连接 |
+| `random` | 在健康候选之间使用无偏随机选择 |
+| `weighted` | 按 `weights` 的 glob 权重随机选择，未匹配成员权重为 `1` |
+
+自动策略直接管理实际节点和 provider。引用下级组的上层组必须使用 `manual`。这一约束
+避免把地区分组的健康状态错误折叠成单个节点分数。组依赖图在配置编译期做拓扑检查，
+循环错误会返回完整路径，例如 `A -> B -> C -> A`。`chain` 是预留的多跳 relay
+类型，当前仍会在配置编译期拒绝。
+
+### 健康与筛选
+
+| 字段 | 作用 |
+| --- | --- |
 | `prefer` | 名称包含匹配。Fast 在延迟差不超过 `tolerance` 时优先，Stable 先检查优先节点，Smart 作为评分加成 |
 | `avoid` | 自动策略的降级候选。其它候选全部不可用时才兜底，Smart 在所有候选都命中时恢复全量评分 |
 | `check` | HTTP 或 HTTPS 健康检查 URL。探测通过任意支持 TCP 的出站适配器执行，不限定节点协议 |
@@ -77,12 +119,21 @@ groups:
 | `test-timeout` | 连续拨号失败的统计窗口，也是按需探测的超时上限 |
 | `disable-udp` | 从选择入口拒绝该组的 UDP，不只影响 API 展示 |
 | `sticky` | Smart 的组级覆盖：`off`、`site`、`session`。省略时继承顶层 `smart.sticky` |
+| `lazy` | `true` 时闲置超过 `idle-timeout` 停止周期探测，`false` 时保持探活 |
 | `hidden` | 在支持该字段的 Clash Dashboard 中隐藏 |
 | `icon` | URL、路径、data URI、`base64:` 前缀或原始 Base64 图像。Base64 会归一化为 data URI |
 
 `fast` 使用 URLTest 延迟和迟滞选择。`stable` 按优先层级选第一个存活节点。
 `spread` 只在存活候选间分配。`smart` 综合 P50、P90、抖动、成功率、退化基线、
-被动吞吐、活跃连接、站点记忆和冷却状态。`manual` 完全服从用户选择。
+被动吞吐、活跃连接、站点记忆和冷却状态。`random` 和 `weighted` 使用 `rand`
+提供的发行版级随机分布实现。
+
+### 编译与运行时成本
+
+组成员使用 `IndexSet` 保持声明顺序并去重。glob 由 `globset` 一次编译后复用。
+依赖关系使用 `petgraph` 做拓扑检查和循环路径定位。订阅刷新使用 `ArcSwap` 发布
+不可变组快照，连接热路径不获取全局读写锁。选路链使用栈内 `SmallVec` 保存，常见
+的两层和三层策略不会为链路容器单独分配堆内存。
 
 ### Pin 固定节点
 

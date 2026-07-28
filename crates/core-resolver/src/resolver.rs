@@ -3125,14 +3125,15 @@ nameserver-policy:
 
         let resolver = Resolver::try_new_with_rulesets(plan.resolver, Some(rulesets)).unwrap();
 
-        assert!(resolver.groups().contains_key("domestic"));
-        assert!(resolver.groups().contains_key("public"));
-        let crate::policy::DnsAction::Proxy(group) =
+        assert!(resolver.groups().contains_key("国内DNS"));
+        assert!(resolver.groups().contains_key("国外DNS"));
+        assert!(resolver.groups().contains_key("节点域名DNS"));
+        let crate::policy::DnsAction::Route { server, .. } =
             resolver.policy().decide("unmatched.wuther.test")
         else {
-            panic!("official resolver final rule must use the public DNS group");
+            panic!("official resolver final rule must use the default DNS group");
         };
-        assert_eq!(group, "public");
+        assert_eq!(server, "default");
     }
 
     #[test]

@@ -14,187 +14,187 @@ hide:
 
 透明接管/TUN、平台过滤、智能选择、管理面板和 Tailscale 协同。
 
-全手册当前覆盖 **770 个字段**、**55 个枚举类型**。
+全手册当前覆盖 **790 个字段**、**55 个枚举类型**。
 行为说明和跨字段约束请同时阅读同分类下的人工手册页面。
 
 ## `Capture`
 
 Capture / TUN 入站：兼容 mihomo / sing-box 常用 `inbounds[type=tun]` 字段。 Friendly 字段（顶层）保留 WutherCore 简洁语义；`tun` 子字段对齐 sing-box JSON。
 
-[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5078)
+[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5232)
 
 | YAML / JSON 字段 | 类型 | 必填与默认 | 兼容别名 | 取值 / 形态 | 解析与用途 |
 | --- | --- | --- | --- | --- | --- |
-| `on` | `布尔值` | 可选；默认 `false` | 无 | 无 | 控制该配置块是否启用；关闭时保留配置但不启动对应运行时能力。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5080) |
-| `method` | `CaptureMethod` | 可选；默认 `auto` | 无 | `auto`<br>`virtual_nic`<br>`tproxy`<br>`redirect` | `Capture` 的 `method` 参数。解析类型为 `CaptureMethod`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5082) |
-| `traffic` | `CaptureTraffic` | 可选；默认 `system` | 无 | `system`<br>`lan`<br>`apps` | `Capture` 的 `traffic` 参数。解析类型为 `CaptureTraffic`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5084) |
-| `resolver` | `CaptureResolver` | 可选；默认 `hijack` | 无 | `off`<br>`hijack` | `Capture` 的 `resolver` 参数。解析类型为 `CaptureResolver`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5086) |
-| `stack` | `CaptureStack` | 可选；默认 `mixed` | 无 | `system`<br>`mixed`<br>`native`<br>`smoltcp`<br>`gvisor` | `Capture` 的 `stack` 参数。解析类型为 `CaptureStack`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5088) |
-| `mtu` | `std::num::NonZeroU16（可选）` | 可选；默认 不设置 | 无 | 无 | `Capture` 的 `mtu` 参数。解析类型为 `std::num::NonZeroU16（可选）`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5090) |
-| `offload` | `布尔值` | 可选；默认 `true` | 无 | 无 | `Capture` 的 `offload` 参数。解析类型为 `布尔值`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5092) |
-| `exclude` | `CaptureExclude` | 可选；默认 `CaptureExclude::default()` | 无 | 无 | `Capture` 的 `exclude` 参数。解析类型为 `CaptureExclude`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5094) |
-| `tun` | `TunInboundOptions` | 可选；默认 `TunInboundOptions::default()` | 无 | 无 | sing-box 兼容子配置（详见 <https://sing-box.sagernet.org/configuration/inbound/tun/>）。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5097) |
+| `on` | `布尔值` | 可选；默认 `false` | 无 | 无 | 控制该配置块是否启用；关闭时保留配置但不启动对应运行时能力。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5234) |
+| `method` | `CaptureMethod` | 可选；默认 `auto` | 无 | `auto`<br>`virtual_nic`<br>`tproxy`<br>`redirect` | `Capture` 的 `method` 参数。解析类型为 `CaptureMethod`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5236) |
+| `traffic` | `CaptureTraffic` | 可选；默认 `system` | 无 | `system`<br>`lan`<br>`apps` | `Capture` 的 `traffic` 参数。解析类型为 `CaptureTraffic`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5238) |
+| `resolver` | `CaptureResolver` | 可选；默认 `hijack` | 无 | `off`<br>`hijack` | `Capture` 的 `resolver` 参数。解析类型为 `CaptureResolver`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5240) |
+| `stack` | `CaptureStack` | 可选；默认 `mixed` | 无 | `system`<br>`mixed`<br>`native`<br>`smoltcp`<br>`gvisor` | `Capture` 的 `stack` 参数。解析类型为 `CaptureStack`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5242) |
+| `mtu` | `std::num::NonZeroU16（可选）` | 可选；默认 不设置 | 无 | 无 | `Capture` 的 `mtu` 参数。解析类型为 `std::num::NonZeroU16（可选）`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5244) |
+| `offload` | `布尔值` | 可选；默认 `true` | 无 | 无 | `Capture` 的 `offload` 参数。解析类型为 `布尔值`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5246) |
+| `exclude` | `CaptureExclude` | 可选；默认 `CaptureExclude::default()` | 无 | 无 | `Capture` 的 `exclude` 参数。解析类型为 `CaptureExclude`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5248) |
+| `tun` | `TunInboundOptions` | 可选；默认 `TunInboundOptions::default()` | 无 | 无 | sing-box 兼容子配置（详见 <https://sing-box.sagernet.org/configuration/inbound/tun/>）。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5251) |
 
 ## `CaptureExclude`
 
 `CaptureExclude` 配置对象。
 
-[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5168)
+[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5322)
 
 | YAML / JSON 字段 | 类型 | 必填与默认 | 兼容别名 | 取值 / 形态 | 解析与用途 |
 | --- | --- | --- | --- | --- | --- |
-| `cidr` | `字符串 列表` | 可选；默认空 | 无 | 无 | `CaptureExclude` 的 `cidr` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5170) |
-| `process` | `字符串 列表` | 可选；默认空 | 无 | 无 | `CaptureExclude` 的 `process` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5172) |
+| `cidr` | `字符串 列表` | 可选；默认空 | 无 | 无 | `CaptureExclude` 的 `cidr` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5324) |
+| `process` | `字符串 列表` | 可选；默认空 | 无 | 无 | `CaptureExclude` 的 `process` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5326) |
 
 ## `TunInboundOptions`
 
 sing-box `inbounds[type=tun]` 兼容字段映射：见 <https://sing-box.sagernet.org/configuration/inbound/tun/>
 
-[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5243)
+[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5397)
 
 | YAML / JSON 字段 | 类型 | 必填与默认 | 兼容别名 | 取值 / 形态 | 解析与用途 |
 | --- | --- | --- | --- | --- | --- |
-| `interface_name` | `字符串（可选）` | 可选；默认 不设置 | 无 | 无 | `interface_name`：优先级高于 WutherCore 默认 `rpktun0/utun7/WutherCoreTun`。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5246) |
-| `address` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `address`：TUN 接口 v4 / v6 CIDR 列表（首条 v4 / 首条 v6 生效）。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5249) |
-| `inet6` | `布尔值` | 可选；默认 `true` | 无 | 无 | `inet6`：是否在 TUN 上启用 IPv6。关闭后不配 v6 地址 / 路由 / 规则 / listener。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5252) |
-| `auto_route` | `布尔值` | 可选；默认 `true` | 无 | 无 | `auto_route`：自动写默认路由（0.0.0.0/0 + ::/0 → tun）。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5257) |
-| `iproute2_table_index` | `非负整数` | 可选；默认 `2022` | 无 | 无 | `iproute2_table_index`：Linux 自定义路由表 id（默认 2022）。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5260) |
-| `iproute2_rule_index` | `非负整数` | 可选；默认 `9000` | 无 | 无 | `iproute2_rule_index`：`ip rule` 优先级起始 id。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5263) |
-| `auto_redirect` | `布尔值` | 可选；默认 `false` | 无 | 无 | `auto_redirect`：在 auto_route TUN 数据面上，为 TCP 注入 nftables NAT REDIRECT。当前安全契约只把本机 UDP 送入 TUN； ICMP/其他协议不新增导流 rule，继续按已有主路由策略处理。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5268) |
-| `auto_redirect_input_mark` | `字符串（可选）` | 可选；默认 不设置 | 无 | 无 | `auto_redirect_input_mark`：保留的 mark/NFQUEUE 入站 mark；当前 Linux REDIRECT 安全子集不消费，显式配置会失败。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5272) |
-| `auto_redirect_output_mark` | `字符串（可选）` | 可选；默认 不设置 | 无 | 无 | `auto_redirect_output_mark`：跳过 redirect chain 的 fwmark。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5275) |
-| `auto_redirect_reset_mark` | `字符串（可选）` | 可选；默认 不设置 | 无 | 无 | `auto_redirect_reset_mark`：NFQUEUE 预匹配的连接 reset mark（保留字段）。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5278) |
-| `auto_redirect_nfqueue` | `0-65535 整数（可选）` | 可选；默认 不设置 | 无 | 无 | `auto_redirect_nfqueue`：NFQUEUE 预匹配队列编号（当前无消费者）。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5281) |
-| `auto_redirect_iproute2_fallback_rule_index` | `非负整数（可选）` | 可选；默认 不设置 | 无 | 无 | `auto_redirect_iproute2_fallback_rule_index`：fallback ip rule 优先级。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5284) |
-| `strict_route` | `布尔值` | 可选；默认 `false` | 无 | 无 | `strict_route`：严格防泄漏；任何未接管流量被 drop。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5287) |
-| `route_address` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `route_address`：仅这些 CIDR 走 TUN（白名单）。空 = 全部。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5290) |
-| `route_exclude_address` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `route_exclude_address`：这些 CIDR 不走 TUN（黑名单）。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5293) |
-| `route_address_set` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `route_address_set`：白名单引用 ruleset（动态 IP 集）。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5296) |
-| `route_exclude_address_set` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `route_exclude_address_set`：黑名单引用 ruleset。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5299) |
-| `endpoint_independent_nat` | `布尔值` | 可选；默认 `false` | `endpoint-independent-nat` | 无 | `endpoint_independent_nat`：全锥 NAT；UDP 打洞场景需开。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5304) |
-| `udp_timeout` | `时长` | 可选；默认 `5m` | `udp-timeout` | 无 | `udp_timeout`：UDP NAT 老化（默认 5m）。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5311) |
-| `exclude_mptcp` | `布尔值` | 可选；默认 `false` | 无 | 无 | `exclude_mptcp`：透传 MPTCP 不接管。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5314) |
-| `loopback_address` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `loopback_address`：哪些 IP 视为 loopback 不接管（如保留地址）。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5317) |
-| `include_interface` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `include_interface`：仅接管这些上行接口的流量。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5322) |
-| `exclude_interface` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `exclude_interface`：排除这些接口。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5325) |
-| `include_uid` | `非负整数 列表` | 可选；默认 空 | 无 | 无 | 包含/排除过滤条件；与同配置块其它过滤器的组合规则见对应语义手册。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5329) |
-| `include_uid_range` | `字符串 列表` | 可选；默认 空 | 无 | 无 | 形如 `"1000:99999"`，闭区间。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5332) |
-| `exclude_uid` | `非负整数 列表` | 可选；默认 空 | 无 | 无 | 包含/排除过滤条件；与同配置块其它过滤器的组合规则见对应语义手册。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5334) |
-| `exclude_uid_range` | `字符串 列表` | 可选；默认 空 | 无 | 无 | 包含/排除过滤条件；与同配置块其它过滤器的组合规则见对应语义手册。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5336) |
-| `include_gid` | `非负整数 列表` | 可选；默认 空 | 无 | 无 | 包含/排除过滤条件；与同配置块其它过滤器的组合规则见对应语义手册。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5340) |
-| `include_gid_range` | `字符串 列表` | 可选；默认 空 | 无 | 无 | 包含/排除过滤条件；与同配置块其它过滤器的组合规则见对应语义手册。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5342) |
-| `exclude_gid` | `非负整数 列表` | 可选；默认 空 | 无 | 无 | 包含/排除过滤条件；与同配置块其它过滤器的组合规则见对应语义手册。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5344) |
-| `exclude_gid_range` | `字符串 列表` | 可选；默认 空 | 无 | 无 | 包含/排除过滤条件；与同配置块其它过滤器的组合规则见对应语义手册。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5346) |
-| `include_android_user` | `非负整数 列表` | 可选；默认 空 | 无 | 无 | `include_android_user`：仅接管这些 Android user id 的流量（双开 / 工作资料）。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5351) |
-| `include_package` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `include_package`：Android 包名白名单。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5354) |
-| `exclude_package` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `exclude_package`：Android 包名黑名单。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5357) |
-| `include_mac_address` | `字符串 列表` | 可选；默认 空 | 无 | 无 | 包含/排除过滤条件；与同配置块其它过滤器的组合规则见对应语义手册。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5361) |
-| `exclude_mac_address` | `字符串 列表` | 可选；默认 空 | 无 | 无 | 包含/排除过滤条件；与同配置块其它过滤器的组合规则见对应语义手册。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5363) |
-| `platform` | `TunPlatformOptions（可选）` | 可选；默认 不设置 | 无 | 无 | `platform.http_proxy`：iOS/Android 系统代理透传。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5368) |
+| `interface_name` | `字符串（可选）` | 可选；默认 不设置 | 无 | 无 | `interface_name`：优先级高于 WutherCore 默认 `rpktun0/utun7/WutherCoreTun`。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5400) |
+| `address` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `address`：TUN 接口 v4 / v6 CIDR 列表（首条 v4 / 首条 v6 生效）。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5403) |
+| `inet6` | `布尔值` | 可选；默认 `true` | 无 | 无 | `inet6`：是否在 TUN 上启用 IPv6。关闭后不配 v6 地址 / 路由 / 规则 / listener。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5406) |
+| `auto_route` | `布尔值` | 可选；默认 `true` | 无 | 无 | `auto_route`：自动写默认路由（0.0.0.0/0 + ::/0 → tun）。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5411) |
+| `iproute2_table_index` | `非负整数` | 可选；默认 `2022` | 无 | 无 | `iproute2_table_index`：Linux 自定义路由表 id（默认 2022）。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5414) |
+| `iproute2_rule_index` | `非负整数` | 可选；默认 `9000` | 无 | 无 | `iproute2_rule_index`：`ip rule` 优先级起始 id。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5417) |
+| `auto_redirect` | `布尔值` | 可选；默认 `false` | 无 | 无 | `auto_redirect`：在 auto_route TUN 数据面上，为 TCP 注入 nftables NAT REDIRECT。当前安全契约只把本机 UDP 送入 TUN； ICMP/其他协议不新增导流 rule，继续按已有主路由策略处理。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5422) |
+| `auto_redirect_input_mark` | `字符串（可选）` | 可选；默认 不设置 | 无 | 无 | `auto_redirect_input_mark`：保留的 mark/NFQUEUE 入站 mark；当前 Linux REDIRECT 安全子集不消费，显式配置会失败。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5426) |
+| `auto_redirect_output_mark` | `字符串（可选）` | 可选；默认 不设置 | 无 | 无 | `auto_redirect_output_mark`：跳过 redirect chain 的 fwmark。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5429) |
+| `auto_redirect_reset_mark` | `字符串（可选）` | 可选；默认 不设置 | 无 | 无 | `auto_redirect_reset_mark`：NFQUEUE 预匹配的连接 reset mark（保留字段）。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5432) |
+| `auto_redirect_nfqueue` | `0-65535 整数（可选）` | 可选；默认 不设置 | 无 | 无 | `auto_redirect_nfqueue`：NFQUEUE 预匹配队列编号（当前无消费者）。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5435) |
+| `auto_redirect_iproute2_fallback_rule_index` | `非负整数（可选）` | 可选；默认 不设置 | 无 | 无 | `auto_redirect_iproute2_fallback_rule_index`：fallback ip rule 优先级。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5438) |
+| `strict_route` | `布尔值` | 可选；默认 `false` | 无 | 无 | `strict_route`：严格防泄漏；任何未接管流量被 drop。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5441) |
+| `route_address` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `route_address`：仅这些 CIDR 走 TUN（白名单）。空 = 全部。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5444) |
+| `route_exclude_address` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `route_exclude_address`：这些 CIDR 不走 TUN（黑名单）。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5447) |
+| `route_address_set` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `route_address_set`：白名单引用 ruleset（动态 IP 集）。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5450) |
+| `route_exclude_address_set` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `route_exclude_address_set`：黑名单引用 ruleset。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5453) |
+| `endpoint_independent_nat` | `布尔值` | 可选；默认 `false` | `endpoint-independent-nat` | 无 | `endpoint_independent_nat`：全锥 NAT；UDP 打洞场景需开。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5458) |
+| `udp_timeout` | `时长` | 可选；默认 `5m` | `udp-timeout` | 无 | `udp_timeout`：UDP NAT 老化（默认 5m）。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5465) |
+| `exclude_mptcp` | `布尔值` | 可选；默认 `false` | 无 | 无 | `exclude_mptcp`：透传 MPTCP 不接管。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5468) |
+| `loopback_address` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `loopback_address`：哪些 IP 视为 loopback 不接管（如保留地址）。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5471) |
+| `include_interface` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `include_interface`：仅接管这些上行接口的流量。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5476) |
+| `exclude_interface` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `exclude_interface`：排除这些接口。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5479) |
+| `include_uid` | `非负整数 列表` | 可选；默认 空 | 无 | 无 | 包含/排除过滤条件；与同配置块其它过滤器的组合规则见对应语义手册。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5483) |
+| `include_uid_range` | `字符串 列表` | 可选；默认 空 | 无 | 无 | 形如 `"1000:99999"`，闭区间。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5486) |
+| `exclude_uid` | `非负整数 列表` | 可选；默认 空 | 无 | 无 | 包含/排除过滤条件；与同配置块其它过滤器的组合规则见对应语义手册。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5488) |
+| `exclude_uid_range` | `字符串 列表` | 可选；默认 空 | 无 | 无 | 包含/排除过滤条件；与同配置块其它过滤器的组合规则见对应语义手册。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5490) |
+| `include_gid` | `非负整数 列表` | 可选；默认 空 | 无 | 无 | 包含/排除过滤条件；与同配置块其它过滤器的组合规则见对应语义手册。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5494) |
+| `include_gid_range` | `字符串 列表` | 可选；默认 空 | 无 | 无 | 包含/排除过滤条件；与同配置块其它过滤器的组合规则见对应语义手册。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5496) |
+| `exclude_gid` | `非负整数 列表` | 可选；默认 空 | 无 | 无 | 包含/排除过滤条件；与同配置块其它过滤器的组合规则见对应语义手册。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5498) |
+| `exclude_gid_range` | `字符串 列表` | 可选；默认 空 | 无 | 无 | 包含/排除过滤条件；与同配置块其它过滤器的组合规则见对应语义手册。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5500) |
+| `include_android_user` | `非负整数 列表` | 可选；默认 空 | 无 | 无 | `include_android_user`：仅接管这些 Android user id 的流量（双开 / 工作资料）。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5505) |
+| `include_package` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `include_package`：Android 包名白名单。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5508) |
+| `exclude_package` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `exclude_package`：Android 包名黑名单。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5511) |
+| `include_mac_address` | `字符串 列表` | 可选；默认 空 | 无 | 无 | 包含/排除过滤条件；与同配置块其它过滤器的组合规则见对应语义手册。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5515) |
+| `exclude_mac_address` | `字符串 列表` | 可选；默认 空 | 无 | 无 | 包含/排除过滤条件；与同配置块其它过滤器的组合规则见对应语义手册。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5517) |
+| `platform` | `TunPlatformOptions（可选）` | 可选；默认 不设置 | 无 | 无 | `platform.http_proxy`：iOS/Android 系统代理透传。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5522) |
 
 ## `TunPlatformOptions`
 
 `TunPlatformOptions` 配置对象。
 
-[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5417)
+[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5571)
 
 | YAML / JSON 字段 | 类型 | 必填与默认 | 兼容别名 | 取值 / 形态 | 解析与用途 |
 | --- | --- | --- | --- | --- | --- |
-| `http_proxy` | `TunHttpProxyOptions（可选）` | 可选；默认不设置 | 无 | 无 | `TunPlatformOptions` 的 `http_proxy` 参数。解析类型为 `TunHttpProxyOptions（可选）`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5419) |
+| `http_proxy` | `TunHttpProxyOptions（可选）` | 可选；默认不设置 | 无 | 无 | `TunPlatformOptions` 的 `http_proxy` 参数。解析类型为 `TunHttpProxyOptions（可选）`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5573) |
 
 ## `TunHttpProxyOptions`
 
 `TunHttpProxyOptions` 配置对象。
 
-[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5424)
+[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5578)
 
 | YAML / JSON 字段 | 类型 | 必填与默认 | 兼容别名 | 取值 / 形态 | 解析与用途 |
 | --- | --- | --- | --- | --- | --- |
-| `enabled` | `布尔值` | 可选；默认 `false` | 无 | 无 | 控制该配置块是否启用；关闭时保留配置但不启动对应运行时能力。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5426) |
-| `server` | `字符串` | 可选；默认空字符串 | 无 | 无 | 监听或连接使用的主机/IP 地址；是否允许域名由所在协议和校验阶段决定。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5428) |
-| `server_port` | `0-65535 整数` | 可选；默认 `0` | 无 | 无 | 监听或连接使用的端口；`0` 是否允许由所在配置块校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5430) |
-| `bypass_domain` | `字符串 列表` | 可选；默认空 | 无 | 无 | `TunHttpProxyOptions` 的 `bypass_domain` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5432) |
-| `match_domain` | `字符串 列表` | 可选；默认空 | 无 | 无 | `TunHttpProxyOptions` 的 `match_domain` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5434) |
+| `enabled` | `布尔值` | 可选；默认 `false` | 无 | 无 | 控制该配置块是否启用；关闭时保留配置但不启动对应运行时能力。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5580) |
+| `server` | `字符串` | 可选；默认空字符串 | 无 | 无 | 监听或连接使用的主机/IP 地址；是否允许域名由所在协议和校验阶段决定。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5582) |
+| `server_port` | `0-65535 整数` | 可选；默认 `0` | 无 | 无 | 监听或连接使用的端口；`0` 是否允许由所在配置块校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5584) |
+| `bypass_domain` | `字符串 列表` | 可选；默认空 | 无 | 无 | `TunHttpProxyOptions` 的 `bypass_domain` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5586) |
+| `match_domain` | `字符串 列表` | 可选；默认空 | 无 | 无 | `TunHttpProxyOptions` 的 `match_domain` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5588) |
 
 ## `Smart`
 
 `Smart` 配置对象。
 
-[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5441)
+[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5595)
 
 | YAML / JSON 字段 | 类型 | 必填与默认 | 兼容别名 | 取值 / 形态 | 解析与用途 |
 | --- | --- | --- | --- | --- | --- |
-| `on` | `布尔值` | 可选；默认 `true` | 无 | 无 | 控制该配置块是否启用；关闭时保留配置但不启动对应运行时能力。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5443) |
-| `goal` | `SmartGoal` | 可选；默认 `balanced` | 无 | `balanced`<br>`speed`<br>`stability`<br>`lowcost`<br>`privacy` | `Smart` 的 `goal` 参数。解析类型为 `SmartGoal`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5445) |
-| `learn` | `时长` | 可选；默认 `14d` | 无 | 无 | `Smart` 的 `learn` 参数。解析类型为 `时长`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5447) |
-| `sticky` | `SmartSticky` | 可选；默认 `site` | 无 | `off`<br>`site`<br>`session` | `Smart` 的 `sticky` 参数。解析类型为 `SmartSticky`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5449) |
-| `explain` | `布尔值` | 可选；默认 `true` | 无 | 无 | `Smart` 的 `explain` 参数。解析类型为 `布尔值`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5451) |
+| `on` | `布尔值` | 可选；默认 `true` | 无 | 无 | 控制该配置块是否启用；关闭时保留配置但不启动对应运行时能力。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5597) |
+| `goal` | `SmartGoal` | 可选；默认 `balanced` | 无 | `balanced`<br>`speed`<br>`stability`<br>`lowcost`<br>`privacy` | `Smart` 的 `goal` 参数。解析类型为 `SmartGoal`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5599) |
+| `learn` | `时长` | 可选；默认 `14d` | 无 | 无 | `Smart` 的 `learn` 参数。解析类型为 `时长`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5601) |
+| `sticky` | `SmartSticky` | 可选；默认 `site` | 无 | `off`<br>`site`<br>`session` | `Smart` 的 `sticky` 参数。解析类型为 `SmartSticky`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5603) |
+| `explain` | `布尔值` | 可选；默认 `true` | 无 | 无 | `Smart` 的 `explain` 参数。解析类型为 `布尔值`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5605) |
 
 ## `Ui`
 
 `Ui` 配置对象。
 
-[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5488)
+[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5642)
 
 | YAML / JSON 字段 | 类型 | 必填与默认 | 兼容别名 | 取值 / 形态 | 解析与用途 |
 | --- | --- | --- | --- | --- | --- |
-| `on` | `布尔值` | 可选；默认 `true` | 无 | 无 | 控制该配置块是否启用；关闭时保留配置但不启动对应运行时能力。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5490) |
-| `secret` | `字符串（可选）` | 可选；默认 不设置 | 无 | 无 | 敏感认证材料；不要写入公开仓库、日志或截图。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5492) |
-| `dashboard` | `字符串` | 可选；默认 `auto` | 无 | 无 | `Ui` 的 `dashboard` 参数。解析类型为 `字符串`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5494) |
-| `api` | `UiApi` | 可选；默认 `UiApi::default()` | 无 | 无 | `Ui` 的 `api` 参数。解析类型为 `UiApi`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5496) |
-| `cors` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `Ui` 的 `cors` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5498) |
+| `on` | `布尔值` | 可选；默认 `true` | 无 | 无 | 控制该配置块是否启用；关闭时保留配置但不启动对应运行时能力。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5644) |
+| `secret` | `字符串（可选）` | 可选；默认 不设置 | 无 | 无 | 敏感认证材料；不要写入公开仓库、日志或截图。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5646) |
+| `dashboard` | `字符串` | 可选；默认 `auto` | 无 | 无 | `Ui` 的 `dashboard` 参数。解析类型为 `字符串`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5648) |
+| `api` | `UiApi` | 可选；默认 `UiApi::default()` | 无 | 无 | `Ui` 的 `api` 参数。解析类型为 `UiApi`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5650) |
+| `cors` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `Ui` 的 `cors` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5652) |
 
 ## `UiApi`
 
 `UiApi` 配置对象。
 
-[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5515)
+[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5669)
 
 | YAML / JSON 字段 | 类型 | 必填与默认 | 兼容别名 | 取值 / 形态 | 解析与用途 |
 | --- | --- | --- | --- | --- | --- |
-| `native` | `布尔值` | 可选；默认 `true` | 无 | 无 | `UiApi` 的 `native` 参数。解析类型为 `布尔值`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5517) |
-| `clash_compat` | `布尔值` | 可选；默认 `true` | 无 | 无 | `UiApi` 的 `clash_compat` 参数。解析类型为 `布尔值`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5519) |
+| `native` | `布尔值` | 可选；默认 `true` | 无 | 无 | `UiApi` 的 `native` 参数。解析类型为 `布尔值`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5671) |
+| `clash_compat` | `布尔值` | 可选；默认 `true` | 无 | 无 | `UiApi` 的 `clash_compat` 参数。解析类型为 `布尔值`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5673) |
 
 ## `Mesh`
 
 `Mesh` 配置对象。
 
-[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5535)
+[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5689)
 
 | YAML / JSON 字段 | 类型 | 必填与默认 | 兼容别名 | 取值 / 形态 | 解析与用途 |
 | --- | --- | --- | --- | --- | --- |
-| `tailscale` | `MeshTailscale（可选）` | 可选；默认不设置 | 无 | 无 | `Mesh` 的 `tailscale` 参数。解析类型为 `MeshTailscale（可选）`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5537) |
+| `tailscale` | `MeshTailscale（可选）` | 可选；默认不设置 | 无 | 无 | `Mesh` 的 `tailscale` 参数。解析类型为 `MeshTailscale（可选）`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5691) |
 
 ## `MeshTailscale`
 
 `MeshTailscale` 配置对象。
 
-[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5542)
+[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5696)
 
 | YAML / JSON 字段 | 类型 | 必填与默认 | 兼容别名 | 取值 / 形态 | 解析与用途 |
 | --- | --- | --- | --- | --- | --- |
-| `on` | `布尔值` | 可选；默认 `true` | 无 | 无 | 控制该配置块是否启用；关闭时保留配置但不启动对应运行时能力。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5544) |
-| `mode` | `TailscaleMode` | 可选；默认 `auto` | 无 | `auto`<br>`localapi`<br>`userspace`<br>`tsnet`<br>`off` | `MeshTailscale` 的 `mode` 参数。解析类型为 `TailscaleMode`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5546) |
-| `keep_tailnet_direct` | `布尔值` | 可选；默认 `true` | 无 | 无 | `MeshTailscale` 的 `keep_tailnet_direct` 参数。解析类型为 `布尔值`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5548) |
-| `expose_as_node` | `布尔值` | 可选；默认 `false` | 无 | 无 | `MeshTailscale` 的 `expose_as_node` 参数。解析类型为 `布尔值`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5550) |
-| `userspace_proxy` | `TailscaleUserspaceProxy（可选）` | 可选；默认 不设置 | 无 | 无 | `MeshTailscale` 的 `userspace_proxy` 参数。解析类型为 `TailscaleUserspaceProxy（可选）`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5552) |
+| `on` | `布尔值` | 可选；默认 `true` | 无 | 无 | 控制该配置块是否启用；关闭时保留配置但不启动对应运行时能力。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5698) |
+| `mode` | `TailscaleMode` | 可选；默认 `auto` | 无 | `auto`<br>`localapi`<br>`userspace`<br>`tsnet`<br>`off` | `MeshTailscale` 的 `mode` 参数。解析类型为 `TailscaleMode`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5700) |
+| `keep_tailnet_direct` | `布尔值` | 可选；默认 `true` | 无 | 无 | `MeshTailscale` 的 `keep_tailnet_direct` 参数。解析类型为 `布尔值`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5702) |
+| `expose_as_node` | `布尔值` | 可选；默认 `false` | 无 | 无 | `MeshTailscale` 的 `expose_as_node` 参数。解析类型为 `布尔值`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5704) |
+| `userspace_proxy` | `TailscaleUserspaceProxy（可选）` | 可选；默认 不设置 | 无 | 无 | `MeshTailscale` 的 `userspace_proxy` 参数。解析类型为 `TailscaleUserspaceProxy（可选）`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5706) |
 
 ## `TailscaleUserspaceProxy`
 
 `TailscaleUserspaceProxy` 配置对象。
 
-[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5578)
+[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5732)
 
 | YAML / JSON 字段 | 类型 | 必填与默认 | 兼容别名 | 取值 / 形态 | 解析与用途 |
 | --- | --- | --- | --- | --- | --- |
-| `socks` | `字符串（可选）` | 可选；默认不设置 | 无 | 无 | `TailscaleUserspaceProxy` 的 `socks` 参数。解析类型为 `字符串（可选）`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5580) |
-| `http` | `字符串（可选）` | 可选；默认不设置 | 无 | 无 | `TailscaleUserspaceProxy` 的 `http` 参数。解析类型为 `字符串（可选）`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5582) |
+| `socks` | `字符串（可选）` | 可选；默认不设置 | 无 | 无 | `TailscaleUserspaceProxy` 的 `socks` 参数。解析类型为 `字符串（可选）`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5734) |
+| `http` | `字符串（可选）` | 可选；默认不设置 | 无 | 无 | `TailscaleUserspaceProxy` 的 `http` 参数。解析类型为 `字符串（可选）`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5736) |
 
 ## 本分类枚举
 
 ### `CaptureMethod`
 
-`CaptureMethod` 的可接受配置形态。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5118)
+`CaptureMethod` 的可接受配置形态。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5272)
 
 | 写法 | 兼容别名 | 含义 |
 | --- | --- | --- |
@@ -205,7 +205,7 @@ sing-box `inbounds[type=tun]` 兼容字段映射：见 <https://sing-box.sagerne
 
 ### `CaptureTraffic`
 
-`CaptureTraffic` 的可接受配置形态。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5128)
+`CaptureTraffic` 的可接受配置形态。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5282)
 
 | 写法 | 兼容别名 | 含义 |
 | --- | --- | --- |
@@ -215,7 +215,7 @@ sing-box `inbounds[type=tun]` 兼容字段映射：见 <https://sing-box.sagerne
 
 ### `CaptureResolver`
 
-`CaptureResolver` 的可接受配置形态。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5136)
+`CaptureResolver` 的可接受配置形态。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5290)
 
 | 写法 | 兼容别名 | 含义 |
 | --- | --- | --- |
@@ -224,7 +224,7 @@ sing-box `inbounds[type=tun]` 兼容字段映射：见 <https://sing-box.sagerne
 
 ### `CaptureStack`
 
-TCP/UDP 栈选择：对标 sing-tun `stack` 字段。 sing-tun 实现： - `system` = TCP 走 OS 内核 NAT + TcpListener accept，UDP 走 OS 转发 - `mixed` = TCP 同 system，UDP 走 gVisor 用户态 - `gvisor` = TCP + UDP 全部走 gVisor 用户态 WutherCore 映射： - `system` / `mixed` / `native` → SystemDispatcher（TCP NAT + OS accept + UDP forwarder） - `gvisor` / `smoltcp` → TunDispatcher（smoltcp 用户态 TCP，仅测试/备用） [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5153)
+TCP/UDP 栈选择：对标 sing-tun `stack` 字段。 sing-tun 实现： - `system` = TCP 走 OS 内核 NAT + TcpListener accept，UDP 走 OS 转发 - `mixed` = TCP 同 system，UDP 走 gVisor 用户态 - `gvisor` = TCP + UDP 全部走 gVisor 用户态 WutherCore 映射： - `system` / `mixed` / `native` → SystemDispatcher（TCP NAT + OS accept + UDP forwarder） - `gvisor` / `smoltcp` → TunDispatcher（smoltcp 用户态 TCP，仅测试/备用） [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5307)
 
 | 写法 | 兼容别名 | 含义 |
 | --- | --- | --- |
@@ -236,7 +236,7 @@ TCP/UDP 栈选择：对标 sing-tun `stack` 字段。 sing-tun 实现： - `syst
 
 ### `SmartGoal`
 
-`SmartGoal` 的可接受配置形态。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5468)
+`SmartGoal` 的可接受配置形态。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5622)
 
 | 写法 | 兼容别名 | 含义 |
 | --- | --- | --- |
@@ -248,7 +248,7 @@ TCP/UDP 栈选择：对标 sing-tun `stack` 字段。 sing-tun 实现： - `syst
 
 ### `SmartSticky`
 
-`SmartSticky` 的可接受配置形态。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5478)
+`SmartSticky` 的可接受配置形态。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5632)
 
 | 写法 | 兼容别名 | 含义 |
 | --- | --- | --- |
@@ -258,7 +258,7 @@ TCP/UDP 栈选择：对标 sing-tun `stack` 字段。 sing-tun 实现： - `syst
 
 ### `TailscaleMode`
 
-`TailscaleMode` 的可接受配置形态。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5569)
+`TailscaleMode` 的可接受配置形态。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5723)
 
 | 写法 | 兼容别名 | 含义 |
 | --- | --- | --- |

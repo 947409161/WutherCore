@@ -123,8 +123,17 @@ curl \
 数据库提交失败会返回 `500`，不会只改内存。自动组的固定节点失活时会临时回退，
 pin 本身继续保留。测速解锁后会立即刷新 `now`。
 
-`GET /proxies/:name/delay` 只测试单节点，不改变策略组 pin。只有
-`GET /group/:group/delay` 具有自动组测速解锁语义。
+嵌套组额外返回 `selectedChain` 和 `resolvedNow`。`now` 是上层组直接选择的
+下级组，`resolvedNow` 是实际 outbound，`selectedChain` 按实际 outbound 到
+最外层组的顺序返回完整链。`all` 只返回过滤和候选数量限制后的直接成员。
+
+`GET /proxies/:name/delay` 接受节点或组名。组名会递归到当前实际叶子节点，不改变
+策略组 pin。只有 `GET /group/:group/delay` 会展开全部叶子节点并执行自动组测速
+解锁。
+
+原生 `GET /v1/groups` 同时返回 `members`, `configured_members`,
+`resolved_member`, `selected_chain`, `default_selected`, `empty_fallback`,
+`min_members`, `max_members`, `lazy`, `weights`, `hidden` 和 `icon`。
 
 ## 服务端保护
 

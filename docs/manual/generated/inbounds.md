@@ -14,7 +14,7 @@ hide:
 
 Mixed、Panel、Shadowsocks、WireGuard、Young、gRPC、REALITY 和 XHTTP 入站。
 
-全手册当前覆盖 **770 个字段**、**55 个枚举类型**。
+全手册当前覆盖 **790 个字段**、**55 个枚举类型**。
 行为说明和跨字段约束请同时阅读同分类下的人工手册页面。
 
 ## `Listen`

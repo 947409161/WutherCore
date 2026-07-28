@@ -74,7 +74,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::model::{LogFormat, LogLevel};
+    use crate::model::{ChooseStrategy, LogFormat, LogLevel};
 
     #[test]
     fn minimal_yaml_loads() {
@@ -680,15 +680,47 @@ route:
 
         assert_eq!(plan.name, "official-multi-platform");
         assert_eq!(plan.feeds.len(), 1);
-        assert_eq!(plan.groups.len(), 10);
+        assert_eq!(plan.groups.len(), 23);
         assert_eq!(plan.route.sets.len(), 24);
         assert!(plan.capture.on);
         assert_eq!(plan.capture.method, CaptureMethod::Auto);
         assert!(!plan.capture.tun.auto_redirect);
-        assert!(plan.groups.contains_key("auto"));
-        assert!(plan.groups.contains_key("load-balance"));
+        assert!(plan.groups.contains_key("智能节点"));
+        assert!(plan.groups.contains_key("负载均衡节点"));
+        assert!(plan.groups.contains_key("香港节点"));
+        assert!(plan.groups.contains_key("美国节点"));
+        assert!(plan.groups.contains_key("澳大利亚节点"));
+        assert!(plan.groups.values().all(|group| {
+            group
+                .icon
+                .starts_with("https://raw.githubusercontent.com/luestr/IconResource/")
+        }));
+        assert!(
+            plan.groups["人工智能"]
+                .icon
+                .ends_with("/App_icon/120px/ChatGPT.png")
+        );
+        assert_eq!(plan.groups["节点选择"].choose, ChooseStrategy::Manual);
+        assert!(
+            plan.groups["节点选择"]
+                .members
+                .iter()
+                .all(|member| plan.groups.contains_key(member))
+        );
+        assert!(
+            plan.groups["人工智能"]
+                .members
+                .iter()
+                .all(|member| plan.groups.contains_key(member))
+        );
+        assert!(
+            plan.groups["香港节点"]
+                .members
+                .contains(&"feed:primary".to_string())
+        );
+        assert_eq!(plan.groups["香港节点"].empty_fallback, "DIRECT-FALLBACK");
         assert!(plan.route.sets.contains_key("ads"));
-        assert!(plan.route.sets.contains_key("cn-ip"));
+        assert!(plan.route.sets.contains_key("geoip-cn"));
         assert!(plan.route.sets.contains_key("global"));
     }
 

@@ -11,7 +11,7 @@
 | 订阅管理 | 已实现 | 原生 YAML/JSON、Young、格式与协议探测、HTTP/文件/内联、Age 解密、Mihomo 26 类节点、过滤与安全缓存 |
 | 外部规则集 | 已实现 | Mihomo YAML/文本/MRS v1，sing-box JSON/SRS v1-v5，内联 Payload，RRS v3，兼容 RRS v1/v2 |
 | 路由匹配 | 已实现 | Mihomo 全部官方规则，逻辑规则，子规则，按序 DNS 与 `no-resolve` |
-| 策略组 | 已实现 | Manual、Load Balance、URLTest、Smart |
+| 策略组 | 已实现 | 嵌套 Manual 分流, Smart, URLTest, Fallback, Load Balance, Random, Weighted, glob 成员来源, 持久 pin |
 | DNS | 已实现 | 多上游、缓存、Hosts、Fallback、Fake IP、IPv6 策略 |
 | 独立 DNS 服务 | 已实现 | 同一地址提供 UDP 与 TCP DNS |
 | 透明代理 | 平台相关 | TUN、TPROXY、REDIRECT 与 Android VpnService |

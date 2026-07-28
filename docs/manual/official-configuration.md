@@ -20,7 +20,7 @@ description: Windows、macOS、Linux 和 Android 共用的订阅、策略组、�
 | --- | --- |
 | 平台 | Windows、macOS、Linux、Android root TUN、Android VpnService |
 | 订阅 | HTTPS 拉取、定时更新、响应大小限制、请求头、过滤、重命名、磁盘缓存 |
-| 策略组 | manual、smart、fast、stable、spread |
+| 策略组 | 两层嵌套 manual 分流组，smart、fast、stable、spread 节点组 |
 | 分流 | 域名、IP、网络、端口、进程、协议嗅探、最终规则 |
 | 规则集 | 23 个远程 MRS 集合和 1 个内联集合 |
 | DNS | 国内与公共服务组、多出口、自适应选择、Fallback、策略和 Fake IP |
@@ -77,25 +77,41 @@ feeds:
 
 | 组名 | 策略 | 用途 |
 | --- | --- | --- |
-| `proxy` | manual | 面板或 API 手动选择 |
-| `auto` | smart | 综合延迟、成功率、稳定性和站点记忆 |
-| `low-latency` | fast | 健康检查后选择低延迟节点 |
-| `failover` | stable | 按候选顺序选择首个可用节点 |
-| `load-balance` | spread | 按会话分散连接 |
-| `ai` | smart | AI 服务地区偏好 |
-| `streaming` | smart | 流媒体地区偏好 |
-| `gaming` | fast | 游戏低延迟选择 |
-| `development` | stable | GitHub、开发站点和 SSH |
-| `messaging` | stable | Telegram 等消息服务 |
+| `节点选择` | manual | 全局分流入口，可从地区组和通用节点组中选择 |
+| `人工智能` | manual | AI 规则的独立地区选择 |
+| `流媒体` | manual | 流媒体规则的独立地区选择 |
+| `游戏加速` | manual | 游戏规则的独立地区选择 |
+| `开发服务` | manual | GitHub, Git, SSH 和开发站点的独立地区选择 |
+| `即时通信` | manual | Telegram 等消息服务的独立地区选择 |
+| `智能节点` | smart | 综合延迟, 成功率, 稳定性和站点记忆 |
+| `最低延迟节点` | fast | 健康检查后选择低延迟节点 |
+| `故障转移节点` | stable | 按候选顺序选择首个可用节点 |
+| `负载均衡节点` | spread | 按会话分散连接 |
+
+配置明确分成两层。上层是路由引用的中文分流策略组，只负责选择下级节点组。下层是
+地区节点组和通用节点组，只负责从静态节点与 provider 中选择实际节点。运行时会
+解析完整链路，例如 `人工智能 -> 美国节点 -> [订阅] US-01`。DNS 的命名出口也使用
+同一套递归选路，不会把策略组名误当成普通 outbound。
+
+地区节点组包括 `香港节点`, `台湾节点`, `日本节点`, `新加坡节点`, `韩国节点`,
+`美国节点`, `加拿大节点`, `英国节点`, `德国节点`, `法国节点`,
+`澳大利亚节点`, `印度节点` 和 `其他地区`。每个地区组使用独立正则过滤节点名，
+同时识别中文地区名, 英文名称, 常用国家代码和旗帜字符。没有该地区节点时只使用
+`DIRECT-FALLBACK`，不会拿其它地区节点伪装成地区命中。
+
+所有策略组的图标都来自
+[`luestr/IconResource`](https://github.com/luestr/IconResource)。功能组使用对应应用或
+功能图标，地区组使用 120px 国旗资源。`人工智能` 明确使用该仓库的 ChatGPT 图标。
 
 项目当前会拒绝 `chain`，不会把未实现的多跳组降级为单跳。因此官方配置覆盖全部可
 执行策略，但不写不可执行的示例。
 
-这些组都支持 Clash API 持久 pin。Manual 会一直保持选择；Smart、Fast、Stable
-和 Spread 的固定节点失活时临时回退，成功执行组测速后解除旧 pin 并恢复自动选择。
-官方配置为自动组设置了 `expected-status`、`interval`、`idle-timeout`、
-`unified-delay`、失败阈值和切换迟滞。没有参与真实选路的组不会在后台扫描订阅。
-`load-balance` 使用 `strategy: sticky-sessions`，不要把 Smart 的 `sticky` 字段
+这些组都支持 Clash API 持久 pin。Manual 会一直保持直接选择，Clash API 额外返回
+`selectedChain` 和 `resolvedNow`，方便面板展示最终地区节点与实际节点。Smart,
+Fast, Stable 和 Spread 的固定节点失活时临时回退，成功执行组测速后解除旧 pin
+并恢复自动选择。官方配置为自动组设置了 `expected-status`, `interval`,
+`idle-timeout`, `unified-delay`, 失败阈值和切换迟滞。没有参与真实选路的组不会
+在后台扫描订阅。`负载均衡节点` 使用 `strategy: sticky-sessions`，不要把 Smart 的 `sticky` 字段
 误当成 Spread 算法。
 
 ## 规则集
@@ -110,8 +126,8 @@ feeds:
 2. 广告集合随后阻断。
 3. 中国大陆服务和地址直连。
 4. AI、流媒体、消息、开发和游戏进入专用组。
-5. 其它非中国大陆域名进入 `auto`。
-6. 最终规则进入 `auto`。
+5. 其它非中国大陆域名进入 `节点选择`。
+6. 最终规则进入 `节点选择`。
 
 MRS 文件下载失败时不会用空集合替换上次成功缓存。首次运行尚无缓存时，未加载集合
 不会伪造命中，最终规则仍会处理流量。
@@ -121,21 +137,29 @@ MRS 文件下载失败时不会用空集合替换上次成功缓存。首次运�
 
 ## DNS
 
-`domestic` 组并发查询 AliDNS 和 DNSPod，`public` 组通过 `auto`、`failover` 或
-Direct 访问 Cloudflare 和 Google。代理节点域名使用 `domestic` 启动解析，避免
-解析代理节点时反过来依赖尚未建立的代理连接。
+`国内DNS` 并发查询 AliDNS 和 DNSPod。`国外DNS` 通过 `节点选择`,
+`故障转移节点` 或 Direct 访问 Cloudflare, Google 与 Quad9。默认 nameserver 是
+`国内DNS`，fallback 是 `国外DNS`，方向不会颠倒。
+
+已知中国大陆域名直接进入 `国内DNS`。已知国外分类进入 `国外DNS`。尚未被规则集
+分类的域名先查询国内 DNS，返回非中国大陆地址，保留地址或污染地址时再查询国外
+DNS。`geoip-code: CN` 对应配置中的 `geoip-cn` MRS 集合，因此不是只有字段外观而
+没有真实 GeoIP 数据。
+
+代理节点域名使用独立的 `节点域名DNS`。该组只访问 IP 字面地址的国内 DoH，不依赖
+尚未建立的代理隧道，避免启动阶段出现 DNS 与代理互相等待。
 
 DNS 规则与路由规则使用同一批规则集：
 
 ```yaml
 resolver:
-  nameserver-policy:
-    "rule-set:cn-domain": domestic
-    "rule-set:ai-global": public
+  nameserver: [国内DNS]
+  fallback: [国外DNS]
   rules:
     - "set:ads -> nxdomain"
-    - "set:cn-domain -> direct"
-    - "any -> proxy:public?strategy=adaptive"
+    - "set:cn-domain -> route:国内DNS?strategy=parallel"
+    - "set:ai-global -> route:国外DNS?strategy=adaptive"
+    - "any -> route:default?strategy=parallel"
 ```
 
 Fake IP 与 `capture.resolver: hijack` 配套启用。关闭 TUN 并只使用 Mixed 代理时，
@@ -171,5 +195,5 @@ wuther-core ruleset list config.yaml
 wuther-core ruleset refresh config.yaml --cache-dir data/rulesets
 ```
 
-确认订阅节点数、全部规则集更新时间、`auto` 当前节点和 DNS 查询结果后再把配置加入
+确认订阅节点数、全部规则集更新时间、`节点选择` 的完整选择链和 DNS 查询结果后再把配置加入
 系统服务。完整字段仍以逐字段索引和 `check` 的严格校验为准。

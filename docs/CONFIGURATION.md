@@ -60,20 +60,27 @@ nodes:
     port: 1080
 
 groups:
-  main:
+  香港节点:
     choose: smart
-    use: [airport]
-    prefer: ["HK", "SG"]
-    avoid: ["expired"]
+    include-providers: [airport]
+    filter: '(?i)(香港|\bHK\b)'
+    empty-fallback: DIRECT
+  main:
+    choose: manual
+    proxies: [香港节点]
+    default-selected: 香港节点
 ```
 
 订阅地址和节点凭据属于敏感信息。不要提交真实配置、订阅缓存或完整节点 URI。
 
 订阅正文不要求使用 Mihomo 外形。原生 YAML/JSON 可以用 `nodes` 或 `outbounds`，节点通过 `type` 指定 Young 等协议；省略时只对具有唯一字段特征的协议自动探测。格式和示例见 [自由订阅指南](FEEDS.md)。
 
-策略组可以从订阅和其他路径聚合节点，并通过 `prefer`、`avoid`、`interval`、
-`idle-timeout`、`tolerance`、`unified-delay`、过滤器和粘性配置影响选择。
-所有已实现策略支持 Clash API 持久 pin，自动策略可由成功的组测速安全解锁。
+策略组可以从订阅, 静态节点和下级组聚合成员。`proxies` 明确引用成员，
+`include-*` 与 `exclude-*` 使用 glob 批量选择来源。`min-members`,
+`max-members`, `empty-fallback`, `default-selected`, `weights` 和 `lazy`
+控制候选边界与退化行为。Manual, Smart, Fast, Stable, Spread, Random,
+Weighted 都支持 Clash API 持久 pin，自动策略可由成功的组测速安全解锁。
+路由与 DNS 可以引用上层 Manual 分流组，运行时递归解析到实际节点。
 完整算法、字段和 API 语义见
 [高级路由、策略组与 DNS](manual/advanced-routing-dns.md)。
 

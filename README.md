@@ -44,7 +44,7 @@ WutherCore 负责节点接入、订阅更新、DNS、规则分流、透明代理
 
 * 支持原生自由订阅、本地节点、订阅 URI、Clash/Mihomo 节点和迁移后的配置。
 * 订阅具备格式与协议自动探测、Young 原生节点、拉取、缓存、Age 解密、Mihomo 全节点解析、过滤、重命名、去重和运行时刷新能力。
-* 策略组支持 Manual、Smart、Fast、Stable、Spread，具备过滤、迟滞、统一延迟、活跃组探测和有界并发。
+* 策略组支持 Manual, Smart, Fast, Stable, Spread, Random, Weighted，具备嵌套分流组, glob 成员来源, 候选上下限, 显式空组回退, 过滤, 迟滞, 统一延迟和按需探活。
 * 所有已实现策略支持 Clash API 持久 pin；自动策略可由成功的组测速按世代安全解锁。
 * Smart 综合延迟分位数、抖动、成功率、退化基线、被动吞吐、负载和站点或会话记忆。
 * 节点评分、测速历史、选择和 pin 状态可以持久化。
@@ -307,7 +307,7 @@ resolver:
 
 可以直接修改这些示例：
 
-* [`examples/official/multi-platform.yaml`](examples/official/multi-platform.yaml) 是带远程订阅、24 个规则集、10 个策略组、DNS 和跨平台 TUN 的官方完整配置。
+* [`examples/official/multi-platform.yaml`](examples/official/multi-platform.yaml) 是带远程订阅、24 个规则集、23 个中文策略组、国内外 DNS 分流和跨平台 TUN 的官方完整配置。
 * [`examples/desktop.yaml`](examples/desktop.yaml) 用于桌面普通代理。
 * [`examples/router.yaml`](examples/router.yaml) 用于路由器和透明代理。
 * [`examples/android.yaml`](examples/android.yaml) 用于 Android VpnService。

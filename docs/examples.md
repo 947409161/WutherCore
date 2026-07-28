@@ -12,7 +12,7 @@ description: WutherCore Desktop、Router、Android、订阅和 DNS 示例
 
 | 场景 | 文件 | 重点 |
 | --- | --- | --- |
-| 官方多平台完整配置 | [`multi-platform.yaml`](https://github.com/MiChongs/WutherCore/blob/main/examples/official/multi-platform.yaml) | 远程订阅、完整策略组、24 个规则集、DNS 和跨平台 TUN |
+| 官方多平台完整配置 | [`multi-platform.yaml`](https://github.com/MiChongs/WutherCore/blob/main/examples/official/multi-platform.yaml) | 远程订阅、23 个中文策略组、24 个规则集、国内外 DNS 分流和跨平台 TUN |
 | 桌面普通代理 | [`desktop.yaml`](https://github.com/MiChongs/WutherCore/blob/main/examples/desktop.yaml) | Mixed 监听、手动节点和基本路由 |
 | 路由器/网关 | [`router.yaml`](https://github.com/MiChongs/WutherCore/blob/main/examples/router.yaml) | TUN、自动路由和严格路由 |
 | Android VpnService | [`android.yaml`](https://github.com/MiChongs/WutherCore/blob/main/examples/android.yaml) | 非 root TUN、应用过滤和移动网络 |
