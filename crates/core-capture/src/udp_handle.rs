@@ -328,7 +328,7 @@ async fn run_udp_dial_worker(
         "udp dial worker started"
     );
     let prepared = match handler
-        .new_packet(build_inbound_metadata(&session_meta, None))
+        .new_packet(build_inbound_metadata(&session_meta))
         .await
     {
         Ok(r) => r,

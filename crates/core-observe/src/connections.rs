@@ -4,7 +4,8 @@
 //! * [`ConnectionMeta`] —— Clash dashboard 的 metadata 子对象，与 `constant.Metadata`
 //!   字段一一对应，能直接被 serde 序列化（包含 sourceIP / sourcePort / destinationIP /
 //!   destinationPort / inboundIP / inboundPort / inboundName / inboundUser / host /
-//!   dnsMode / process / processPath / specialProxy / specialRules / sniffHost。连接 id、
+//!   dnsMode / uid / process / processPath / packageNames / protocol /
+//!   specialProxy / specialRules / sniffHost。连接 id、
 //!   chains、providerChains、rule、rulePayload 是 tracker 顶层字段；内部索引字段
 //!   不会泄漏到 metadata 子对象。
 //! * [`ConnectionEntry`] —— 一条活跃连接的完整状态：immutable `Arc<ConnectionMeta>` +
@@ -99,13 +100,19 @@ pub struct ConnectionMeta {
     pub rematch_name: CompactString,
     pub host: CompactString,
     pub dns_mode: CompactString,
-    pub uid: u32,
+    /// `None` means unavailable. A real Unix root uid is represented as
+    /// `Some(0)`, avoiding the old ambiguous placeholder zero.
+    pub uid: Option<u32>,
     pub process: CompactString,
     pub process_path: CompactString,
+    pub package_names: StringList,
+    pub protocol: CompactString,
     pub special_proxy: CompactString,
     pub special_rules: CompactString,
     pub remote_destination: CompactString,
-    pub dscp: u8,
+    /// DSCP is optional because most listener APIs do not expose the received
+    /// traffic class. `Some(0)` is a real best-effort DSCP, not "unknown".
+    pub dscp: Option<u8>,
     pub sniff_host: CompactString,
     #[serde(skip)]
     pub uuid: CompactString,
@@ -307,6 +314,16 @@ pub struct ConnectionInfo {
     /// 字符串，与 dashboard 期望一致。
     #[serde(rename = "smartBlock", serialize_with = "serialize_smart_block")]
     pub smart_block: Arc<AtomicU8>,
+}
+
+impl ConnectionInfo {
+    pub fn smart_block_state(&self) -> &'static str {
+        if self.smart_block.load(Ordering::Relaxed) == SMART_BLOCK_BLOCKED {
+            "blocked"
+        } else {
+            ""
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -654,7 +671,7 @@ impl ConnectionTable {
                     } else {
                         e.meta.destination_ip.to_string()
                     },
-                    destination_port: e.meta.destination_port.parse::<u16>().unwrap_or(0),
+                    destination_port: e.meta.destination_port.to_string(),
                     age_secs: now_secs.saturating_sub(e.started_at),
                     bytes_up: e.bytes_up.load(Ordering::Relaxed),
                     bytes_down: e.bytes_down.load(Ordering::Relaxed),
@@ -1007,7 +1024,7 @@ impl ConnectionAccounting {
 }
 
 fn traffic_labels(meta: &ConnectionMeta) -> Vec<(String, String)> {
-    let mut labels = Vec::with_capacity(18);
+    let mut labels = Vec::with_capacity(24);
     let mut push = |dimension: &str, value: &str| {
         let value = value.trim();
         if !value.is_empty() {
@@ -1038,6 +1055,10 @@ fn traffic_labels(meta: &ConnectionMeta) -> Vec<(String, String)> {
         meta.process_path.as_str()
     };
     push("process", process);
+    for package in &meta.package_names {
+        push("package", package.as_str());
+    }
+    push("protocol", meta.protocol.as_str());
 
     let destination = if !meta.host.is_empty() {
         meta.host.as_str()
@@ -1055,8 +1076,8 @@ fn traffic_labels(meta: &ConnectionMeta) -> Vec<(String, String)> {
     if let Some(geo) = &meta.destination_geoip {
         push("destination_geoip", &geo.join("/"));
     }
-    if meta.uid != 0 {
-        push("uid", &meta.uid.to_string());
+    if let Some(uid) = meta.uid {
+        push("uid", &uid.to_string());
     }
     labels
 }
@@ -1099,7 +1120,7 @@ pub struct LongLivedEntry {
     pub id: u64,
     pub process: String,
     pub host: String,
-    pub destination_port: u16,
+    pub destination_port: String,
     pub age_secs: u64,
     pub bytes_up: u64,
     pub bytes_down: u64,
@@ -1238,7 +1259,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_json_matches_mihomo_contract() {
+    fn metadata_json_contains_mihomo_contract_and_extensions() {
         let mut meta = ConnectionMeta {
             kind: "VLESS+XUDP".into(),
             host: "example.com".into(),
@@ -1273,6 +1294,8 @@ mod tests {
             "uid",
             "process",
             "processPath",
+            "packageNames",
+            "protocol",
             "specialProxy",
             "specialRules",
             "remoteDestination",
@@ -1284,6 +1307,24 @@ mod tests {
         assert_eq!(object["remoteDestination"], "example.com");
         assert!(object["sourceGeoIP"].is_null());
         assert!(object["destinationGeoIP"].is_null());
+        assert!(object["uid"].is_null());
+        assert!(object["dscp"].is_null());
+    }
+
+    #[test]
+    fn metadata_distinguishes_unknown_from_real_zero_values() {
+        let unknown = serde_json::to_value(ConnectionMeta::default()).unwrap();
+        assert!(unknown["uid"].is_null());
+        assert!(unknown["dscp"].is_null());
+
+        let known_zero = serde_json::to_value(ConnectionMeta {
+            uid: Some(0),
+            dscp: Some(0),
+            ..ConnectionMeta::default()
+        })
+        .unwrap();
+        assert_eq!(known_zero["uid"], 0);
+        assert_eq!(known_zero["dscp"], 0);
     }
 
     #[test]

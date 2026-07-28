@@ -269,11 +269,14 @@ fn recover(record: &RecoveryRecord) -> Result<(), CaptureError> {
     }
 
     if matches!(record.mode, RecoveryMode::Legacy | RecoveryMode::Tproxy) {
-        crate::linux_netlink::remove_tproxy_policy(
-            true,
-            crate::tproxy_rules::TPROXY_FWMARK,
-            crate::tproxy_rules::TPROXY_ROUTE_TABLE,
-        );
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            crate::linux_netlink::remove_tproxy_policy(
+                true,
+                crate::tproxy_rules::TPROXY_FWMARK,
+                crate::tproxy_rules::TPROXY_ROUTE_TABLE,
+            );
+        }
     }
     if matches!(record.mode, RecoveryMode::Legacy | RecoveryMode::Tun) {
         delete_tun(&record.interface_name);

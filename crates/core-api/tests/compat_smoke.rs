@@ -843,7 +843,19 @@ async fn connections_snapshot_uses_connection_manager() {
     let guard = runtime.connections.open(ConnectionMeta {
         network: "tcp".into(),
         kind: "HTTP".into(),
+        source_ip: "192.0.2.10".into(),
+        source_port: "51000".into(),
         host: "example.com".into(),
+        destination_ip: "203.0.113.20".into(),
+        destination_port: "443".into(),
+        inbound_ip: "127.0.0.1".into(),
+        inbound_port: "7890".into(),
+        inbound_name: "mixed-in".into(),
+        uid: Some(1000),
+        process: "browser".into(),
+        process_path: "/usr/bin/browser".into(),
+        package_names: core_observe::string_list_from(["com.example.browser"]),
+        protocol: "http".into(),
         destination_ip_asn: "AS15169".into(),
         smart_target: "example.com".into(),
         chains: core_observe::string_list_from(["main", "NodeA"]),
@@ -875,12 +887,27 @@ async fn connections_snapshot_uses_connection_manager() {
     assert!(conn["id"].as_str().is_some());
     assert!(conn["metadata"].get("id").is_none());
     assert!(conn["metadata"].get("smartTarget").is_none());
+    assert_eq!(conn["metadata"]["host"], "example.com");
+    assert_eq!(conn["metadata"]["destinationIP"], "203.0.113.20");
+    assert_eq!(conn["metadata"]["destinationPort"], "443");
+    assert_eq!(conn["metadata"]["sourceIP"], "192.0.2.10");
+    assert_eq!(conn["metadata"]["sourcePort"], "51000");
+    assert_eq!(conn["metadata"]["inboundName"], "mixed-in");
+    assert_eq!(conn["metadata"]["uid"], 1000);
+    assert_eq!(conn["metadata"]["packageNames"][0], "com.example.browser");
+    assert_eq!(conn["metadata"]["protocol"], "http");
     assert_eq!(conn["metadata"]["destinationIPASN"], "AS15169");
     assert!(conn["metadata"]["sourceGeoIP"].is_null());
     assert!(conn["metadata"]["destinationGeoIP"].is_null());
     assert!(conn.get("providerChains").is_some());
-    assert!(conn.get("maxUploadRate").is_none());
-    assert!(conn.get("maxDownloadRate").is_none());
+    assert!(conn["metadata"]["dscp"].is_null());
+    assert!(conn["maxUploadRate"].as_u64().is_some_and(|rate| rate > 0));
+    assert!(
+        conn["maxDownloadRate"]
+            .as_u64()
+            .is_some_and(|rate| rate > 0)
+    );
+    assert_eq!(conn["smartBlock"], "");
 
     drop(guard);
 }

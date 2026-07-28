@@ -182,10 +182,9 @@ impl CapturePlan {
                 mtu.get()
             )));
         }
-        if kind != EngineKind::Tun && c.mtu.is_some() {
+        if c.on && kind != EngineKind::Tun && c.mtu.is_some() {
             return Err(CaptureError::DeviceFailed(
-                "capture.mtu 只适用于 virtual_nic/TUN；TPROXY、REDIRECT 和关闭状态不创建 TUN 设备"
-                    .into(),
+                "capture.mtu 只适用于 virtual_nic/TUN；TPROXY 和 REDIRECT 不创建 TUN 设备".into(),
             ));
         }
 
@@ -783,6 +782,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn mtu_is_rejected_when_no_tun_device_is_created() {
         let mut capture = base();

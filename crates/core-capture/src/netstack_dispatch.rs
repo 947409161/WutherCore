@@ -351,19 +351,36 @@ async fn handle_netstack_tcp(
 
     let mut initial_payload = Vec::new();
     let target_session = match inbound.resolve_session("tcp", source, original_dst, None) {
-        Ok(s) => s,
-        Err(TunDropReason::FakeDnsMissing) => {
+        Ok(session) if session.target.host.parse::<std::net::IpAddr>().is_ok() => {
             use tokio::io::AsyncReadExt;
-            let mut buf = vec![0u8; 8192];
+            let mut buf = vec![0u8; 16 * 1024];
             let sniff_host =
                 match tokio::time::timeout(Duration::from_millis(200), stream.read(&mut buf)).await
                 {
                     Ok(Ok(n)) if n > 0 => {
                         initial_payload = buf[..n].to_vec();
-                        match core_route::sniff_tcp(&initial_payload) {
-                            core_route::L7Proto::Sni(host) if !host.is_empty() => Some(host),
-                            _ => None,
-                        }
+                        core_route::sniff_tcp_host(&initial_payload)
+                    }
+                    _ => None,
+                };
+            if let Some(host) = sniff_host.as_deref() {
+                inbound
+                    .resolve_session("tcp", source, original_dst, Some(host))
+                    .unwrap_or(session)
+            } else {
+                session
+            }
+        }
+        Ok(s) => s,
+        Err(TunDropReason::FakeDnsMissing) => {
+            use tokio::io::AsyncReadExt;
+            let mut buf = vec![0u8; 16 * 1024];
+            let sniff_host =
+                match tokio::time::timeout(Duration::from_millis(200), stream.read(&mut buf)).await
+                {
+                    Ok(Ok(n)) if n > 0 => {
+                        initial_payload = buf[..n].to_vec();
+                        core_route::sniff_tcp_host(&initial_payload)
                     }
                     _ => None,
                 };
@@ -381,7 +398,10 @@ async fn handle_netstack_tcp(
         }
     };
 
-    let metadata = build_inbound_metadata(&target_session, Some(original_dst));
+    let mut metadata = build_inbound_metadata(&target_session);
+    if !initial_payload.is_empty() {
+        metadata = metadata.with_protocol(Some(core_route::sniff_tcp(&initial_payload)));
+    }
     let prepared = match handler.prepare_tcp(metadata).await {
         Ok(p) => p,
         Err(e) => {
@@ -413,6 +433,7 @@ async fn handle_netstack_tcp(
             warn!(target: "capture::netstack", error = %e, "replay initial payload failed");
             return;
         }
+        handler.record_upload(&guard, initial_payload.len() as u64);
     }
 
     let started = std::time::Instant::now();

@@ -37,10 +37,7 @@ use crate::{
 /// `bind_outbound_socket` 在 socket 层绕过 TUN，根本不会进 listener
 /// 路径，因此 `is_inner` 字段当前没有生产 set 点，留作未来"显式 tag
 /// 的内部 RPC 走 tunnel"扩展点。
-pub fn build_inbound_metadata(
-    session: &TunSession,
-    inbound_addr: Option<SocketAddr>,
-) -> InboundMetadata {
+pub fn build_inbound_metadata(session: &TunSession) -> InboundMetadata {
     let network = match session.network {
         "udp" => NetworkKind::Udp,
         _ => NetworkKind::Tcp,
@@ -51,7 +48,10 @@ pub fn build_inbound_metadata(
         "tun",
         "Tun",
         session.source,
-        inbound_addr,
+        // A TUN flow has no userspace listener endpoint. The NAT listener
+        // address used by a system stack is an implementation detail and must
+        // not be reported as Clash inboundIP/inboundPort.
+        None,
         session.target.host.clone(),
         session.target.original_dst_port,
     )
@@ -459,25 +459,17 @@ impl TunInbound {
     pub fn tcp_meta(
         &self,
         session: &TunSession,
-        inbound: SocketAddr,
+        _internal_listener: SocketAddr,
         outbound: &TunOutboundMeta,
     ) -> ConnectionMeta {
-        self.base_meta(session, outbound, inbound)
+        self.base_meta(session, outbound)
     }
 
     pub fn udp_meta(&self, session: &TunSession, outbound: &TunOutboundMeta) -> ConnectionMeta {
-        let mut meta = self.base_meta(session, outbound, session.original_dst);
-        meta.inbound_ip.clear();
-        meta.inbound_port.clear();
-        meta
+        self.base_meta(session, outbound)
     }
 
-    fn base_meta(
-        &self,
-        session: &TunSession,
-        outbound: &TunOutboundMeta,
-        inbound: SocketAddr,
-    ) -> ConnectionMeta {
+    fn base_meta(&self, session: &TunSession, outbound: &TunOutboundMeta) -> ConnectionMeta {
         ConnectionMeta {
             network: session.network.into(),
             kind: "Tun".into(),
@@ -485,8 +477,6 @@ impl TunInbound {
             source_port: session.source.port().to_compact_string(),
             destination_ip: session.original_dst.ip().to_compact_string(),
             destination_port: session.original_dst.port().to_compact_string(),
-            inbound_ip: inbound.ip().to_compact_string(),
-            inbound_port: inbound.port().to_compact_string(),
             inbound_name: "tun".into(),
             host: session.target.host.as_str().into(),
             dns_mode: session.target.dns_mode.as_str().into(),
@@ -803,6 +793,11 @@ mod tests {
         assert_eq!(session.original_dst, original_dst);
         assert_eq!(session.target.dns_mode.as_str(), "fake-ip");
         assert_eq!(session.bypass, None);
+
+        let metadata = build_inbound_metadata(&session);
+        assert_eq!(metadata.host, "example.com");
+        assert_eq!(metadata.destination_ip, Some(fake));
+        assert_eq!(metadata.inbound, None);
     }
 
     #[test]
@@ -923,6 +918,8 @@ mod tests {
         assert_eq!(meta.kind, "Tun");
         assert_eq!(meta.source_ip, "10.0.0.2");
         assert_eq!(meta.destination_ip, "8.8.8.8");
+        assert!(meta.inbound_ip.is_empty());
+        assert!(meta.inbound_port.is_empty());
         assert_eq!(meta.host, "www.google.com");
         assert_eq!(meta.sniff_host, "www.google.com");
         assert_eq!(meta.chains.as_slice(), ["Proxy", "NodeA"]);

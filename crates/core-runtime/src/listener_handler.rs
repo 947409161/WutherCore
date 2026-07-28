@@ -49,7 +49,11 @@ pub struct InboundMetadata {
     /// Android package names associated with the owning UID. Shared UIDs may
     /// legitimately map to more than one package.
     pub package_names: Vec<String>,
-    pub uid: u32,
+    /// Owning user id. `None` means the platform lookup did not return a UID;
+    /// uid 0 remains a valid, distinguishable value for root.
+    pub uid: Option<u32>,
+    /// Received DSCP/traffic-class value when the listener API exposes it.
+    pub dscp: Option<u8>,
     pub inbound_user: String,
     pub protocol: Option<L7Proto>,
     pub force_direct: bool,
@@ -125,7 +129,8 @@ impl InboundMetadata {
             process: None,
             process_path: None,
             package_names: Vec::new(),
-            uid: 0,
+            uid: None,
+            dscp: None,
             inbound_user: String::new(),
             protocol: None,
             force_direct: false,
@@ -162,6 +167,16 @@ impl InboundMetadata {
 
     pub fn with_package_names(mut self, package_names: Vec<String>) -> Self {
         self.package_names = package_names;
+        self
+    }
+
+    pub fn with_uid(mut self, uid: Option<u32>) -> Self {
+        self.uid = uid;
+        self
+    }
+
+    pub fn with_dscp(mut self, dscp: Option<u8>) -> Self {
+        self.dscp = dscp;
         self
     }
 
@@ -309,6 +324,7 @@ impl ListenerHandler {
 
     pub async fn prepare_tcp(&self, metadata: InboundMetadata) -> io::Result<PreparedTcp> {
         self.reject_loopback_self_capture(&metadata)?;
+        let metadata = self.enrich_destination_host(metadata);
         let metadata = self.enrich_with_process(metadata, NetworkKind::Tcp).await;
         let result = self.dial_tcp(&metadata).await?;
         // 内部组件（DNS resolver / ruleset fetcher / URLTest 等）发起的连接
@@ -325,6 +341,7 @@ impl ListenerHandler {
 
     pub async fn prepare_udp(&self, metadata: InboundMetadata) -> io::Result<PreparedUdpPacket> {
         self.reject_loopback_self_capture(&metadata)?;
+        let metadata = self.enrich_destination_host(metadata);
         let metadata = self.enrich_with_process(metadata, NetworkKind::Udp).await;
         let target_host = metadata.target_host();
         let target_port = metadata.destination_port;
@@ -495,7 +512,50 @@ impl ListenerHandler {
             metadata.process = Some(info.name);
             metadata.process_path = Some(info.path);
             metadata.package_names = info.package_names;
-            metadata.uid = info.uid;
+            metadata.uid = if cfg!(target_os = "windows") {
+                // The Windows process backend cannot provide a Unix UID; its
+                // legacy zero was a placeholder rather than a real identity.
+                None
+            } else {
+                Some(info.uid)
+            };
+        }
+        metadata
+    }
+
+    /// Recover a domain from the resolver's fake-IP/redir-host mapping before
+    /// routing and before the immutable connection snapshot is created.
+    ///
+    /// Capture paths normally do this earlier with their own shared fake pool,
+    /// while SOCKS/HTTP/TPROXY and embedders can arrive here with only an IP.
+    /// Keeping this final enrichment point prevents those paths from producing
+    /// an IP-only connection row when DNS already knows the hostname.
+    fn enrich_destination_host(&self, mut metadata: InboundMetadata) -> InboundMetadata {
+        if !metadata.sniff_host.trim().is_empty() || metadata.host.trim().parse::<IpAddr>().is_err()
+        {
+            return metadata;
+        }
+        let Some(ip) = metadata
+            .destination_ip
+            .or_else(|| metadata.host.trim().parse::<IpAddr>().ok())
+        else {
+            return metadata;
+        };
+        let Some(host) = self.runtime.resolver.find_host_by_ip(ip) else {
+            return metadata;
+        };
+        metadata.host = host;
+        if metadata.dns_mode == "normal" {
+            metadata.dns_mode = if self
+                .runtime
+                .resolver
+                .fake_pool()
+                .is_some_and(|pool| pool.contains(ip))
+            {
+                "fake-ip".into()
+            } else {
+                "redir-host".into()
+            };
         }
         metadata
     }
@@ -577,11 +637,19 @@ fn tcp_connection_meta(metadata: &InboundMetadata, result: &DialResult) -> Conne
         inbound_port,
         inbound_name: metadata.inbound_name.as_str().into(),
         inbound_user: metadata.inbound_user.as_str().into(),
-        host: metadata.target_host().into(),
+        host: metadata.route_host().into(),
         dns_mode: metadata.dns_mode.as_str().into(),
         process: metadata.process.as_deref().unwrap_or_default().into(),
         process_path: metadata.process_path.as_deref().unwrap_or_default().into(),
+        package_names: core_observe::string_list_from(&metadata.package_names),
         uid: metadata.uid,
+        dscp: metadata.dscp,
+        protocol: metadata
+            .protocol
+            .as_ref()
+            .map(core_route::L7Proto::name)
+            .unwrap_or_default()
+            .into(),
         sniff_host: metadata.sniff_host.as_str().into(),
         remote_destination: result.remote_destination.as_str().into(),
         smart_target: result.smart_target.as_str().into(),
@@ -606,11 +674,19 @@ fn udp_connection_meta(metadata: &InboundMetadata, result: &UdpDialResult) -> Co
         inbound_port,
         inbound_name: metadata.inbound_name.as_str().into(),
         inbound_user: metadata.inbound_user.as_str().into(),
-        host: metadata.target_host().into(),
+        host: metadata.route_host().into(),
         dns_mode: metadata.dns_mode.as_str().into(),
         process: metadata.process.as_deref().unwrap_or_default().into(),
         process_path: metadata.process_path.as_deref().unwrap_or_default().into(),
+        package_names: core_observe::string_list_from(&metadata.package_names),
         uid: metadata.uid,
+        dscp: metadata.dscp,
+        protocol: metadata
+            .protocol
+            .as_ref()
+            .map(core_route::L7Proto::name)
+            .unwrap_or_default()
+            .into(),
         sniff_host: metadata.sniff_host.as_str().into(),
         remote_destination: result.remote_destination.as_str().into(),
         smart_target: result.smart_target.as_str().into(),
@@ -647,6 +723,8 @@ fn destination_ip(metadata: &InboundMetadata) -> compact_str::CompactString {
 
 #[cfg(test)]
 mod tests {
+    use std::{sync::Arc, time::Duration};
+
     use super::*;
 
     #[test]
@@ -668,5 +746,63 @@ mod tests {
             Some("/usr/bin/example-client")
         );
         assert_eq!(flow.ruleset.package_names, ["com.example.client"]);
+    }
+
+    #[test]
+    fn resolver_mapping_recovers_domain_without_losing_original_ip() {
+        let plan = core_config::loader::load_from_str(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+route:
+  final: direct
+"#,
+        )
+        .unwrap();
+        let runtime = Arc::new(Runtime::build(plan).unwrap());
+        let destination_ip: IpAddr = "203.0.113.9".parse().unwrap();
+        runtime.resolver.mapping().insert(
+            destination_ip,
+            "Api.Example.COM",
+            Duration::from_secs(60),
+        );
+        let handler = ListenerHandler::new(runtime);
+        let metadata = InboundMetadata::tcp(
+            "tproxy",
+            "TProxy",
+            "192.0.2.10:51000".parse().unwrap(),
+            "127.0.0.1:7890".parse().unwrap(),
+            destination_ip.to_string(),
+            443,
+        );
+
+        let enriched = handler.enrich_destination_host(metadata);
+
+        assert_eq!(enriched.host, "Api.Example.COM");
+        assert_eq!(enriched.destination_ip, Some(destination_ip));
+        assert_eq!(enriched.dns_mode, "redir-host");
+    }
+
+    #[test]
+    fn sniffed_domain_is_used_for_connection_host_and_routing() {
+        let metadata = InboundMetadata::tcp(
+            "tun",
+            "Tun",
+            "192.0.2.10:51000".parse().unwrap(),
+            "127.0.0.1:7890".parse().unwrap(),
+            "203.0.113.9",
+            443,
+        )
+        .with_sniff_host("api.example.com")
+        .with_protocol(Some(L7Proto::Sni("api.example.com".into())));
+
+        assert_eq!(metadata.route_host(), "api.example.com");
+        assert_eq!(metadata.flow_context().host, "api.example.com");
+        assert_eq!(
+            metadata.destination_ip,
+            Some("203.0.113.9".parse().unwrap())
+        );
     }
 }

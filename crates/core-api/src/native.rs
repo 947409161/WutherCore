@@ -194,6 +194,7 @@ async fn list_conns(State(s): State<NativeState>) -> impl IntoResponse {
                 "rulePayload": conn.rule_payload,
                 "maxUploadRate": conn.max_upload_rate,
                 "maxDownloadRate": conn.max_download_rate,
+                "smartBlock": conn.smart_block_state(),
             })
         })
         .collect();

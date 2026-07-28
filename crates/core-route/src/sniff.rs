@@ -115,6 +115,83 @@ pub fn sniff_tcp(buf: &[u8]) -> L7Proto {
     L7Proto::Other
 }
 
+/// Extract the logical destination hostname from the first TCP payload.
+///
+/// TLS ClientHello SNI and HTTP request targets/`Host` headers are supported.
+/// IP literals are deliberately rejected: callers already have the original
+/// destination IP and need this function specifically to recover a domain.
+pub fn sniff_tcp_host(buf: &[u8]) -> Option<String> {
+    if buf.len() >= 6 && buf[0] == 0x16 && buf[1] == 0x03 && buf[2] <= 0x04 {
+        return parse_tls_sni(buf).and_then(normalize_sniffed_host);
+    }
+
+    let header_end = buf
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| position + 4)
+        .unwrap_or(buf.len().min(16 * 1024));
+    let headers = std::str::from_utf8(buf.get(..header_end)?).ok()?;
+    let mut lines = headers.split("\r\n");
+    let request_line = lines.next()?;
+    let mut request_parts = request_line.split_ascii_whitespace();
+    let method = request_parts.next()?;
+    let target = request_parts.next().unwrap_or_default();
+
+    if method.eq_ignore_ascii_case("CONNECT") {
+        if let Some(host) = normalize_sniffed_host(target.to_string()) {
+            return Some(host);
+        }
+    } else if let Some(authority) = http_absolute_form_authority(target) {
+        if let Some(host) = normalize_sniffed_host(authority.to_string()) {
+            return Some(host);
+        }
+    }
+
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("host") {
+            return normalize_sniffed_host(value.trim().to_string());
+        }
+    }
+    None
+}
+
+fn http_absolute_form_authority(target: &str) -> Option<&str> {
+    let (_, remainder) = target.split_once("://")?;
+    Some(remainder.split('/').next().unwrap_or(remainder))
+}
+
+fn normalize_sniffed_host(value: String) -> Option<String> {
+    let value = value.trim();
+    let host = if let Some(bracketed) = value.strip_prefix('[') {
+        let end = bracketed.find(']')?;
+        &bracketed[..end]
+    } else if let Some((candidate, port)) = value.rsplit_once(':') {
+        if port.parse::<u16>().is_ok() {
+            candidate
+        } else {
+            value
+        }
+    } else {
+        value
+    };
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty()
+        || host.len() > 253
+        || host.parse::<std::net::IpAddr>().is_ok()
+        || host.bytes().any(|byte| {
+            byte.is_ascii_control()
+                || byte.is_ascii_whitespace()
+                || !(byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+        })
+    {
+        return None;
+    }
+    Some(host)
+}
+
 /// 从 TLS ClientHello 提取 SNI 域名。
 ///
 /// TLS Record:
@@ -316,6 +393,38 @@ mod tests {
         ] {
             assert_eq!(sniff_tcp(m.as_bytes()), L7Proto::Http);
         }
+    }
+
+    #[test]
+    fn extracts_tls_sni_host() {
+        let buf = tls_clienthello_sni("API.OpenAI.COM");
+        assert_eq!(sniff_tcp_host(&buf).as_deref(), Some("api.openai.com"));
+    }
+
+    #[test]
+    fn extracts_http_host_and_removes_port() {
+        let request = b"GET /v1 HTTP/1.1\r\nHost: Example.COM:8080\r\nConnection: close\r\n\r\n";
+        assert_eq!(sniff_tcp_host(request).as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn extracts_connect_and_absolute_form_hosts() {
+        assert_eq!(
+            sniff_tcp_host(b"CONNECT proxy.example:443 HTTP/1.1\r\n\r\n").as_deref(),
+            Some("proxy.example")
+        );
+        assert_eq!(
+            sniff_tcp_host(b"GET http://cdn.example/path HTTP/1.1\r\n\r\n").as_deref(),
+            Some("cdn.example")
+        );
+    }
+
+    #[test]
+    fn does_not_report_ip_literal_as_a_domain() {
+        assert_eq!(
+            sniff_tcp_host(b"GET / HTTP/1.1\r\nHost: 192.0.2.1:80\r\n\r\n"),
+            None
+        );
     }
 
     #[test]

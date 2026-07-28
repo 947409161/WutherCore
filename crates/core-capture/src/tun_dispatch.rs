@@ -542,7 +542,7 @@ async fn read_initial_payload_for_sniff(
     notify: Arc<Notify>,
 ) -> Vec<u8> {
     let mut stream = crate::stack::SmolStream::new(handle, stack, notify);
-    let mut buf = vec![0u8; 8192];
+    let mut buf = vec![0u8; 16 * 1024];
     match tokio::time::timeout(Duration::from_millis(200), stream.read(&mut buf)).await {
         Ok(Ok(n)) if n > 0 => {
             buf.truncate(n);
@@ -553,10 +553,7 @@ async fn read_initial_payload_for_sniff(
 }
 
 fn sniff_host_from_payload(payload: &[u8]) -> Option<String> {
-    match core_route::sniff_tcp(payload) {
-        core_route::L7Proto::Sni(host) if !host.is_empty() => Some(host),
-        _ => None,
-    }
+    core_route::sniff_tcp_host(payload)
 }
 
 fn hex_head(buf: &[u8], max: usize) -> String {
@@ -586,13 +583,31 @@ async fn run_accept_consumer(
             _ = &mut stop_rx => break,
             ev = accept_rx.recv() => {
                 let Some(ev) = ev else { break };
-                // ★ Fake-IP 反查（mihomo `tunnel.preHandleMetadata` 等价）：
-                //   把 198.18.x.y 反查回 "www.bilibili.com"，再喂给 outbound。
-                //   若 fake-IP 记录缺失，按 mihomo 的 TCP sniff fallback 尝试从
-                //   首段 TLS ClientHello 提取 SNI，避免缓存过期时直接断流。
+                // Prefer fake-IP/redir-host reverse mapping. When the logical
+                // target is still an IP, inspect the first client payload for
+                // TLS SNI or HTTP Host and keep the original destination IP in
+                // metadata.destinationIP.
                 let mut initial_payload = Vec::new();
                 let mut sniff_host = None;
                 let target_session = match inbound.resolve_session("tcp", ev.remote, ev.original_dst, None) {
+                    Ok(session) if session.target.host.parse::<std::net::IpAddr>().is_ok() => {
+                        initial_payload = read_initial_payload_for_sniff(
+                            ev.handle,
+                            stack.clone(),
+                            notify.clone(),
+                        ).await;
+                        sniff_host = sniff_host_from_payload(&initial_payload);
+                        if let Some(host) = sniff_host.as_deref() {
+                            inbound.resolve_session(
+                                "tcp",
+                                ev.remote,
+                                ev.original_dst,
+                                Some(host),
+                            ).unwrap_or(session)
+                        } else {
+                            session
+                        }
+                    }
                     Ok(session) => session,
                     Err(TunDropReason::FakeDnsMissing) => {
                         initial_payload = read_initial_payload_for_sniff(
@@ -675,9 +690,12 @@ async fn run_accept_consumer(
                     }
                     continue;
                 }
-                let prepared = handler
-                    .prepare_tcp(build_inbound_metadata(&target_session, Some(ev.local)))
-                    .await;
+                let mut metadata = build_inbound_metadata(&target_session);
+                if !initial_payload.is_empty() {
+                    metadata =
+                        metadata.with_protocol(Some(core_route::sniff_tcp(&initial_payload)));
+                }
+                let prepared = handler.prepare_tcp(metadata).await;
                 match prepared {
                     Ok(prepared) => {
                         let core_runtime::PreparedTcp { result, guard } = prepared;

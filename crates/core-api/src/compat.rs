@@ -451,6 +451,9 @@ pub(crate) fn build_connections_value(runtime: &Arc<Runtime>) -> Value {
                 "providerChains": conn.provider_chains,
                 "rule": conn.rule,
                 "rulePayload": conn.rule_payload,
+                "maxUploadRate": conn.max_upload_rate,
+                "maxDownloadRate": conn.max_download_rate,
+                "smartBlock": conn.smart_block_state(),
             })
         })
         .collect();

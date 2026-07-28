@@ -48,6 +48,7 @@ use smoltcp::{
     },
 };
 use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::oneshot,
 };
@@ -55,7 +56,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     tcp_nat::{NatSession, TcpNat},
-    tun_inbound::{TunInbound, build_inbound_metadata},
+    tun_inbound::{TunDropReason, TunInbound, build_inbound_metadata},
 };
 
 /// 包处理结果。
@@ -1020,11 +1021,52 @@ async fn handle_accepted_conn(
 ) {
     let source = session.source;
     let original_dst = session.destination;
-    let inbound_addr = conn.local_addr().ok();
 
-    // 1) fake-IP 反查（沿用 TunInbound::resolve_session 语义；后续可加 SNI sniff fallback）
+    // 1) Recover the DNS mapping first. If only an IP remains, consume one
+    // client payload and recover TLS SNI or HTTP Host before routing.
+    let mut initial_payload = Vec::new();
     let target_session = match inbound.resolve_session("tcp", source, original_dst, None) {
-        Ok(s) => s,
+        Ok(session) if session.target.host.parse::<std::net::IpAddr>().is_ok() => {
+            initial_payload = read_tcp_initial_payload_for_sniff(&mut conn).await;
+            if let Some(host) = core_route::sniff_tcp_host(&initial_payload) {
+                inbound
+                    .resolve_session("tcp", source, original_dst, Some(&host))
+                    .unwrap_or(session)
+            } else {
+                session
+            }
+        }
+        Ok(session) => session,
+        Err(TunDropReason::FakeDnsMissing) => {
+            initial_payload = read_tcp_initial_payload_for_sniff(&mut conn).await;
+            let Some(host) = core_route::sniff_tcp_host(&initial_payload) else {
+                debug!(
+                    target: "capture::system",
+                    family,
+                    nat_port,
+                    dst = %original_dst,
+                    "fake DNS mapping missing and TCP hostname sniff did not recover a domain"
+                );
+                stack.tcp_nat.remove_by_port(nat_port);
+                return;
+            };
+            match inbound.resolve_session("tcp", source, original_dst, Some(&host)) {
+                Ok(session) => session,
+                Err(reason) => {
+                    debug!(
+                        target: "capture::system",
+                        family,
+                        nat_port,
+                        src = %source,
+                        dst = %original_dst,
+                        ?reason,
+                        "resolve session failed after TCP hostname sniff"
+                    );
+                    stack.tcp_nat.remove_by_port(nat_port);
+                    return;
+                }
+            }
+        }
         Err(reason) => {
             debug!(
                 target: "capture::system",
@@ -1066,7 +1108,10 @@ async fn handle_accepted_conn(
     }
 
     // 2) 走统一 ListenerHandler 路由 + 拨号
-    let metadata = build_inbound_metadata(&target_session, inbound_addr);
+    let mut metadata = build_inbound_metadata(&target_session);
+    if !initial_payload.is_empty() {
+        metadata = metadata.with_protocol(Some(core_route::sniff_tcp(&initial_payload)));
+    }
     let prepared = match handler.prepare_tcp(metadata).await {
         Ok(p) => p,
         Err(e) => {
@@ -1083,7 +1128,7 @@ async fn handle_accepted_conn(
             return;
         }
     };
-    let PreparedTcp { result, guard } = prepared;
+    let PreparedTcp { mut result, guard } = prepared;
     let conn_id = guard.id;
     let src_label = source.to_string();
     let host = &target_session.target.host;
@@ -1099,6 +1144,21 @@ async fn handle_accepted_conn(
         info!(target: "capture::traffic", "[TCP] #{conn_id} {src_label} --> {host}:{port} match {} using {proxy}", result.rule);
     } else {
         info!(target: "capture::traffic", "[TCP] #{conn_id} {src_label} --> {host}:{port} match {}({}) using {proxy}", result.rule, result.rule_payload);
+    }
+
+    if !initial_payload.is_empty() {
+        if let Err(error) = result.stream.write_all(&initial_payload).await {
+            warn!(
+                target: "capture::system",
+                family,
+                nat_port,
+                error = %error,
+                "replay sniffed TCP payload failed"
+            );
+            stack.tcp_nat.remove_by_port(nat_port);
+            return;
+        }
+        handler.record_upload(&guard, initial_payload.len() as u64);
     }
 
     // 3) 双向 splice —— OS TcpStream + outbound stream，全程走 mihomo 流量记账。
@@ -1128,6 +1188,17 @@ async fn handle_accepted_conn(
     }
     drop(guard);
     stack.tcp_nat.remove_by_port(nat_port);
+}
+
+async fn read_tcp_initial_payload_for_sniff(conn: &mut TcpStream) -> Vec<u8> {
+    let mut payload = vec![0u8; 16 * 1024];
+    match tokio::time::timeout(Duration::from_millis(200), conn.read(&mut payload)).await {
+        Ok(Ok(size)) if size > 0 => {
+            payload.truncate(size);
+            payload
+        }
+        _ => Vec::new(),
+    }
 }
 
 #[cfg(test)]
