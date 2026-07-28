@@ -1992,6 +1992,47 @@ route:
     }
 
     #[test]
+    fn provider_reality_link_with_mihomo_tls_metadata_activates_atomically() {
+        if !core_outbound::registry::protocol_component_enabled(
+            &core_config::node_uri::NodeProtocol::Vless,
+        ) {
+            return;
+        }
+        let plan = load_plan(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+feeds:
+  primary: "https://example.invalid/subscription"
+groups:
+  main:
+    choose: manual
+    use: [primary]
+route:
+  preset: global
+  final: main
+"#,
+        );
+        let runtime = Runtime::build(plan).unwrap();
+        let node = core_config::node_uri::parse_uri(
+            "vless://11111111-1111-1111-1111-111111111111@192.0.2.10:443?security=reality&sni=cover.example&fp=chrome&pbk=BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc&sid=0123456789abcdef&alpn=h2%2Chttp%2F1.1&allowInsecure=1&skip-cert-verify=true&ech=true&echConfigList=ignored#%5B%E8%AE%A2%E9%98%85%5D%20HK-D-1-0.2x",
+        )
+        .unwrap();
+
+        runtime.apply_feed_nodes("primary", vec![node]).unwrap();
+
+        assert_eq!(runtime.node_revision(), 1);
+        assert_eq!(runtime.nodes_in_provider("primary").len(), 1);
+        assert!(
+            runtime
+                .outbound_names()
+                .contains(&"[订阅] HK-D-1-0.2x".to_string())
+        );
+    }
+
+    #[test]
     fn feed_updates_expand_all_loaded_providers_without_erasing_each_other() {
         let plan = load_plan(
             r#"

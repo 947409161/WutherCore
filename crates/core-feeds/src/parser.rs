@@ -4,7 +4,9 @@ use base64::Engine;
 use core_config::{
     compile_node_spec,
     model::{FeedDetail, NodeSpec},
-    node_uri::{NodeProtocol, ParsedNode, parse_uri, validate_young_node},
+    node_uri::{
+        NodeProtocol, ParsedNode, parse_uri, reality_settings_from_params, validate_young_node,
+    },
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -855,6 +857,58 @@ fn structured_proxy_to_node(
         "ech-",
     );
 
+    // Mihomo treats `tls: true` as the carrier switch and lets
+    // `reality-opts` select the REALITY handshake.  The ordinary TLS-looking
+    // metadata remains on the proxy object, but `client-fingerprint` and
+    // `servername` belong to REALITY once a public key is present.
+    if matches!(&proto, NodeProtocol::Vless)
+        && let Some(reality_opts) = g("reality-opts").and_then(|value| value.as_mapping().cloned())
+        && let Some(public_key) = reality_opts
+            .get(serde_yaml::Value::String("public-key".into()))
+            .and_then(scalar_to_string)
+            .filter(|value| !value.is_empty())
+    {
+        if !node.tls {
+            debug!(
+                target: "feeds::parser",
+                name = %node.name,
+                "skip Mihomo REALITY node without tls: true"
+            );
+            return None;
+        }
+        let mut reality_params = std::collections::BTreeMap::new();
+        reality_params.insert("public-key".into(), public_key);
+        if let Some(short_id) = reality_opts
+            .get(serde_yaml::Value::String("short-id".into()))
+            .and_then(scalar_to_string)
+        {
+            reality_params.insert("short-id".into(), short_id);
+        }
+        if let Some(fingerprint) = str_g("client-fingerprint")
+            .or_else(|| str_g("client_fingerprint"))
+            .or_else(|| str_g("clientFingerprint"))
+        {
+            reality_params.insert("client-fingerprint".into(), fingerprint);
+        }
+        if let Some(server_name) = node.sni.clone() {
+            reality_params.insert("servername".into(), server_name);
+        }
+        let reality = match reality_settings_from_params(&reality_params, &node.host) {
+            Ok(reality) => reality,
+            Err(error) => {
+                debug!(
+                    target: "feeds::parser",
+                    name = %node.name,
+                    %error,
+                    "skip invalid Mihomo REALITY node"
+                );
+                return None;
+            }
+        };
+        node.params.insert("security".into(), "reality".into());
+        node.reality = Some(reality);
+    }
+
     // 5. ws-opts 嵌套 path / headers（headers 是 map）
     if let Some(ws_opts) = g("ws-opts").and_then(|v| v.as_mapping().cloned()) {
         if let Some(path) = ws_opts
@@ -1340,6 +1394,57 @@ proxies:
             nodes[0].params.get("skip-cert-verify").map(String::as_str),
             Some("1")
         );
+    }
+
+    #[test]
+    fn mihomo_vless_reality_maps_carrier_and_client_fields_without_tls_conflict() {
+        let yaml = r#"
+proxies:
+  - name: HK-Reality
+    type: vless
+    server: 192.0.2.10
+    port: 443
+    uuid: 11111111-1111-1111-1111-111111111111
+    network: tcp
+    tls: true
+    udp: true
+    flow: xtls-rprx-vision
+    servername: cover.example
+    client-fingerprint: firefox
+    skip-cert-verify: true
+    alpn: [h2, http/1.1]
+    ech-opts:
+      enable: true
+      config: ignored-by-reality
+    reality-opts:
+      public-key: BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc
+      short-id: 0123456789abcdef
+"#;
+        let nodes = parse_feed_payload(yaml.as_bytes(), FormatHint::ClashYaml);
+        assert_eq!(nodes.len(), 1);
+        let node = &nodes[0];
+        let reality = node.reality.as_ref().expect("typed REALITY settings");
+        assert!(node.tls);
+        assert_eq!(
+            node.params.get("security").map(String::as_str),
+            Some("reality")
+        );
+        assert_eq!(reality.server_name, "cover.example");
+        assert_eq!(reality.fingerprint, "firefox");
+        assert_eq!(reality.short_id, "0123456789abcdef");
+        assert_eq!(
+            reality.public_key.as_deref(),
+            Some("BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc")
+        );
+        assert_eq!(
+            node.params.get("allowInsecure").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            node.params.get("alpn").map(String::as_str),
+            Some("h2,http/1.1")
+        );
+        assert_eq!(node.params.get("ech-enable").map(String::as_str), Some("1"));
     }
 
     #[test]

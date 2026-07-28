@@ -848,9 +848,7 @@ fn build_vless(node: &ParsedNode) -> Result<SharedOutbound, String> {
             },
         });
     }
-    if ob.reality.is_some() {
-        reject_ordinary_tls_with_reality(node)?;
-    } else {
+    if ob.reality.is_none() {
         let tls_options =
             build_node_tls_options(node, ob.tls, ob.sni.clone(), ob.insecure, ob.alpn.clone())?;
         if ob.tls {
@@ -1325,56 +1323,6 @@ fn build_node_tls_options(
         TlsOptions::from_xray_settings(settings).map_err(|error| error.to_string())?;
     options.insecure = effective_insecure;
     Ok(options)
-}
-
-fn reject_ordinary_tls_with_reality(node: &ParsedNode) -> Result<(), String> {
-    const TLS_ONLY_KEYS: &[&str] = &[
-        "enableSessionResumption",
-        "enable-session-resumption",
-        "enable_session_resumption",
-        "disableSystemRoot",
-        "disable-system-root",
-        "disable_system_root",
-        "minVersion",
-        "min-version",
-        "min_version",
-        "maxVersion",
-        "max-version",
-        "max_version",
-        "cipherSuites",
-        "cipher-suites",
-        "cipher_suites",
-        "curvePreferences",
-        "curve-preferences",
-        "curve_preferences",
-        "pinnedPeerCertSha256",
-        "pinned-peer-cert-sha256",
-        "pinned_peer_cert_sha256",
-        "verifyPeerCertByName",
-        "verify-peer-cert-by-name",
-        "verify_peer_cert_by_name",
-        "echConfigList",
-        "ech-config-list",
-        "ech_config_list",
-        "alpn",
-        "allowInsecure",
-        "allow-insecure",
-        "allow_insecure",
-        "utls",
-    ];
-    let ech_enabled = first_param(node, &["ech"])
-        .map(|value| parse_bool_param("ech", value))
-        .transpose()?
-        .unwrap_or(false);
-    if node.tls_settings.is_some()
-        || ech_enabled
-        || TLS_ONLY_KEYS
-            .iter()
-            .any(|key| node.params.contains_key(*key))
-    {
-        return Err("ordinary TLS/ECH settings cannot be combined with REALITY".into());
-    }
-    Ok(())
 }
 
 fn grpc_param<'a>(node: &'a ParsedNode, keys: &[&str]) -> Result<Option<&'a str>, &'static str> {
@@ -4309,6 +4257,23 @@ fn decode_b64_32(s: &str) -> Option<[u8; 32]> {
     let mut out = [0u8; 32];
     out.copy_from_slice(&v);
     Some(out)
+}
+
+#[cfg(all(test, feature = "with_vless", feature = "with_reality"))]
+mod reality_compat_tests {
+    use core_config::node_uri::parse_uri;
+
+    use super::build_outbound;
+
+    #[test]
+    fn mihomo_compatible_reality_metadata_does_not_enter_ordinary_tls_validation() {
+        let node = parse_uri(
+            "vless://11111111-1111-1111-1111-111111111111@192.0.2.10:443?security=reality&sni=cover.example&fp=chrome&pbk=BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc&sid=0123456789abcdef&alpn=h2%2Chttp%2F1.1&allowInsecure=1&skip-cert-verify=true&ech=true&echConfigList=ignored#HK-Reality",
+        )
+        .unwrap();
+        assert!(node.reality.is_some());
+        assert!(build_outbound(&node).is_ok());
+    }
 }
 
 #[cfg(all(test, feature = "standard"))]

@@ -519,7 +519,15 @@ fn validate_young_certificate_pin(value: &str) -> ConfigResult<()> {
     Ok(())
 }
 
-fn reality_settings_from_params(
+/// Build the strongly typed REALITY client settings used by URI and
+/// subscription adapters.
+///
+/// Xray share links use `fp`, `sni`, `pbk`, and `sid`, while Mihomo exposes
+/// the same values as `client-fingerprint`, `servername`,
+/// `reality-opts.public-key`, and `reality-opts.short-id`.  Keep the alias
+/// merge in one place so adapters cannot accidentally route browser
+/// fingerprints through ordinary TLS settings.
+pub fn reality_settings_from_params(
     params: &std::collections::BTreeMap<String, String>,
     fallback_server_name: &str,
 ) -> ConfigResult<RealityClientSettings> {
@@ -542,22 +550,40 @@ fn reality_settings_from_params(
     };
 
     let password = get_unique(&["password", "pbk"])?;
-    let public_key = get_unique(&["publicKey", "public_key"])?;
+    let public_key = get_unique(&["publicKey", "public_key", "public-key"])?;
     if password.is_some() && public_key.is_some() && password != public_key {
         return Err(ConfigError::bad_node(
             "REALITY password/pbk 与 publicKey 值冲突",
         ));
     }
+    let client_fingerprint = get_unique(&[
+            "fp",
+            "client-fingerprint",
+            "client_fingerprint",
+            "clientFingerprint",
+            "utls",
+        ])?
+        // `fingerprint` is certificate pinning in Mihomo.  Retain it only as
+        // a legacy Wuther alias when no explicit client fingerprint exists.
+        .or_else(|| params.get("fingerprint").cloned())
+        .unwrap_or_else(|| "chrome".into());
     let settings = RealityClientSettings {
-        fingerprint: get_unique(&["fingerprint", "fp"])?.unwrap_or_else(|| "chrome".into()),
-        server_name: get_unique(&["serverName", "server_name", "sni"])?
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| fallback_server_name.to_owned()),
+        fingerprint: client_fingerprint,
+        server_name: get_unique(&[
+            "serverName",
+            "server_name",
+            "server-name",
+            "servername",
+            "sni",
+        ])?
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| fallback_server_name.to_owned()),
         password,
         public_key,
-        short_id: get_unique(&["shortId", "short_id", "sid"])?.unwrap_or_default(),
-        mldsa65_verify: get_unique(&["mldsa65Verify", "mldsa65_verify", "pqv"])?,
-        spider_x: get_unique(&["spiderX", "spider_x", "spx"])?.unwrap_or_else(|| "/".into()),
+        short_id: get_unique(&["shortId", "short_id", "short-id", "sid"])?.unwrap_or_default(),
+        mldsa65_verify: get_unique(&["mldsa65Verify", "mldsa65_verify", "mldsa65-verify", "pqv"])?,
+        spider_x: get_unique(&["spiderX", "spider_x", "spider-x", "spx"])?
+            .unwrap_or_else(|| "/".into()),
         show: params
             .get("show")
             .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes")),
@@ -842,6 +868,18 @@ mod tests {
         assert_eq!(reality.spider_x, "/news?p=10-20");
         assert!(reality.password.is_some());
         assert!(node.tls);
+    }
+
+    #[test]
+    fn parse_vless_reality_uses_client_fingerprint_not_certificate_fingerprint() {
+        let node = parse_uri(
+            "vless://11111111-1111-1111-1111-111111111111@127.0.0.1:443?security=reality&servername=cover.example&client-fingerprint=firefox&fingerprint=certificate-pin&pbk=BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc&short-id=00",
+        )
+        .unwrap();
+        let reality = node.reality.expect("typed REALITY settings");
+        assert_eq!(reality.server_name, "cover.example");
+        assert_eq!(reality.fingerprint, "firefox");
+        assert_eq!(reality.short_id, "00");
     }
 
     #[test]
