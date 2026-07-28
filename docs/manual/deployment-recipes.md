@@ -251,8 +251,9 @@ pwsh -File scripts/build-all.ps1 \
   -Targets "aarch64-apple-darwin"
 ```
 
-仓库 CI 对 Intel 和 Apple Silicon 使用原生 runner，不依赖缺少 Apple SDK 的普通
-交叉编译环境。
+仓库 CI 仅对 Apple Silicon 使用原生 runner，不依赖缺少 Apple SDK 的普通交叉编译
+环境。Intel 命令保留给自行维护该架构的构建者，官方 CI 和 Release 不再产出 Intel
+macOS 二进制。
 
 ### TUN 边界
 

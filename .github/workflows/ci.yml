@@ -14,7 +14,7 @@ on:
         type: string
         default: ""
       validate-macos:
-        description: Build and smoke-test both macOS architectures.
+        description: Build and smoke-test macOS on Apple Silicon.
         required: false
         type: boolean
         default: true
@@ -30,7 +30,7 @@ on:
         type: string
         default: ""
       validate-macos:
-        description: Build and smoke-test Intel and Apple Silicon.
+        description: Build and smoke-test Apple Silicon.
         required: true
         type: boolean
         default: true
@@ -159,20 +159,11 @@ jobs:
           fi
 
   macos:
+    name: macOS Apple Silicon
     if: github.event_name != 'workflow_call' || inputs.validate-macos
     needs: prepare
-    runs-on: ${{ matrix.platform.runner }}
+    runs-on: macos-15
     timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        platform:
-          - name: Intel
-            runner: macos-15-intel
-            target: x86_64-apple-darwin
-          - name: Apple Silicon
-            runner: macos-15
-            target: aarch64-apple-darwin
 
     steps:
       - name: Checkout
@@ -184,8 +175,8 @@ jobs:
       - name: Setup cached Rust
         uses: ./.github/actions/setup-rust
         with:
-          cache-key: ci-macos-${{ matrix.platform.target }}-${{ needs.prepare.outputs.tag-key }}
-          targets: ${{ matrix.platform.target }}
+          cache-key: ci-macos-aarch64-apple-darwin-${{ needs.prepare.outputs.tag-key }}
+          targets: aarch64-apple-darwin
           cache-targets: true
           save-cache: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
 
@@ -200,7 +191,7 @@ jobs:
       - name: Build macOS binary
         shell: bash
         env:
-          TARGET: ${{ matrix.platform.target }}
+          TARGET: aarch64-apple-darwin
           WUTHER_BUILD_TAGS: ${{ needs.prepare.outputs.tags }}
         run: |
           set -euo pipefail
@@ -220,7 +211,7 @@ jobs:
           contains(format(',{0},', needs.prepare.outputs.tags), ',all_components,')
         shell: bash
         env:
-          TARGET: ${{ matrix.platform.target }}
+          TARGET: aarch64-apple-darwin
         run: >-
           python3 scripts/stage-runtime-libraries.py
           --target "$TARGET"
@@ -230,7 +221,7 @@ jobs:
       - name: Smoke-test macOS binary
         shell: bash
         env:
-          TARGET: ${{ matrix.platform.target }}
+          TARGET: aarch64-apple-darwin
         run: "./target/$TARGET/release-fast/wuther-core --version"
 
   required:

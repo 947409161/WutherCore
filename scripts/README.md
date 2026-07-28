@@ -96,9 +96,8 @@ GitHub Actions 的 **Build Matrix** 和 **CI** 手动运行入口也提供 `tags
 显式填写时语义与本地 `--tags` 完全相同。Build Matrix 留空时会按目标选择上述
 `standard` 或 `portable` 平台预设，并把最终选择写进归档。它还可用 `platforms`
 只运行 `linux`、`android`、`windows` 或 `macos` 子矩阵；`all` 会并行构建
-10 个目标。macOS 使用 GitHub 原生 Intel 与 Apple Silicon runner，分别产出
-`x86_64-apple-darwin` 和 `aarch64-apple-darwin`，不依赖不完整的 Darwin
-交叉编译环境。
+9 个目标。官方 macOS 自动构建只使用 Apple Silicon runner，产出
+`aarch64-apple-darwin`，不依赖不完整的 Darwin 交叉编译环境。
 
 ## 短别名
 
@@ -209,5 +208,5 @@ type    dist\wuther-core-0.3.1-x86_64-pc-windows-msvc.zip.sha256
 - **`Compress-Archive` 限制 2GB**：debug 构建产物可能过大，请使用 release profile（默认）。
 - **macOS 构建**：在对应架构的 macOS 主机直接运行
   `cargo build --release --target aarch64-apple-darwin` 或
-  `cargo build --release --target x86_64-apple-darwin`；CI 分别使用
-  `macos-15`（Apple Silicon）和 `macos-15-intel`（Intel）原生构建并冒烟测试。
+  `cargo build --release --target x86_64-apple-darwin`。官方 CI 仅使用
+  `macos-15` Apple Silicon runner 构建并冒烟测试。

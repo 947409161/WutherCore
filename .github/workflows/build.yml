@@ -467,20 +467,11 @@ jobs:
           retention-days: ${{ needs.prepare.outputs.retention-days }}
 
   macos:
+    name: macOS Apple Silicon
     if: needs.prepare.outputs.platforms == 'all' || needs.prepare.outputs.platforms == 'macos'
     needs: prepare
-    runs-on: ${{ matrix.platform.runner }}
+    runs-on: macos-15
     timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        platform:
-          - target: x86_64-apple-darwin
-            name: macos-amd64
-            runner: macos-15-intel
-          - target: aarch64-apple-darwin
-            name: macos-arm64
-            runner: macos-15
 
     steps:
       - name: Checkout
@@ -492,8 +483,8 @@ jobs:
       - name: Setup cached Rust
         uses: ./.github/actions/setup-rust
         with:
-          cache-key: build-${{ matrix.platform.target }}-${{ needs.prepare.outputs.tag-key }}
-          targets: ${{ matrix.platform.target }}
+          cache-key: build-aarch64-apple-darwin-${{ needs.prepare.outputs.tag-key }}
+          targets: aarch64-apple-darwin
           cache-targets: true
 
       - name: Ensure Firefox Neqo build tools
@@ -507,7 +498,7 @@ jobs:
       - name: Build macOS binary
         shell: bash
         env:
-          TARGET: ${{ matrix.platform.target }}
+          TARGET: aarch64-apple-darwin
           WUTHER_BUILD_TAGS: ${{ needs.prepare.outputs.tags }}
         run: |
           set -euo pipefail
@@ -526,7 +517,7 @@ jobs:
           contains(format(',{0},', needs.prepare.outputs.tags), ',all_components,')
         shell: bash
         env:
-          TARGET: ${{ matrix.platform.target }}
+          TARGET: aarch64-apple-darwin
         run: >-
           python3 scripts/stage-runtime-libraries.py
           --target "$TARGET"
@@ -535,14 +526,14 @@ jobs:
       - name: Smoke-test macOS binary
         shell: bash
         env:
-          TARGET: ${{ matrix.platform.target }}
+          TARGET: aarch64-apple-darwin
         run: "./target/$TARGET/release/wuther-core --version"
 
       - name: Package artifact
         id: package
         env:
-          TARGET: ${{ matrix.platform.target }}
-          PLATFORM_NAME: ${{ matrix.platform.name }}
+          TARGET: aarch64-apple-darwin
+          PLATFORM_NAME: macos-arm64
           RELEASE_VERSION: ${{ inputs.version }}
           WUTHER_BUILD_TAG_LABEL: ${{ needs.prepare.outputs.tag-label }}
         run: >-

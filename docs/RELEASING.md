@@ -58,9 +58,9 @@ git push origin v0.4.0
 1. 校验标签格式、版本通道与 workspace 版本；
 2. 确认正式版提交属于 `main`；
 3. 在标签对应源码上运行格式、仓库完整性与 Linux workspace 校验；
-4. 调用统一的 Build Matrix，并行构建全部 10 个目标；Windows 和 macOS
+4. 调用统一的 Build Matrix，并行构建全部 9 个目标；Windows 和 macOS
    产物会在对应架构的原生 runner 上执行冒烟验证；
-5. 将每个平台 ZIP 作为非嵌套 artifact 上传，再按 `wuther-core-$VERSION-*` 前缀收集全部 10 个产物；
+5. 将每个平台 ZIP 作为非嵌套 artifact 上传，再按 `wuther-core-$VERSION-*` 前缀收集全部 9 个产物；
 6. 生成 `SHA256SUMS`，再汇总为零压缩的 `release-assets` artifact；
 7. 下载并解包汇总产物，生成 GitHub Artifact Attestation；
 8. 使用 `.github/release.yml` 自动分类 Release Notes；
@@ -76,7 +76,7 @@ git push origin v0.4.0
 | Linux musl | AMD64、ARM64 |
 | Android | ARM64、ARMv7 |
 | Windows MSVC | AMD64、ARM64 |
-| macOS | Intel、Apple Silicon |
+| macOS | Apple Silicon |
 
 每个 ZIP 包含：
 
@@ -118,5 +118,5 @@ gh attestation verify .\wuther-core-0.4.0-windows-amd64-msvc.zip --repo MiChongs
 并在 `tags` 中填写逗号分隔的组件标签，例如
 `with_quic,with_vless,with_grpc,with_utls`。留空执行各目标支持的默认组件集。标签含义、
 本地等价命令和许可边界见[组件化构建](BUILDING.md)。
-Build Matrix 的 `platforms` 可只重跑一个平台组；`macos` 会同时覆盖 Intel
-和 Apple Silicon。
+Build Matrix 的 `platforms` 可只重跑一个平台组；`macos` 使用 Apple Silicon
+原生 runner。

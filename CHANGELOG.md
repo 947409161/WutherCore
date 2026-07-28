@@ -13,6 +13,10 @@
 - provider 节点补全 Direct，Reject，Dns，Naive，Sudoku，TrustTunnel 和 Young 的 Clash 类型映射。
 - provider 激活失败时保留上一份运行时快照和状态，名称重复，静态节点冲突，策略组冲突及保留名称冲突会整批拒绝。
 
+### Changed
+
+- GitHub CI，Build Matrix 和 Release 的 macOS 自动构建仅保留 Apple Silicon，不再运行或发布 Intel macOS 产物。
+
 ## [0.3.1] - 2026-07-28
 
 ### Security
