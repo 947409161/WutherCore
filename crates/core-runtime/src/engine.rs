@@ -12,6 +12,7 @@ use std::{
     time::Instant,
 };
 
+use arc_swap::ArcSwap;
 use core_config::{
     model::{ChooseStrategy, FeedDetail},
     node_uri::ParsedNode,
@@ -32,12 +33,15 @@ use core_store::{
     schema::{GROUP_MANUAL, GROUP_PIN},
     store::BatchOp,
 };
+use smallvec::{SmallVec, smallvec};
 use thiserror::Error;
 use tracing::{debug, trace, warn};
 
 use crate::group_selector::{GroupPin, GroupSelector, ManualProbeToken, PinSource};
 
 const DIAL_MAX_RETRIES: usize = 10;
+const GROUP_MAX_DEPTH: usize = 32;
+pub type GroupChain = SmallVec<[String; 4]>;
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -56,7 +60,8 @@ pub enum RuntimeError {
 pub struct Runtime {
     pub plan: RuntimePlan,
     pub outbounds: Arc<parking_lot::RwLock<OutboundRegistry>>,
-    pub groups: parking_lot::RwLock<BTreeMap<String, Arc<GroupSelector>>>,
+    /// provider 刷新时通过 ArcSwap 一次发布完整组快照，选路线程只做无锁读取。
+    pub groups: Arc<ArcSwap<BTreeMap<String, Arc<GroupSelector>>>>,
     /// pin 是低频控制面事务。串行化内存状态与 Turso 提交，避免并发 API
     /// 更新造成数据库和运行时顺序分叉。
     group_pin_lock: tokio::sync::Mutex<()>,
@@ -78,7 +83,7 @@ pub struct Runtime {
     pub mutable: parking_lot::RwLock<MutableConfig>,
     /// URLTest 实例 —— main.rs 在创建后通过 `set_urltest` 注入。
     /// `pick_in_group` 把它传给 `GroupSelector::pick` 让 URLTest/Fallback/LB 走死节点感知。
-    pub urltest: parking_lot::RwLock<Option<Arc<crate::health::UrlTester>>>,
+    pub urltest: Arc<parking_lot::RwLock<Option<Arc<crate::health::UrlTester>>>>,
     /// 规则集管理器 —— 周期任务、Clash API 手动刷新和路由数据面共享同一实例。
     pub ruleset_manager: parking_lot::RwLock<Option<Arc<core_ruleset::RulesetManager>>>,
     /// 进程反查 —— 与 mihomo `find-process-mode` 1:1。
@@ -167,16 +172,12 @@ impl Runtime {
         let mut reg = OutboundRegistry::new();
         register_nodes(&mut reg, &plan.nodes).map_err(RuntimeError::OutboundConfig)?;
         let outbounds = Arc::new(parking_lot::RwLock::new(reg));
-        core_resolver::upstream::outbound::set_dns_outbound_provider(Arc::new(
-            RuntimeDnsOutboundProvider {
-                outbounds: outbounds.clone(),
-            },
-        ));
 
         let mut groups = BTreeMap::new();
         for (name, g) in &plan.groups {
             groups.insert(name.clone(), Arc::new(GroupSelector::new(g.clone())));
         }
+        let groups = Arc::new(ArcSwap::from_pointee(groups));
 
         // RouteEngine：有 RulesetIndex 时走 `with_rulesets`，否则退化到 None
         // （`set:<name>` 规则会全部 fallthrough）。
@@ -216,6 +217,15 @@ impl Runtime {
         } else {
             Arc::new(SmartSelector::new(plan.smart.goal, plan.smart.sticky))
         };
+        let urltest = Arc::new(parking_lot::RwLock::new(None));
+        core_resolver::upstream::outbound::set_dns_outbound_provider(Arc::new(
+            RuntimeDnsOutboundProvider {
+                outbounds: outbounds.clone(),
+                groups: groups.clone(),
+                smart: smart.clone(),
+                urltest: urltest.clone(),
+            },
+        ));
 
         // Smart 节点初始化
         for n in &plan.nodes {
@@ -230,7 +240,7 @@ impl Runtime {
                     if blob.node.is_empty() {
                         continue;
                     }
-                    if let Some(group) = groups.get(&group_name) {
+                    if let Some(group) = groups.load().get(&group_name) {
                         group.restore_pin(GroupPin {
                             node: blob.node,
                             generation: blob.generation.max(1),
@@ -244,7 +254,7 @@ impl Runtime {
             // 后续第一次写入会删除旧键。
             if let Ok(rows) = store.iter_string(GROUP_MANUAL).await {
                 for (group_name, picked) in rows {
-                    if let Some(g) = groups.get(&group_name) {
+                    if let Some(g) = groups.load().get(&group_name) {
                         if g.current_pin().is_none() && !picked.is_empty() {
                             g.set_manual(picked);
                         }
@@ -273,7 +283,7 @@ impl Runtime {
         Ok(Self {
             plan,
             outbounds,
-            groups: parking_lot::RwLock::new(groups),
+            groups,
             group_pin_lock: tokio::sync::Mutex::new(()),
             node_info: parking_lot::RwLock::new(node_info),
             node_update_lock: parking_lot::Mutex::new(()),
@@ -287,7 +297,7 @@ impl Runtime {
             store,
             logs: Arc::new(core_observe::LogBus::new(512)),
             mutable: parking_lot::RwLock::new(mutable),
-            urltest: parking_lot::RwLock::new(None),
+            urltest,
             ruleset_manager: parking_lot::RwLock::new(None),
             process_finder,
         })
@@ -357,7 +367,7 @@ impl Runtime {
         }
         let _commit = self.group_pin_lock.lock().await;
         let (selector, strategy) = {
-            let groups = self.groups.read();
+            let groups = self.groups.load();
             let Some(selector) = groups.get(group) else {
                 return false;
             };
@@ -409,7 +419,7 @@ impl Runtime {
     pub async fn clear_group_pin(&self, group: &str) -> bool {
         let _commit = self.group_pin_lock.lock().await;
         let selector = {
-            let groups = self.groups.read();
+            let groups = self.groups.load();
             let Some(selector) = groups.get(group) else {
                 return false;
             };
@@ -447,7 +457,7 @@ impl Runtime {
         any_success: bool,
     ) -> bool {
         let _commit = self.group_pin_lock.lock().await;
-        let Some(selector) = self.groups.read().get(group).cloned() else {
+        let Some(selector) = self.groups.load().get(group).cloned() else {
             return false;
         };
         let previous_pin = selector.current_pin();
@@ -489,7 +499,101 @@ impl Runtime {
     }
 
     pub fn group_names(&self) -> Vec<String> {
-        self.groups.read().keys().cloned().collect()
+        self.groups.load().keys().cloned().collect()
+    }
+
+    /// 当前控制面选择链，顺序与连接表一致：实际节点、下级节点组、上层分流组。
+    pub fn current_group_chain(&self, group: &str) -> GroupChain {
+        let groups = self.groups.load();
+        let mut outward = SmallVec::<[String; 4]>::new();
+        let mut current = group.to_string();
+        let mut visited = BTreeSet::new();
+        for _ in 0..GROUP_MAX_DEPTH {
+            if !visited.insert(current.clone()) {
+                return smallvec!["BLOCK".to_string()];
+            }
+            let Some(selector) = groups.get(&current) else {
+                outward.push(current);
+                outward.reverse();
+                return outward;
+            };
+            outward.push(current);
+            let mut members = selector.filtered_members(|member| self.member_protocol(member));
+            members.retain(|member| feed_member_name(member).is_none());
+            if selector.plan().max_members > 0 && members.len() > selector.plan().max_members {
+                members.truncate(selector.plan().max_members);
+            }
+            let next = selector
+                .last_pick()
+                .filter(|member| members.contains(member))
+                .or_else(|| {
+                    (!selector.plan().default_selected.is_empty()
+                        && members.contains(&selector.plan().default_selected))
+                    .then(|| selector.plan().default_selected.clone())
+                })
+                .or_else(|| members.first().cloned())
+                .unwrap_or_else(|| selector.plan().empty_fallback.clone());
+            current = match next.to_ascii_uppercase().as_str() {
+                "REJECT" => "BLOCK".to_string(),
+                _ => next,
+            };
+        }
+        smallvec!["BLOCK".to_string()]
+    }
+
+    /// 递归展开组的实际叶子 outbound，供 Clash 组测速与控制面检查使用。
+    pub fn group_leaf_members(&self, group: &str) -> Vec<String> {
+        fn expand(
+            runtime: &Runtime,
+            group_name: &str,
+            visiting: &mut BTreeSet<String>,
+            depth: usize,
+            leaves: &mut Vec<String>,
+        ) {
+            if depth >= GROUP_MAX_DEPTH || !visiting.insert(group_name.to_string()) {
+                return;
+            }
+            if !runtime.groups.load().contains_key(group_name) {
+                visiting.remove(group_name);
+                return;
+            }
+            let members = runtime.group_visible_members(group_name);
+            for member in members {
+                if runtime.groups.load().contains_key(&member) {
+                    expand(runtime, &member, visiting, depth + 1, leaves);
+                } else if runtime.outbounds.read().get(&member).is_some()
+                    && !leaves.contains(&member)
+                {
+                    leaves.push(member);
+                }
+            }
+            visiting.remove(group_name);
+        }
+
+        let mut leaves = Vec::new();
+        expand(self, group, &mut BTreeSet::new(), 0, &mut leaves);
+        leaves
+    }
+
+    /// 控制面可见的直接成员。隐藏未展开 provider 占位符，并在空组或
+    /// `min-members` 不满足时只暴露实际会执行的 empty-fallback。
+    pub fn group_visible_members(&self, group: &str) -> Vec<String> {
+        let Some(selector) = self.groups.load().get(group).cloned() else {
+            return Vec::new();
+        };
+        let mut members = selector.filtered_members(|member| self.member_protocol(member));
+        members.retain(|member| {
+            feed_member_name(member).is_none()
+                && (self.groups.load().contains_key(member)
+                    || self.outbounds.read().get(member).is_some())
+        });
+        if selector.plan().max_members > 0 && members.len() > selector.plan().max_members {
+            members.truncate(selector.plan().max_members);
+        }
+        if members.len() < selector.plan().min_members.max(1) {
+            return vec![selector.plan().empty_fallback.clone()];
+        }
+        members
     }
 
     pub fn outbound_names(&self) -> Vec<String> {
@@ -662,7 +766,7 @@ impl Runtime {
         // 重建受影响的 GroupSelector：对每个含 feed:<name> 占位符的分组，
         // 用所有已加载 provider 快照展开，而不是只展开本次刷新 feed。
         let plan_map = self.plan.groups.clone();
-        let mut groups = self.groups.write();
+        let mut groups = (*self.groups.load_full()).clone();
         let mut updated_groups = 0usize;
         let mut updated_selectors = Vec::new();
         for (name, base_plan) in plan_map {
@@ -707,7 +811,7 @@ impl Runtime {
                 updated_groups += 1;
             }
         }
-        drop(groups);
+        self.groups.store(Arc::new(groups));
         if let Some(tester) = self.urltest.read().clone() {
             tester.remove_nodes(removed_names.iter().map(String::as_str));
             for selector in updated_selectors {
@@ -817,15 +921,24 @@ impl Runtime {
             );
         }
 
-        let (label, outbound) = match &decision {
-            RouteDecision::Direct => ("DIRECT".into(), self.must_get("DIRECT")),
-            RouteDecision::Block => ("BLOCK".into(), self.must_get("BLOCK")),
+        let resolved = match &decision {
+            RouteDecision::Direct => ResolvedGroupPick {
+                label: "DIRECT".into(),
+                outbound: self.must_get("DIRECT"),
+                chain: smallvec!["DIRECT".into()],
+            },
+            RouteDecision::Block => ResolvedGroupPick {
+                label: "BLOCK".into(),
+                outbound: self.must_get("BLOCK"),
+                chain: smallvec!["BLOCK".into()],
+            },
             RouteDecision::Group(name) => self.pick_in_group(name, &ctx),
         };
         RoutePick {
             decision,
-            label,
-            outbound,
+            label: resolved.label,
+            outbound: resolved.outbound,
+            chain: resolved.chain,
             rule: hit.rule,
             rule_payload: hit.payload,
             rule_index: hit.index,
@@ -867,11 +980,25 @@ impl Runtime {
         }
     }
 
-    fn pick_in_group(&self, group: &str, ctx: &FlowContext) -> (String, SharedOutbound) {
-        let groups = self.groups.read();
-        let Some(g) = groups.get(group) else {
+    fn pick_in_group(&self, group: &str, ctx: &FlowContext) -> ResolvedGroupPick {
+        self.pick_in_group_inner(group, ctx, &mut BTreeSet::new(), 0)
+    }
+
+    fn pick_in_group_inner(
+        &self,
+        group: &str,
+        ctx: &FlowContext,
+        visiting: &mut BTreeSet<String>,
+        depth: usize,
+    ) -> ResolvedGroupPick {
+        if depth >= GROUP_MAX_DEPTH || !visiting.insert(group.to_string()) {
+            warn!(target: "route", group, depth, "策略组递归超限或存在循环，阻断流量");
+            return self.blocked_group_pick();
+        }
+        let Some(g) = self.groups.load().get(group).cloned() else {
+            visiting.remove(group);
             warn!(target: "route", group, "未知分组，阻断流量避免回退 DIRECT");
-            return ("BLOCK".into(), self.must_get("BLOCK"));
+            return self.blocked_group_pick();
         };
         let mut meta = crate::group_selector::FlowMeta::for_host(
             ctx.host.clone(),
@@ -880,64 +1007,184 @@ impl Runtime {
         );
         meta.dst_ip = ctx.ip;
         let tester = self.urltest.read().clone();
-        let registry = self.outbounds.read();
-        let pick = if ctx.network == NetworkKind::Udp {
-            g.pick_eligible_with_protocol(
-                &meta,
-                &self.smart,
-                tester.as_ref(),
-                |name| {
-                    registry
-                        .get(name)
-                        .map(|ob| ob.capabilities().udp)
-                        .unwrap_or(false)
-                },
-                |name| {
-                    registry
-                        .get(name)
-                        .map(|outbound| outbound.protocol().to_string())
-                        .unwrap_or_default()
-                },
-            )
-        } else {
-            g.pick_eligible_with_protocol(
-                &meta,
-                &self.smart,
-                tester.as_ref(),
-                |_| true,
-                |name| {
-                    registry
-                        .get(name)
-                        .map(|outbound| outbound.protocol().to_string())
-                        .unwrap_or_default()
-                },
-            )
-        };
+        let pick = g.pick_eligible_with_protocol(
+            &meta,
+            &self.smart,
+            tester.as_ref(),
+            |name| self.member_supports_network(name, ctx.network, visiting, depth + 1),
+            |name| self.member_protocol(name),
+        );
         if let Some(name) = pick {
-            if let Some(ob) = registry.get(&name) {
-                return (name, ob);
+            if let Some(outbound) = self.outbounds.read().get(&name) {
+                visiting.remove(group);
+                return ResolvedGroupPick {
+                    label: name.clone(),
+                    outbound,
+                    chain: smallvec![name, group.to_string()],
+                };
+            }
+            if self.groups.load().contains_key(&name) {
+                let mut nested = self.pick_in_group_inner(&name, ctx, visiting, depth + 1);
+                visiting.remove(group);
+                nested.chain.push(group.to_string());
+                return nested;
             }
             warn!(target: "route", node = %name, "节点未注册，阻断流量避免回退 DIRECT");
         } else if ctx.network == NetworkKind::Udp {
             // 没有任何 UDP 可用成员时返回组内第一个已注册成员作为错误载体。
             // dial_udp 会在真正拨号前检查 capabilities 并返回 Unsupported，
             // 既不产生流量泄漏，也能保留具体节点名和协议，避免伪装成 BLOCK。
-            if let Some((name, outbound)) = g
-                .filtered_members(|name| {
-                    registry
-                        .get(name)
-                        .map(|outbound| outbound.protocol().to_string())
-                        .unwrap_or_default()
-                })
-                .into_iter()
-                .find_map(|name| registry.get(&name).map(|outbound| (name, outbound)))
-            {
-                return (name, outbound);
+            for member in g.filtered_members(|name| self.member_protocol(name)) {
+                if let Some(mut fallback) =
+                    self.first_resolvable_member(&member, visiting, depth + 1)
+                {
+                    visiting.remove(group);
+                    fallback.chain.push(group.to_string());
+                    return fallback;
+                }
             }
         } else if g.has_unresolved_feed_placeholders() {
             warn!(target: "route", group, "订阅节点尚未加载或为空，阻断流量避免回退 DIRECT");
         }
-        ("BLOCK".into(), self.must_get("BLOCK"))
+        visiting.remove(group);
+        self.empty_group_pick(&g, group)
+    }
+
+    fn blocked_group_pick(&self) -> ResolvedGroupPick {
+        ResolvedGroupPick {
+            label: "BLOCK".into(),
+            outbound: self.must_get("BLOCK"),
+            chain: smallvec!["BLOCK".into()],
+        }
+    }
+
+    fn empty_group_pick(&self, group: &GroupSelector, group_name: &str) -> ResolvedGroupPick {
+        let configured = group.plan().empty_fallback.as_str();
+        let label = match configured.to_ascii_uppercase().as_str() {
+            "REJECT" | "BLOCK" => "BLOCK",
+            "DIRECT" => "DIRECT",
+            _ => configured,
+        };
+        if let Some(outbound) = self.outbounds.read().get(label) {
+            return ResolvedGroupPick {
+                label: label.to_string(),
+                outbound,
+                chain: smallvec![label.to_string(), group_name.to_string()],
+            };
+        }
+        warn!(
+            target: "route",
+            group = group_name,
+            empty_fallback = configured,
+            "策略组 empty-fallback 当前不可用，安全回退 BLOCK"
+        );
+        self.blocked_group_pick()
+    }
+
+    fn member_protocol(&self, name: &str) -> String {
+        if self.groups.load().contains_key(name) {
+            return "group".into();
+        }
+        self.outbounds
+            .read()
+            .get(name)
+            .map(|outbound| outbound.protocol().to_string())
+            .unwrap_or_default()
+    }
+
+    fn member_supports_network(
+        &self,
+        name: &str,
+        network: NetworkKind,
+        ancestors: &BTreeSet<String>,
+        depth: usize,
+    ) -> bool {
+        if let Some(outbound) = self.outbounds.read().get(name) {
+            return network != NetworkKind::Udp || outbound.capabilities().udp;
+        }
+        self.group_supports_network(name, network, &mut ancestors.clone(), depth)
+    }
+
+    fn group_supports_network(
+        &self,
+        group: &str,
+        network: NetworkKind,
+        visiting: &mut BTreeSet<String>,
+        depth: usize,
+    ) -> bool {
+        if depth >= GROUP_MAX_DEPTH || !visiting.insert(group.to_string()) {
+            return false;
+        }
+        let Some(selector) = self.groups.load().get(group).cloned() else {
+            visiting.remove(group);
+            return false;
+        };
+        if network == NetworkKind::Udp && selector.plan().disable_udp {
+            visiting.remove(group);
+            return false;
+        }
+        let mut members = selector.filtered_members(|name| self.member_protocol(name));
+        if selector.plan().max_members > 0 && members.len() > selector.plan().max_members {
+            members.truncate(selector.plan().max_members);
+        }
+        let required = selector.plan().min_members.max(1);
+        let supported = members
+            .into_iter()
+            .filter(|member| feed_member_name(member).is_none())
+            .filter(|member| self.member_supports_network(member, network, visiting, depth + 1))
+            .take(required)
+            .count()
+            >= required;
+        visiting.remove(group);
+        supported
+            || self.fallback_supports_network(selector.plan().empty_fallback.as_str(), network)
+    }
+
+    fn fallback_supports_network(&self, fallback: &str, network: NetworkKind) -> bool {
+        let fallback = match fallback.to_ascii_uppercase().as_str() {
+            "REJECT" => "BLOCK",
+            "DIRECT" => "DIRECT",
+            "BLOCK" => "BLOCK",
+            _ => fallback,
+        };
+        self.outbounds
+            .read()
+            .get(fallback)
+            .is_some_and(|outbound| network != NetworkKind::Udp || outbound.capabilities().udp)
+    }
+
+    fn first_resolvable_member(
+        &self,
+        member: &str,
+        visiting: &mut BTreeSet<String>,
+        depth: usize,
+    ) -> Option<ResolvedGroupPick> {
+        if let Some(outbound) = self.outbounds.read().get(member) {
+            return Some(ResolvedGroupPick {
+                label: member.to_string(),
+                outbound,
+                chain: smallvec![member.to_string()],
+            });
+        }
+        if depth >= GROUP_MAX_DEPTH || !visiting.insert(member.to_string()) {
+            return None;
+        }
+        let Some(selector) = self.groups.load().get(member).cloned() else {
+            visiting.remove(member);
+            return None;
+        };
+        for child in selector.filtered_members(|name| self.member_protocol(name)) {
+            if feed_member_name(&child).is_some() {
+                continue;
+            }
+            if let Some(mut resolved) = self.first_resolvable_member(&child, visiting, depth + 1) {
+                visiting.remove(member);
+                resolved.chain.push(member.to_string());
+                return Some(resolved);
+            }
+        }
+        visiting.remove(member);
+        None
     }
 
     fn must_get(&self, name: &str) -> SharedOutbound {
@@ -1026,10 +1273,6 @@ impl Runtime {
             let res = pick.outbound.dial_tcp(dial_ctx).await;
             let elapsed = started.elapsed();
             let dial_ms = dial_start.elapsed().as_millis() as u64;
-            let group_for_event = match &pick.decision {
-                RouteDecision::Group(g) => Some(g.clone()),
-                _ => None,
-            };
             match res {
                 Ok(stream) => {
                     trace!(
@@ -1045,16 +1288,12 @@ impl Runtime {
                     if pick.label != "DIRECT" && pick.label != "BLOCK" {
                         self.smart.record_success(&pick.label, elapsed);
                     }
-                    if let Some(name) = &group_for_event {
-                        if let Some(g) = self.groups.read().get(name) {
-                            g.on_dial_success();
-                        }
-                    }
-                    let chain = build_chain(&pick.decision, &pick.label);
+                    self.record_group_dial_success(&pick.chain);
+                    let chain = pick.chain.clone();
                     let provider_chains = self.provider_chains_for_chain(&chain);
                     let remote_destination =
                         self.remote_destination_for_outbound(&pick.label, &host, port);
-                    let smart_target = self.smart_target_for_decision(&pick.decision, &host);
+                    let smart_target = self.smart_target_for_chain(&chain, &host);
                     return Ok(DialResult {
                         stream,
                         outbound: pick.label,
@@ -1104,23 +1343,7 @@ impl Runtime {
                     if pick.label != "DIRECT" && pick.label != "BLOCK" {
                         self.smart.record_failure(&pick.label, e.to_string());
                     }
-                    if let Some(name) = &group_for_event {
-                        if let Some(g) = self.groups.read().get(name).cloned() {
-                            let tester = self.urltest.read().clone();
-                            let err_str = e.to_string();
-                            let g_name = g.name().to_string();
-                            if let Some(tester) = tester.as_ref() {
-                                g.mark_member_failed(&pick.label, tester, &err_str);
-                            }
-                            g.on_dial_failed(&err_str, move || {
-                                // 健康检查最小动作：清 fast-pick 缓存。
-                                // 真实重测延迟到下一次 spawn_periodic round（避免 dial 热路径阻塞）。
-                                if let Some(t) = tester.clone() {
-                                    t.invalidate_fast_pick(&g_name);
-                                }
-                            });
-                        }
-                    }
+                    self.record_group_dial_failure(&pick.chain, &e.to_string());
                     if !retry {
                         return Err(e);
                     }
@@ -1314,18 +1537,14 @@ impl Runtime {
                 network: "udp",
                 dial_id,
             };
-            let group_for_event = match &pick.decision {
-                RouteDecision::Group(group) => Some(group.clone()),
-                _ => None,
-            };
             match pick.outbound.dial_udp(dial_ctx).await {
                 Ok(socket) => {
                     let elapsed = started.elapsed();
-                    let chain = build_chain(&pick.decision, &pick.label);
+                    let chain = pick.chain.clone();
                     let provider_chains = self.provider_chains_for_chain(&chain);
                     let remote_destination =
                         self.remote_destination_for_outbound(&pick.label, &host, port);
-                    let smart_target = self.smart_target_for_decision(&pick.decision, &host);
+                    let smart_target = self.smart_target_for_chain(&chain, &host);
                     debug!(
                         target: "dial",
                         id = dial_id,
@@ -1338,11 +1557,7 @@ impl Runtime {
                     if pick.label != "DIRECT" && pick.label != "BLOCK" {
                         self.smart.record_success(&pick.label, elapsed);
                     }
-                    if let Some(group) = &group_for_event {
-                        if let Some(selector) = self.groups.read().get(group) {
-                            selector.on_dial_success();
-                        }
-                    }
+                    self.record_group_dial_success(&pick.chain);
                     return Ok(UdpDialResult {
                         socket,
                         outbound: pick.label,
@@ -1375,21 +1590,7 @@ impl Runtime {
                     if pick.label != "DIRECT" && pick.label != "BLOCK" {
                         self.smart.record_failure(&pick.label, e.to_string());
                     }
-                    if let Some(group) = &group_for_event {
-                        if let Some(selector) = self.groups.read().get(group).cloned() {
-                            let tester = self.urltest.read().clone();
-                            let error = e.to_string();
-                            let group_name = selector.name().to_string();
-                            if let Some(tester) = tester.as_ref() {
-                                selector.mark_member_failed(&pick.label, tester, &error);
-                            }
-                            selector.on_dial_failed(&error, move || {
-                                if let Some(tester) = tester.clone() {
-                                    tester.invalidate_fast_pick(&group_name);
-                                }
-                            });
-                        }
-                    }
+                    self.record_group_dial_failure(&pick.chain, &e.to_string());
                     if !should_retry_dial(&pick, &e, NetworkKind::Udp, attempt) {
                         return Err(e);
                     }
@@ -1491,14 +1692,46 @@ impl Runtime {
         host.trim_matches(['[', ']']).to_string()
     }
 
-    fn smart_target_for_decision(&self, decision: &RouteDecision, host: &str) -> String {
-        let RouteDecision::Group(group) = decision else {
-            return String::new();
-        };
-        let Some(group) = self.plan.groups.get(group) else {
-            return String::new();
-        };
-        if !matches!(group.choose, ChooseStrategy::Smart) {
+    fn record_group_dial_success(&self, chain: &[String]) {
+        for group_name in chain.iter().skip(1) {
+            if let Some(group) = self.groups.load().get(group_name).cloned() {
+                group.on_dial_success();
+            }
+        }
+    }
+
+    fn record_group_dial_failure(&self, chain: &[String], error: &str) {
+        let tester = self.urltest.read().clone();
+        for pair in chain.windows(2) {
+            let member = &pair[0];
+            let group_name = &pair[1];
+            let Some(group) = self.groups.load().get(group_name).cloned() else {
+                continue;
+            };
+            if !matches!(group.plan().choose, ChooseStrategy::Manual)
+                && let Some(tester) = tester.as_ref()
+            {
+                group.mark_member_failed(member, tester, error);
+            }
+            let tester_for_invalidate = tester.clone();
+            let group_for_invalidate = group_name.clone();
+            group.on_dial_failed(error, move || {
+                if let Some(tester) = &tester_for_invalidate {
+                    tester.invalidate_fast_pick(&group_for_invalidate);
+                }
+            });
+        }
+    }
+
+    fn smart_target_for_chain(&self, chain: &[String], host: &str) -> String {
+        let has_smart_group = chain.iter().skip(1).any(|group_name| {
+            self.plan
+                .groups
+                .get(group_name)
+                .map(|group| matches!(group.choose, ChooseStrategy::Smart))
+                .unwrap_or(false)
+        });
+        if !has_smart_group {
             return String::new();
         }
         host.trim_end_matches('.').to_string()
@@ -1553,6 +1786,8 @@ fn group_strategy_name(strategy: ChooseStrategy) -> &'static str {
         ChooseStrategy::Fast => "fast",
         ChooseStrategy::Stable => "stable",
         ChooseStrategy::Spread => "spread",
+        ChooseStrategy::Random => "random",
+        ChooseStrategy::Weighted => "weighted",
         ChooseStrategy::Chain => "chain",
     }
 }
@@ -1593,17 +1828,17 @@ fn decision_action(decision: &RouteDecision) -> String {
     }
 }
 
-fn build_chain(decision: &RouteDecision, label: &str) -> Vec<String> {
+fn build_chain(decision: &RouteDecision, label: &str) -> GroupChain {
     match decision {
-        RouteDecision::Direct => vec!["DIRECT".to_string()],
-        RouteDecision::Block => vec!["BLOCK".to_string()],
+        RouteDecision::Direct => smallvec!["DIRECT".to_string()],
+        RouteDecision::Block => smallvec!["BLOCK".to_string()],
         RouteDecision::Group(g) => {
             if label != g {
                 // Mihomo 的 Chain 按实际出站到外层策略组排列：
                 // [picked-node, group]，Chain::Last() 即第一个实际出站。
-                vec![label.to_string(), g.clone()]
+                smallvec![label.to_string(), g.clone()]
             } else {
-                vec![g.clone()]
+                smallvec![g.clone()]
             }
         }
     }
@@ -1662,6 +1897,8 @@ pub struct RoutePick {
     pub decision: RouteDecision,
     pub label: String,
     pub outbound: SharedOutbound,
+    /// 从实际 outbound 到最外层分流策略组的完整选择链。
+    pub chain: GroupChain,
     pub rule: String,
     pub rule_payload: String,
     pub rule_index: Option<usize>,
@@ -1671,6 +1908,12 @@ pub struct RoutePick {
     pub no_track: bool,
 }
 
+struct ResolvedGroupPick {
+    label: String,
+    outbound: SharedOutbound,
+    chain: GroupChain,
+}
+
 pub struct DialResult {
     pub stream: core_outbound::adapter::BoxedStream,
     pub outbound: String,
@@ -1678,8 +1921,8 @@ pub struct DialResult {
     pub elapsed: std::time::Duration,
     /// 完整的代理链 —— Clash dashboard 的 connection.chains 顶层字段。
     /// 直连/拦截：`["DIRECT"]` / `["BLOCK"]`；分组遵循 Mihomo 的
-    /// `["<picked-node>", "<group>"]` 顺序。
-    pub chain: Vec<String>,
+    /// `["<picked-node>", "<region-group>", "<policy-group>"]` 顺序。
+    pub chain: GroupChain,
     pub provider_chains: Vec<String>,
     pub remote_destination: String,
     pub smart_target: String,
@@ -1698,7 +1941,7 @@ pub struct UdpDialResult {
     pub outbound: String,
     pub decision: RouteDecision,
     pub elapsed: std::time::Duration,
-    pub chain: Vec<String>,
+    pub chain: GroupChain,
     pub provider_chains: Vec<String>,
     pub remote_destination: String,
     pub smart_target: String,
@@ -1803,6 +2046,9 @@ impl core_outbound::DialResolver for ResolverAdapter {
 
 struct RuntimeDnsOutboundProvider {
     outbounds: Arc<parking_lot::RwLock<OutboundRegistry>>,
+    groups: Arc<ArcSwap<BTreeMap<String, Arc<GroupSelector>>>>,
+    smart: Arc<SmartSelector>,
+    urltest: Arc<parking_lot::RwLock<Option<Arc<crate::health::UrlTester>>>>,
 }
 
 struct RuntimeDnsProxyStream(core_outbound::BoxedStream);
@@ -1838,6 +2084,199 @@ impl tokio::io::AsyncWrite for RuntimeDnsProxyStream {
     }
 }
 
+impl RuntimeDnsOutboundProvider {
+    fn pick(
+        &self,
+        outbound: &str,
+        host: &str,
+        port: u16,
+        network: NetworkKind,
+    ) -> std::io::Result<ResolvedGroupPick> {
+        let normalized = match outbound.to_ascii_uppercase().as_str() {
+            "REJECT" => "BLOCK",
+            _ => outbound,
+        };
+        if let Some(adapter) = self.outbounds.read().get(normalized) {
+            return Ok(ResolvedGroupPick {
+                label: normalized.to_string(),
+                outbound: adapter,
+                chain: smallvec![normalized.to_string()],
+            });
+        }
+        self.pick_group(normalized, host, port, network, &mut BTreeSet::new(), 0)
+    }
+
+    fn pick_group(
+        &self,
+        group_name: &str,
+        host: &str,
+        port: u16,
+        network: NetworkKind,
+        visiting: &mut BTreeSet<String>,
+        depth: usize,
+    ) -> std::io::Result<ResolvedGroupPick> {
+        if depth >= GROUP_MAX_DEPTH || !visiting.insert(group_name.to_string()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("DNS 出口策略组 `{group_name}` 存在循环或递归过深"),
+            ));
+        }
+        let Some(group) = self.groups.load().get(group_name).cloned() else {
+            visiting.remove(group_name);
+            return Err(unknown_dns_outbound(group_name));
+        };
+        let meta =
+            crate::group_selector::FlowMeta::for_host(host.to_string(), port, network.as_str());
+        let tester = self.urltest.read().clone();
+        let picked = group.pick_eligible_with_protocol(
+            &meta,
+            &self.smart,
+            tester.as_ref(),
+            |member| self.member_supports(member, network, visiting, depth + 1),
+            |member| self.member_protocol(member),
+        );
+        if let Some(member) = picked {
+            if let Some(adapter) = self.outbounds.read().get(&member) {
+                visiting.remove(group_name);
+                return Ok(ResolvedGroupPick {
+                    label: member.clone(),
+                    outbound: adapter,
+                    chain: smallvec![member, group_name.to_string()],
+                });
+            }
+            if self.groups.load().contains_key(&member) {
+                let mut resolved =
+                    self.pick_group(&member, host, port, network, visiting, depth + 1)?;
+                visiting.remove(group_name);
+                resolved.chain.push(group_name.to_string());
+                return Ok(resolved);
+            }
+        }
+        visiting.remove(group_name);
+        let fallback = match group.plan().empty_fallback.to_ascii_uppercase().as_str() {
+            "REJECT" | "BLOCK" => "BLOCK",
+            "DIRECT" => "DIRECT",
+            _ => group.plan().empty_fallback.as_str(),
+        };
+        let adapter = self
+            .outbounds
+            .read()
+            .get(fallback)
+            .ok_or_else(|| unknown_dns_outbound(fallback))?;
+        Ok(ResolvedGroupPick {
+            label: fallback.to_string(),
+            outbound: adapter,
+            chain: smallvec![fallback.to_string(), group_name.to_string()],
+        })
+    }
+
+    fn member_protocol(&self, member: &str) -> String {
+        if self.groups.load().contains_key(member) {
+            return "group".into();
+        }
+        self.outbounds
+            .read()
+            .get(member)
+            .map(|outbound| outbound.protocol().to_string())
+            .unwrap_or_default()
+    }
+
+    fn member_supports(
+        &self,
+        member: &str,
+        network: NetworkKind,
+        ancestors: &BTreeSet<String>,
+        depth: usize,
+    ) -> bool {
+        if let Some(outbound) = self.outbounds.read().get(member) {
+            return network != NetworkKind::Udp || outbound.capabilities().udp;
+        }
+        self.group_supports(member, network, &mut ancestors.clone(), depth)
+    }
+
+    fn group_supports(
+        &self,
+        group_name: &str,
+        network: NetworkKind,
+        visiting: &mut BTreeSet<String>,
+        depth: usize,
+    ) -> bool {
+        if depth >= GROUP_MAX_DEPTH || !visiting.insert(group_name.to_string()) {
+            return false;
+        }
+        let Some(group) = self.groups.load().get(group_name).cloned() else {
+            visiting.remove(group_name);
+            return false;
+        };
+        if network == NetworkKind::Udp && group.plan().disable_udp {
+            visiting.remove(group_name);
+            return false;
+        }
+        let mut members = group.filtered_members(|member| self.member_protocol(member));
+        if group.plan().max_members > 0 && members.len() > group.plan().max_members {
+            members.truncate(group.plan().max_members);
+        }
+        let required = group.plan().min_members.max(1);
+        let supported = members
+            .iter()
+            .filter(|member| feed_member_name(member).is_none())
+            .filter(|member| self.member_supports(member, network, visiting, depth + 1))
+            .take(required)
+            .count()
+            >= required;
+        visiting.remove(group_name);
+        supported || self.fallback_supports(group.plan().empty_fallback.as_str(), network)
+    }
+
+    fn fallback_supports(&self, fallback: &str, network: NetworkKind) -> bool {
+        let fallback = match fallback.to_ascii_uppercase().as_str() {
+            "REJECT" => "BLOCK",
+            "DIRECT" => "DIRECT",
+            "BLOCK" => "BLOCK",
+            _ => fallback,
+        };
+        self.outbounds
+            .read()
+            .get(fallback)
+            .is_some_and(|outbound| network != NetworkKind::Udp || outbound.capabilities().udp)
+    }
+
+    fn record_success(&self, pick: &ResolvedGroupPick, elapsed: std::time::Duration) {
+        if !matches!(pick.label.as_str(), "DIRECT" | "BLOCK") {
+            self.smart.record_success(&pick.label, elapsed);
+        }
+        for group_name in pick.chain.iter().skip(1) {
+            if let Some(group) = self.groups.load().get(group_name) {
+                group.on_dial_success();
+            }
+        }
+    }
+
+    fn record_failure(&self, pick: &ResolvedGroupPick, error: &str) {
+        if !matches!(pick.label.as_str(), "DIRECT" | "BLOCK") {
+            self.smart.record_failure(&pick.label, error.to_string());
+        }
+        let tester = self.urltest.read().clone();
+        for pair in pick.chain.windows(2) {
+            let Some(group) = self.groups.load().get(&pair[1]).cloned() else {
+                continue;
+            };
+            if !matches!(group.plan().choose, ChooseStrategy::Manual)
+                && let Some(tester) = tester.as_ref()
+            {
+                group.mark_member_failed(&pair[0], tester, error);
+            }
+            let tester_for_invalidate = tester.clone();
+            let group_name = pair[1].clone();
+            group.on_dial_failed(error, move || {
+                if let Some(tester) = &tester_for_invalidate {
+                    tester.invalidate_fast_pick(&group_name);
+                }
+            });
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl core_resolver::upstream::outbound::DnsOutboundProvider for RuntimeDnsOutboundProvider {
     async fn dial_tcp(
@@ -1846,15 +2285,22 @@ impl core_resolver::upstream::outbound::DnsOutboundProvider for RuntimeDnsOutbou
         host: &str,
         port: u16,
     ) -> std::io::Result<core_resolver::upstream::outbound::BoxedDnsProxyStream> {
-        let adapter = self
-            .outbounds
-            .read()
-            .get(outbound)
-            .ok_or_else(|| unknown_dns_outbound(outbound))?;
-        let stream = adapter
+        let pick = self.pick(outbound, host, port, NetworkKind::Tcp)?;
+        let started = Instant::now();
+        let stream = pick
+            .outbound
             .dial_tcp(DialContext::tcp(host, port).with_id(core_outbound::next_dial_id()))
-            .await?;
-        Ok(Box::pin(RuntimeDnsProxyStream(stream)))
+            .await;
+        match stream {
+            Ok(stream) => {
+                self.record_success(&pick, started.elapsed());
+                Ok(Box::pin(RuntimeDnsProxyStream(stream)))
+            }
+            Err(error) => {
+                self.record_failure(&pick, &error.to_string());
+                Err(error)
+            }
+        }
     }
 
     async fn exchange_udp(
@@ -1864,34 +2310,55 @@ impl core_resolver::upstream::outbound::DnsOutboundProvider for RuntimeDnsOutbou
         port: u16,
         request: &[u8],
     ) -> std::io::Result<Vec<u8>> {
-        let adapter = self
-            .outbounds
-            .read()
-            .get(outbound)
-            .ok_or_else(|| unknown_dns_outbound(outbound))?;
-        if !adapter.capabilities().udp {
+        let pick = self.pick(outbound, host, port, NetworkKind::Udp)?;
+        if !pick.outbound.capabilities().udp {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
-                format!("DNS 出口 `{outbound}`/{} 不支持 UDP", adapter.protocol()),
+                format!(
+                    "DNS 出口 `{}`/{} 不支持 UDP",
+                    pick.label,
+                    pick.outbound.protocol()
+                ),
             ));
         }
-        let socket = adapter
+        let started = Instant::now();
+        let socket = pick
+            .outbound
             .dial_udp(DialContext::udp(host, port).with_id(core_outbound::next_dial_id()))
-            .await?;
-        let written = socket.send_to(request, host, port).await?;
+            .await
+            .inspect_err(|error| self.record_failure(&pick, &error.to_string()))?;
+        let written = match socket.send_to(request, host, port).await {
+            Ok(written) => written,
+            Err(error) => {
+                self.record_failure(&pick, &error.to_string());
+                let _ = socket.close().await;
+                return Err(error);
+            }
+        };
         if written != request.len() {
-            return Err(std::io::Error::new(
+            let error = std::io::Error::new(
                 std::io::ErrorKind::WriteZero,
                 format!(
                     "DNS 出口 `{outbound}` UDP 仅发送 {written}/{} bytes",
                     request.len()
                 ),
-            ));
+            );
+            self.record_failure(&pick, &error.to_string());
+            let _ = socket.close().await;
+            return Err(error);
         }
         let mut response = vec![0u8; 65_535];
-        let length = socket.recv_from(&mut response).await?;
+        let length = match socket.recv_from(&mut response).await {
+            Ok(length) => length,
+            Err(error) => {
+                self.record_failure(&pick, &error.to_string());
+                let _ = socket.close().await;
+                return Err(error);
+            }
+        };
         response.truncate(length);
         let _ = socket.close().await;
+        self.record_success(&pick, started.elapsed());
         Ok(response)
     }
 }
@@ -2158,7 +2625,7 @@ route:
             .unwrap();
         let pin = restored
             .groups
-            .read()
+            .load()
             .get("main")
             .unwrap()
             .current_pin()
@@ -2322,11 +2789,11 @@ route:
             .unwrap();
 
         let pick = runtime.pick_outbound("www.google.com", 443, NetworkKind::Tcp);
-        let chain = build_chain(&pick.decision, &pick.label);
+        let chain = pick.chain.clone();
 
         assert_eq!(pick.label, "provider-a/node-1");
         assert_eq!(
-            chain,
+            chain.as_slice(),
             vec!["provider-a/node-1".to_string(), "main".to_string()]
         );
         assert_eq!(
@@ -2343,6 +2810,92 @@ route:
         assert_eq!(snapshots[0].node.name, "provider-a/node-1");
         assert_eq!(snapshots[0].node.host, "203.0.113.10");
         assert_eq!(runtime.node_revision(), 1);
+    }
+
+    #[test]
+    fn nested_policy_and_region_groups_resolve_to_a_full_route_chain() {
+        let plan = load_plan(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+nodes:
+  - {name: HK-1, protocol: direct, address: "127.0.0.1:1"}
+  - {name: US-1, protocol: direct, address: "127.0.0.1:1"}
+groups:
+  香港节点:
+    choose: smart
+    proxies: [HK-1]
+  美国节点:
+    choose: smart
+    proxies: [US-1]
+  节点选择:
+    choose: manual
+    proxies: [香港节点, 美国节点]
+    default-selected: 香港节点
+route:
+  preset: global
+  final: 节点选择
+"#,
+        );
+        let runtime = Runtime::build(plan).unwrap();
+
+        let pick = runtime.pick_outbound("www.example.com", 443, NetworkKind::Tcp);
+
+        assert_eq!(pick.label, "HK-1");
+        assert_eq!(
+            pick.chain.as_slice(),
+            &[
+                "HK-1".to_string(),
+                "香港节点".to_string(),
+                "节点选择".to_string()
+            ]
+        );
+        assert_eq!(runtime.current_group_chain("节点选择"), pick.chain);
+    }
+
+    #[test]
+    fn nested_empty_group_keeps_the_full_chain_and_leaf_fallback() {
+        let plan = load_plan(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+nodes:
+  - {name: HK-1, protocol: direct, address: "127.0.0.1:1"}
+groups:
+  美国节点:
+    choose: smart
+    proxies: [HK-1]
+    filter: "^US-"
+    empty-fallback: DIRECT
+  节点选择:
+    choose: manual
+    proxies: [美国节点]
+route:
+  preset: global
+  final: 节点选择
+"#,
+        );
+        let runtime = Runtime::build(plan).unwrap();
+
+        let pick = runtime.pick_outbound("www.example.com", 443, NetworkKind::Tcp);
+
+        assert_eq!(pick.label, "DIRECT");
+        assert_eq!(
+            pick.chain.as_slice(),
+            &[
+                "DIRECT".to_string(),
+                "美国节点".to_string(),
+                "节点选择".to_string()
+            ]
+        );
+        assert_eq!(
+            runtime.group_leaf_members("节点选择"),
+            vec!["DIRECT".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -2394,7 +2947,7 @@ route:
         assert_eq!(
             runtime
                 .groups
-                .read()
+                .load()
                 .get("main")
                 .unwrap()
                 .current_manual()
@@ -2558,7 +3111,7 @@ route:
             )
             .unwrap();
 
-        let groups = runtime.groups.read();
+        let groups = runtime.groups.load();
         let members = groups.get("main").unwrap().members();
 
         assert!(members.contains(&"provider-a/node-1".to_string()));
@@ -2666,7 +3219,7 @@ route:
         assert_eq!(runtime.node_revision(), 0);
         assert!(runtime.nodes_in_provider("provider-a").is_empty());
         assert_eq!(
-            runtime.groups.read().get("main").unwrap().members(),
+            runtime.groups.load().get("main").unwrap().members(),
             vec!["feed:provider-a".to_string(), "local-node".to_string()]
         );
     }
@@ -2726,7 +3279,7 @@ route:
         assert!(names.contains(&"provider-a/old".to_string()));
         assert!(!names.contains(&"provider-a/bad".to_string()));
         assert_eq!(
-            runtime.groups.read().get("main").unwrap().members(),
+            runtime.groups.load().get("main").unwrap().members(),
             vec!["provider-a/old".to_string()]
         );
     }
@@ -3027,7 +3580,7 @@ route:
 
         assert!(matches!(pick.decision, RouteDecision::Group(ref group) if group == "main"));
         assert_eq!(
-            runtime.smart_target_for_decision(&pick.decision, "Example.COM."),
+            runtime.smart_target_for_chain(&pick.chain, "Example.COM."),
             "Example.COM"
         );
     }

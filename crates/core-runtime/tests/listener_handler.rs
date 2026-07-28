@@ -72,7 +72,7 @@ route:
 
     assert!(matches!(pick.decision, RouteDecision::Group(ref group) if group == "ai"));
     assert_eq!(pick.rule, "RULE-SET");
-    assert_eq!(pick.rule_payload, "set:openai -> ai");
+    assert_eq!(pick.rule_payload, "openai");
 }
 
 #[tokio::test]

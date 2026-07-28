@@ -4238,8 +4238,125 @@ pub struct NodeNetwork {
 pub struct GroupSpec {
     #[serde(default = "default_choose")]
     pub choose: ChooseStrategy,
+    /// 明确列出的节点或下级策略组。与 Mihomo `proxies` 同语义。
+    #[serde(default, alias = "members")]
+    pub proxies: Vec<String>,
+    /// provider 来源，同时向后兼容直接写 `nodes`、节点名或组名。
     #[serde(default)]
     pub r#use: Vec<String>,
+    /// 同时纳入全部静态节点和全部 provider。等价于同时启用
+    /// `include-all-proxies` 与 `include-all-providers`。
+    #[serde(
+        default,
+        rename = "include-all",
+        alias = "include_all",
+        alias = "includeAll"
+    )]
+    pub include_all: bool,
+    /// 自动纳入所有静态节点。
+    #[serde(
+        default,
+        rename = "include-all-proxies",
+        alias = "include_all_proxies",
+        alias = "includeAllProxies"
+    )]
+    pub include_all_proxies: bool,
+    /// 自动纳入所有 provider，运行时随订阅刷新展开。
+    #[serde(
+        default,
+        rename = "include-all-providers",
+        alias = "include_all_providers",
+        alias = "includeAllProviders"
+    )]
+    pub include_all_providers: bool,
+    /// 按 glob 批量引用其它策略组。仅 manual 分流策略组可用。
+    #[serde(
+        default,
+        rename = "include-groups",
+        alias = "include_groups",
+        alias = "includeGroups"
+    )]
+    pub include_groups: Vec<String>,
+    /// 从显式和批量组引用中按 glob 排除策略组。
+    #[serde(
+        default,
+        rename = "exclude-groups",
+        alias = "exclude_groups",
+        alias = "excludeGroups"
+    )]
+    pub exclude_groups: Vec<String>,
+    /// 按 glob 纳入静态节点。
+    #[serde(
+        default,
+        rename = "include-nodes",
+        alias = "include_nodes",
+        alias = "includeNodes"
+    )]
+    pub include_nodes: Vec<String>,
+    /// 按 glob 排除静态节点。
+    #[serde(
+        default,
+        rename = "exclude-nodes",
+        alias = "exclude_nodes",
+        alias = "excludeNodes"
+    )]
+    pub exclude_nodes: Vec<String>,
+    /// 按 glob 纳入 provider。
+    #[serde(
+        default,
+        rename = "include-providers",
+        alias = "include_providers",
+        alias = "includeProviders"
+    )]
+    pub include_providers: Vec<String>,
+    /// 按 glob 排除 provider。
+    #[serde(
+        default,
+        rename = "exclude-providers",
+        alias = "exclude_providers",
+        alias = "excludeProviders"
+    )]
+    pub exclude_providers: Vec<String>,
+    /// 组至少需要的可用候选数。provider 未加载或过滤后不足时使用
+    /// `empty-fallback`。
+    #[serde(
+        default,
+        rename = "min-members",
+        alias = "min_members",
+        alias = "minMembers"
+    )]
+    pub min_members: usize,
+    /// 过滤后最多保留的候选数。0 表示不限制。
+    #[serde(
+        default,
+        rename = "max-members",
+        alias = "max_members",
+        alias = "maxMembers"
+    )]
+    pub max_members: usize,
+    /// 未指定 API pin 时的默认成员。
+    #[serde(
+        default,
+        rename = "default-selected",
+        alias = "default_selected",
+        alias = "defaultSelected"
+    )]
+    pub default_selected: String,
+    /// 组没有足够候选时使用的具体 outbound。可写 DIRECT、BLOCK
+    /// 或静态节点，不允许引用另一个组。
+    #[serde(
+        default = "default_group_empty_fallback",
+        rename = "empty-fallback",
+        alias = "empty_fallback",
+        alias = "emptyFallback"
+    )]
+    pub empty_fallback: String,
+    /// 闲置时停止健康检查。false 表示持续保持组探活计划。
+    #[serde(default = "default_true")]
+    pub lazy: bool,
+    /// weighted 策略的 glob 权重表。未匹配成员权重为 1。
+    #[serde(default)]
+    pub weights: BTreeMap<String, u32>,
     /// 节点名称软偏好。Fast 在 tolerance 内优先，Stable 提升检查层级，
     /// Smart 加入评分。
     #[serde(default)]
@@ -4346,7 +4463,23 @@ impl Default for GroupSpec {
     fn default() -> Self {
         Self {
             choose: default_choose(),
+            proxies: Vec::new(),
             r#use: Vec::new(),
+            include_all: false,
+            include_all_proxies: false,
+            include_all_providers: false,
+            include_groups: Vec::new(),
+            exclude_groups: Vec::new(),
+            include_nodes: Vec::new(),
+            exclude_nodes: Vec::new(),
+            include_providers: Vec::new(),
+            exclude_providers: Vec::new(),
+            min_members: 0,
+            max_members: 0,
+            default_selected: String::new(),
+            empty_fallback: default_group_empty_fallback(),
+            lazy: true,
+            weights: BTreeMap::new(),
             prefer: Vec::new(),
             avoid: Vec::new(),
             check: None,
@@ -4378,6 +4511,8 @@ pub enum ChooseStrategy {
     Fast,
     Stable,
     Spread,
+    Random,
+    Weighted,
     Chain,
 }
 
@@ -5795,6 +5930,9 @@ fn default_group_max_failed_times() -> u32 {
 
 fn default_group_test_timeout() -> Duration {
     Duration::from_secs(5)
+}
+fn default_group_empty_fallback() -> String {
+    "BLOCK".to_string()
 }
 fn default_route_preset() -> String {
     "cn_smart".into()

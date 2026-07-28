@@ -1051,13 +1051,60 @@ route:
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    let g = runtime.groups.read().get("picker").cloned().unwrap();
+    let g = runtime.groups.load().get("picker").cloned().unwrap();
     assert_eq!(g.current_manual().as_deref(), Some("NodeB"));
 }
 
 #[tokio::test]
+async fn nested_groups_expose_group_members_and_the_resolved_leaf_chain() {
+    let cfg = r#"
+version: 1
+profile: desktop
+listen:
+  local: 7890
+nodes:
+  - {name: HK-1, protocol: direct, address: "127.0.0.1:1"}
+groups:
+  香港节点:
+    choose: smart
+    proxies: [HK-1]
+  人工智能:
+    choose: manual
+    proxies: [香港节点]
+route:
+  preset: global
+  final: 人工智能
+"#;
+    let runtime = Arc::new(Runtime::build(load_from_str(cfg).unwrap()).unwrap());
+    let app = core_api::compat::router(NativeState::for_tests(
+        runtime,
+        UrlTester::new(Default::default()),
+        None,
+    ));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/proxies/%E4%BA%BA%E5%B7%A5%E6%99%BA%E8%83%BD")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["now"], "香港节点");
+    assert_eq!(body["all"], json!(["香港节点"]));
+    assert_eq!(body["resolvedNow"], "HK-1");
+    assert_eq!(
+        body["selectedChain"],
+        json!(["HK-1", "香港节点", "人工智能"])
+    );
+}
+
+#[tokio::test]
 async fn clash_pin_is_visible_and_effective_for_every_automatic_group() {
-    for strategy in ["smart", "fast", "stable", "spread"] {
+    for strategy in ["smart", "fast", "stable", "spread", "random", "weighted"] {
         let cfg = format!(
             r#"
 version: 1
@@ -1189,7 +1236,7 @@ route:
     assert!(
         runtime
             .groups
-            .read()
+            .load()
             .get("picker")
             .unwrap()
             .current_pin()

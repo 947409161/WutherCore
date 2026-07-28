@@ -13,6 +13,12 @@ use std::{
     time::Duration,
 };
 
+use globset::{Glob, GlobSet, GlobSetBuilder};
+use indexmap::IndexSet;
+use petgraph::{
+    algo::{astar, toposort},
+    graphmap::DiGraphMap,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -277,8 +283,20 @@ pub struct UserPass {
 pub struct GroupPlan {
     pub name: String,
     pub choose: ChooseStrategy,
-    /// 已展开成的具体 node 名集合。
+    /// 已展开的具体节点、provider 占位符和下级组名，保持配置顺序。
     pub members: Vec<String>,
+    #[serde(default)]
+    pub min_members: usize,
+    #[serde(default)]
+    pub max_members: usize,
+    #[serde(default)]
+    pub default_selected: String,
+    #[serde(default = "default_group_plan_empty_fallback")]
+    pub empty_fallback: String,
+    #[serde(default = "default_true")]
+    pub lazy: bool,
+    #[serde(default)]
+    pub weights: BTreeMap<String, u32>,
     pub prefer: Vec<String>,
     pub avoid: Vec<String>,
     pub check: Option<String>,
@@ -336,6 +354,14 @@ fn default_group_plan_max_failed_times() -> u32 {
 
 fn default_group_plan_test_timeout() -> Duration {
     Duration::from_secs(5)
+}
+
+fn default_group_plan_empty_fallback() -> String {
+    "BLOCK".to_string()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -474,6 +500,7 @@ pub fn compile(mut cfg: UserConfig) -> ConfigResult<RuntimePlan> {
     let route_sets = cfg_route.sets.clone();
     let route = compile_route(cfg_route, &groups, route_sets)?;
     let resolver = cfg.resolver.unwrap_or_default();
+    validate_resolver_group_exits(&resolver)?;
     let capture = cfg.capture.unwrap_or_default();
     validate_capture_platform(&capture)?;
     let smart = cfg.smart.unwrap_or_default();
@@ -499,6 +526,23 @@ pub fn compile(mut cfg: UserConfig) -> ConfigResult<RuntimePlan> {
         mesh,
         find_process_mode,
     })
+}
+
+fn validate_resolver_group_exits(resolver: &Resolver) -> ConfigResult<()> {
+    for (server_name, server) in &resolver.servers {
+        for exit in server.exits() {
+            // provider 节点在配置编译后才加载，因此未知名称必须保留到运行时
+            // 解析；已定义 group 则由 RuntimeDnsOutboundProvider 递归展开。
+            if exit.trim().is_empty() {
+                return Err(ConfigError::invalid(format!(
+                    "resolver.servers.{server_name}.exits 不能包含空名称"
+                ))
+                .at(format!("resolver.servers.{server_name}.exits"))
+                .hint("DNS 出口可引用 DIRECT、BLOCK、静态节点、provider 节点或策略组"));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_database(database: &DatabaseConfig) -> ConfigResult<()> {
@@ -2948,6 +2992,8 @@ fn compile_groups(
     let mut out = BTreeMap::new();
     let valid_feeds: std::collections::HashSet<&str> =
         cfg.feeds.keys().map(|s| s.as_str()).collect();
+    let valid_groups: std::collections::HashSet<&str> =
+        cfg.groups.keys().map(|s| s.as_str()).collect();
     for (name, g) in &cfg.groups {
         if g.interval < Duration::from_secs(1) {
             return Err(
@@ -2965,6 +3011,18 @@ fn compile_groups(
             return Err(
                 ConfigError::invalid(format!("groups.{name}.max-failed-times 必须大于 0"))
                     .at(format!("groups.{name}.max-failed-times")),
+            );
+        }
+        if g.max_members != 0 && g.max_members < g.min_members {
+            return Err(ConfigError::invalid(format!(
+                "groups.{name}.max-members 不能小于 min-members"
+            ))
+            .at(format!("groups.{name}.max-members")));
+        }
+        if g.weights.values().any(|weight| *weight == 0) {
+            return Err(
+                ConfigError::invalid(format!("groups.{name}.weights 的权重必须大于 0"))
+                    .at(format!("groups.{name}.weights")),
             );
         }
         if let Some(check) = g.check.as_deref() {
@@ -3016,31 +3074,50 @@ fn compile_groups(
             ))
             .at(format!("groups.{name}.choose"))
             .hint(
-                "请改用 manual / smart / fast / stable / spread；\
+                "请改用 manual / smart / fast / stable / spread / random / weighted；\
                      多跳链路实现前不会静默退化为单跳",
             ));
         }
-        let mut members = Vec::new();
-        for src in &g.r#use {
+        let include_nodes = compile_group_globs(name, "include-nodes", &g.include_nodes)?;
+        let exclude_nodes = compile_group_globs(name, "exclude-nodes", &g.exclude_nodes)?;
+        let include_providers =
+            compile_group_globs(name, "include-providers", &g.include_providers)?;
+        let exclude_providers =
+            compile_group_globs(name, "exclude-providers", &g.exclude_providers)?;
+        let include_groups = compile_group_globs(name, "include-groups", &g.include_groups)?;
+        let exclude_groups = compile_group_globs(name, "exclude-groups", &g.exclude_groups)?;
+        for pattern in g.weights.keys() {
+            compile_group_globs(name, "weights", std::slice::from_ref(pattern))?;
+        }
+
+        let mut members = IndexSet::new();
+        for src in g.proxies.iter().chain(&g.r#use) {
             if src == "nodes" {
                 for n in nodes {
-                    members.push(n.name.clone());
+                    members.insert(n.name.clone());
                 }
                 continue;
             }
             if valid_feeds.contains(src.as_str()) {
                 // feeds 节点在运行时按需展开（订阅刷新），这里只做引用记录。
-                members.push(format!("feed:{src}"));
+                members.insert(format!("feed:{src}"));
+                continue;
+            }
+            // manual 分流策略组可以引用其它组。典型结构是：
+            // 分流策略组 -> 地区节点组 -> provider/static nodes。
+            if valid_groups.contains(src.as_str()) {
+                members.insert(src.clone());
                 continue;
             }
             // 也允许直接引用具体节点名
             if nodes.iter().any(|n| &n.name == src) {
-                members.push(src.clone());
+                members.insert(src.clone());
                 continue;
             }
             let valid: Vec<String> = valid_feeds
                 .iter()
                 .map(|s| s.to_string())
+                .chain(valid_groups.iter().map(|s| s.to_string()))
                 .chain(std::iter::once("nodes".into()))
                 .collect();
             return Err(
@@ -3048,9 +3125,71 @@ fn compile_groups(
                     .at(format!("groups.{name}"))
                     .hint(format!(
                         "可用来源只有 {} 或具体的 node 名",
-                        valid.join("、")
+                        valid.join(", ")
                     )),
             );
+        }
+
+        let include_all_nodes = g.include_all || g.include_all_proxies;
+        let include_all_providers = g.include_all || g.include_all_providers;
+        let mut sorted_nodes: Vec<&ParsedNode> = nodes.iter().collect();
+        sorted_nodes.sort_by(|left, right| left.name.cmp(&right.name));
+        for node in sorted_nodes {
+            if (include_all_nodes || include_nodes.is_match(&node.name))
+                && !exclude_nodes.is_match(&node.name)
+            {
+                members.insert(node.name.clone());
+            }
+        }
+        for provider in cfg.feeds.keys() {
+            if (include_all_providers || include_providers.is_match(provider))
+                && !exclude_providers.is_match(provider)
+            {
+                members.insert(format!("feed:{provider}"));
+            }
+        }
+        for group_name in cfg.groups.keys() {
+            if group_name != name
+                && include_groups.is_match(group_name)
+                && !exclude_groups.is_match(group_name)
+            {
+                members.insert(group_name.clone());
+            }
+        }
+        members.retain(|member| {
+            if let Some(provider) = member.strip_prefix("feed:") {
+                return !exclude_providers.is_match(provider);
+            }
+            if valid_groups.contains(member.as_str()) {
+                return !exclude_groups.is_match(member);
+            }
+            !exclude_nodes.is_match(member)
+        });
+        let members: Vec<String> = members.into_iter().collect();
+
+        if !g.default_selected.is_empty() && !members.contains(&g.default_selected) {
+            return Err(ConfigError::invalid(format!(
+                "groups.{name}.default-selected `{}` 不在编译后的成员中",
+                g.default_selected
+            ))
+            .at(format!("groups.{name}.default-selected")));
+        }
+        if valid_groups.contains(g.empty_fallback.as_str()) {
+            return Err(ConfigError::invalid(format!(
+                "groups.{name}.empty-fallback 不能引用另一个策略组"
+            ))
+            .at(format!("groups.{name}.empty-fallback")));
+        }
+        let fallback_is_known = matches!(
+            g.empty_fallback.to_ascii_uppercase().as_str(),
+            "DIRECT" | "BLOCK" | "REJECT"
+        ) || nodes.iter().any(|node| node.name == g.empty_fallback);
+        if !fallback_is_known {
+            return Err(ConfigError::unknown_ref(format!(
+                "groups.{name}.empty-fallback 引用了未知 outbound `{}`",
+                g.empty_fallback
+            ))
+            .at(format!("groups.{name}.empty-fallback")));
         }
         out.insert(
             name.clone(),
@@ -3058,6 +3197,12 @@ fn compile_groups(
                 name: name.clone(),
                 choose: g.choose,
                 members,
+                min_members: g.min_members,
+                max_members: g.max_members,
+                default_selected: g.default_selected.clone(),
+                empty_fallback: g.empty_fallback.clone(),
+                lazy: g.lazy,
+                weights: g.weights.clone(),
                 prefer: g.prefer.clone(),
                 avoid: g.avoid.clone(),
                 check: g.check.clone(),
@@ -3083,7 +3228,80 @@ fn compile_groups(
             },
         );
     }
+    validate_group_graph(&out)?;
     Ok(out)
+}
+
+fn compile_group_globs(group: &str, field: &str, patterns: &[String]) -> ConfigResult<GlobSet> {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        let glob = Glob::new(pattern).map_err(|error| {
+            ConfigError::invalid(format!(
+                "groups.{group}.{field} glob `{pattern}` 非法: {error}"
+            ))
+            .at(format!("groups.{group}.{field}"))
+        })?;
+        builder.add(glob);
+    }
+    builder.build().map_err(|error| {
+        ConfigError::invalid(format!("groups.{group}.{field} 编译失败: {error}"))
+            .at(format!("groups.{group}.{field}"))
+    })
+}
+
+fn validate_group_graph(groups: &BTreeMap<String, GroupPlan>) -> ConfigResult<()> {
+    let mut graph = DiGraphMap::<&str, ()>::new();
+    for name in groups.keys() {
+        graph.add_node(name);
+    }
+    for (name, group) in groups {
+        for member in &group.members {
+            if groups.contains_key(member) {
+                graph.add_edge(name, member, ());
+            }
+        }
+    }
+    if let Err(cycle) = toposort(&graph, None) {
+        let start = cycle.node_id();
+        let cycle_path = graph
+            .neighbors(start)
+            .find_map(|child| {
+                if child == start {
+                    return Some(vec![start, start]);
+                }
+                astar(&graph, child, |node| node == start, |_| 1usize, |_| 0usize).map(
+                    |(_, path)| {
+                        let mut cycle = Vec::with_capacity(path.len() + 1);
+                        cycle.push(start);
+                        cycle.extend(path);
+                        cycle
+                    },
+                )
+            })
+            .unwrap_or_else(|| vec![start, start]);
+        return Err(ConfigError::invalid(format!(
+            "策略组存在循环引用: {}",
+            cycle_path.join(" -> ")
+        ))
+        .at(format!("groups.{start}.use"))
+        .hint("分流策略组可以引用节点组，但下级组不能反向引用上层组"));
+    }
+
+    for (name, group) in groups {
+        let nested_groups: Vec<&str> = group
+            .members
+            .iter()
+            .filter_map(|member| groups.contains_key(member).then_some(member.as_str()))
+            .collect();
+        if !nested_groups.is_empty() && group.choose != ChooseStrategy::Manual {
+            return Err(ConfigError::invalid(format!(
+                "groups.{name} 引用了下级策略组，但 choose 不是 manual"
+            ))
+            .at(format!("groups.{name}.choose"))
+            .hint("上层分流策略组请使用 manual；smart、fast、stable、spread 节点组应直接引用订阅或节点"));
+        }
+    }
+    Ok(())
 }
 
 fn validate_group_expected_status(expression: &str) -> Result<(), String> {
@@ -6584,6 +6802,79 @@ route:
         )
         .unwrap_err();
         assert!(error.to_string().contains("循环引用"));
+    }
+
+    #[test]
+    fn group_graph_compiles_ordered_sources_and_advanced_policies() {
+        let plan = compile_cfg(
+            r#"
+version: 1
+profile: desktop
+nodes:
+  - {name: HK-1, protocol: direct, address: "127.0.0.1:1"}
+  - {name: US-1, protocol: direct, address: "127.0.0.1:1"}
+feeds:
+  primary: https://example.invalid/provider.yaml
+groups:
+  香港节点:
+    choose: weighted
+    proxies: [HK-1]
+    include-providers: [pri*]
+    weights: {"HK-*": 10, "*": 1}
+    empty-fallback: DIRECT
+  美国节点:
+    choose: random
+    include-nodes: ["US-*"]
+    empty-fallback: DIRECT
+  人工智能:
+    choose: manual
+    proxies: [美国节点, 香港节点]
+    default-selected: 美国节点
+  全部地区:
+    choose: manual
+    include-groups: ["*节点"]
+    exclude-groups: ["测试*"]
+route:
+  preset: global
+  final: 人工智能
+"#,
+        );
+
+        assert_eq!(
+            plan.groups["人工智能"].members,
+            vec!["美国节点".to_string(), "香港节点".to_string()]
+        );
+        assert_eq!(plan.groups["人工智能"].default_selected, "美国节点");
+        assert_eq!(
+            plan.groups["香港节点"].members,
+            vec!["HK-1".to_string(), "feed:primary".to_string()]
+        );
+        assert_eq!(
+            plan.groups["全部地区"].members,
+            vec!["美国节点".to_string(), "香港节点".to_string()]
+        );
+    }
+
+    #[test]
+    fn group_graph_reports_the_actual_cycle_path() {
+        let error = crate::loader::load_from_str(
+            r#"
+version: 1
+profile: desktop
+groups:
+  入口: {choose: manual, proxies: [地区]}
+  地区: {choose: manual, proxies: [回退]}
+  回退: {choose: manual, proxies: [入口]}
+route: {preset: global, final: 入口}
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("循环引用"), "{error}");
+        assert!(error.contains("入口"), "{error}");
+        assert!(error.contains("地区"), "{error}");
+        assert!(error.contains("回退"), "{error}");
     }
 
     /// mihomo 友好别名（hyphen 形式）应与 canonical 等价。

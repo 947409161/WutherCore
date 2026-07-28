@@ -14,7 +14,7 @@ pub mod listener_handler;
 
 pub use dns_listener::{DnsListener, DnsListenerError, parse_dns_listen_addr, spawn_dns_listener};
 pub use engine::{
-    DialResult, RoutePick, Runtime, RuntimeError, RuntimeNodeSnapshot, UdpDialResult,
+    DialResult, GroupChain, RoutePick, Runtime, RuntimeError, RuntimeNodeSnapshot, UdpDialResult,
 };
 pub use group_selector::{
     FlowMeta, GroupOptions, GroupPin, GroupSelector, LbStrategy, ManualProbeToken, PinSource,

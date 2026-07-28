@@ -131,13 +131,19 @@ async fn groups(State(s): State<NativeState>) -> impl IntoResponse {
     let groups: Vec<_> = s
         .runtime
         .groups
-        .read()
+        .load()
         .iter()
         .map(|(_, g)| {
             let options = g.options();
+            let selected_chain = s.runtime.current_group_chain(g.name());
+            let resolved_member = selected_chain.first().cloned().unwrap_or_default();
+            let members = s.runtime.group_visible_members(g.name());
             json!({
                 "name": g.name(),
-                "members": g.members(),
+                "members": members,
+                "configured_members": g.members(),
+                "resolved_member": resolved_member,
+                "selected_chain": selected_chain,
                 "manual": g.current_manual(),
                 "pin": g.current_pin().map(|pin| json!({
                     "node": pin.node,
@@ -146,6 +152,12 @@ async fn groups(State(s): State<NativeState>) -> impl IntoResponse {
                     "source": pin.source.as_str(),
                 })),
                 "strategy": format!("{:?}", g.plan().choose).to_ascii_lowercase(),
+                "default_selected": g.plan().default_selected,
+                "empty_fallback": g.plan().empty_fallback,
+                "min_members": g.plan().min_members,
+                "max_members": g.plan().max_members,
+                "lazy": g.plan().lazy,
+                "weights": g.plan().weights,
                 "hidden": options.hidden,
                 "icon": options.icon,
             })
@@ -164,7 +176,7 @@ async fn patch_group(
     Path(name): Path<String>,
     Json(body): Json<GroupPatch>,
 ) -> impl IntoResponse {
-    let valid = s.runtime.groups.read().get(&name).map(|group| {
+    let valid = s.runtime.groups.load().get(&name).map(|group| {
         body.pick.is_empty() || group.members().iter().any(|member| member == &body.pick)
     });
     if valid.is_none() {
@@ -369,7 +381,7 @@ async fn smart_why(
     State(s): State<NativeState>,
     Query(q): Query<SmartWhyParams>,
 ) -> impl IntoResponse {
-    let groups = s.runtime.groups.read();
+    let groups = s.runtime.groups.load();
     let g = match groups.get(&q.group) {
         Some(g) => g,
         None => {
@@ -440,7 +452,7 @@ async fn smart_cache(State(s): State<NativeState>) -> impl IntoResponse {
 }
 
 async fn smart_nodes(State(s): State<NativeState>, Path(group): Path<String>) -> impl IntoResponse {
-    let groups = s.runtime.groups.read();
+    let groups = s.runtime.groups.load();
     if let Some(g) = groups.get(&group) {
         Json(json!({"group": g.name(), "members": g.members()})).into_response()
     } else {

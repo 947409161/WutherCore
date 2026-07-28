@@ -599,7 +599,7 @@ async fn proxy_put(
         s.caches.invalidate_proxy_state();
         return r;
     }
-    let groups = s.runtime.groups.read();
+    let groups = s.runtime.groups.load();
     let Some(g) = groups.get(&group) else {
         return (
             StatusCode::NOT_FOUND,
@@ -642,7 +642,7 @@ async fn proxy_clear(
 }
 
 async fn clear_pin_inner(s: &NativeState, group: &str) -> axum::response::Response {
-    let groups = s.runtime.groups.read();
+    let groups = s.runtime.groups.load();
     let Some(g) = groups.get(group) else {
         return (
             StatusCode::NOT_FOUND,
@@ -705,22 +705,9 @@ async fn proxy_delay(
         None => None,
     };
     let to = q.timeout.map(Duration::from_millis);
-    // Mihomo `proxy.URLTest()` 对 group 名递归到当前选中成员；WutherCore 的
-    // `test_node` 只查 outbounds 注册表（不含 group），group 名直接 UnknownNode，
-    // dashboard 看到全是 timeout。这里仿照 mihomo：name 是 group → 转测它的
-    // `now` 成员；group 没选过 → 用 members.first() 兜底；name 不是 group →
-    // 走原 test_node 路径。
-    let target = match s.runtime.groups.read().get(&name) {
-        Some(g) => g
-            .to_clash_json()
-            .get("now")
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-            .filter(|s| !s.is_empty())
-            .or_else(|| g.members().first().cloned())
-            .unwrap_or_else(|| name.clone()),
-        None => name.clone(),
-    };
+    // Group URLTest 必须递归到当前实际叶子节点。只取上层组的 `now`
+    // 会把地区节点组交给 test_node，最终被误报成 UnknownNode。
+    let target = selected_leaf_name(&s.runtime, &name);
 
     // sing-box `getProxyDelay`: 多采样取中位数稳定结果。第一次 < 50ms 直接采用。
     const MAX_SAMPLES: usize = 3;
@@ -778,7 +765,7 @@ async fn groups_list(State(s): State<NativeState>) -> Json<Value> {
     let groups: Vec<Value> = s
         .runtime
         .groups
-        .read()
+        .load()
         .iter()
         .map(|(_, g)| group_json(g, urltest, &default_url, &s.runtime))
         .collect();
@@ -791,7 +778,7 @@ async fn group_one(
 ) -> axum::response::Response {
     let urltest = &s.urltest;
     let default_url = urltest.current_config().default_url;
-    if let Some(g) = s.runtime.groups.read().get(&name) {
+    if let Some(g) = s.runtime.groups.load().get(&name) {
         return Json(group_json(g, urltest, &default_url, &s.runtime)).into_response();
     }
     (
@@ -824,16 +811,9 @@ async fn group_delay(
         }
         None => None,
     };
-    let (members, probe_token, unified_delay) = match s.runtime.groups.read().get(&name) {
+    let (members, probe_token, unified_delay) = match s.runtime.groups.load().get(&name) {
         Some(g) => {
-            let registry = s.runtime.outbounds.read();
-            let mut members = g.filtered_members(|node| {
-                registry
-                    .get(node)
-                    .map(|outbound| outbound.protocol().to_string())
-                    .unwrap_or_default()
-            });
-            members.retain(|node| registry.get(node).is_some());
+            let members = s.runtime.group_leaf_members(&name);
             (members, g.begin_manual_probe(), g.options().unified_delay)
         }
         None => {
@@ -862,7 +842,7 @@ async fn group_delay(
         .complete_group_manual_probe(&name, probe_token, !body.is_empty())
         .await;
     if released {
-        if let Some(group) = s.runtime.groups.read().get(&name) {
+        if let Some(group) = s.runtime.groups.load().get(&name) {
             group.reselect_after_manual_probe(&members, &url, &s.runtime.smart, &s.urltest);
         }
         s.caches.invalidate_proxy_state();
@@ -958,7 +938,7 @@ fn collect_proxy_map(s: &NativeState) -> Map<String, Value> {
         })
     }
 
-    for (name, g) in runtime.groups.read().iter() {
+    for (name, g) in runtime.groups.load().iter() {
         proxies.insert(name.clone(), group_json(g, urltest, &default_url, runtime));
         let _ = (name, g); // silence unused if future refactor
     }
@@ -1005,13 +985,17 @@ fn collect_proxy_map(s: &NativeState) -> Map<String, Value> {
         }),
     );
     let global_now = runtime.plan.route.r#final.clone();
-    let global_history = history_for(&global_now);
+    let global_leaf = selected_leaf_name(runtime, &global_now);
+    let global_history = history_for(&global_leaf);
     let global_delay = delay_from_history(&global_history);
-    let global_alive = if global_now.is_empty() || global_now == "DIRECT" || global_now == "REJECT"
+    let global_alive = if global_leaf.is_empty()
+        || global_leaf == "DIRECT"
+        || global_leaf == "REJECT"
+        || global_leaf == "BLOCK"
     {
         true
     } else {
-        urltest.alive_for_url(&global_now, &default_url)
+        urltest.alive_for_url(&global_leaf, &default_url)
     };
     let (global_udp, global_smux) = effective_proxy_capabilities(runtime, &global_now);
     proxies.insert(
@@ -1058,13 +1042,34 @@ fn group_json(
         .url
         .filter(|url| !url.is_empty())
         .unwrap_or_else(|| default_url.to_string());
-    let now = json
-        .get("now")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .filter(|s| !s.is_empty());
+    let selected_chain = runtime.current_group_chain(g.name());
+    let now = selected_chain
+        .first()
+        .cloned()
+        .filter(|value| !value.is_empty());
+    let direct_member = selected_chain
+        .len()
+        .checked_sub(2)
+        .and_then(|index| selected_chain.get(index))
+        .cloned()
+        .or_else(|| now.clone())
+        .unwrap_or_default();
 
     if let Some(obj) = json.as_object_mut() {
+        let visible_members = runtime.group_visible_members(g.name());
+        obj.insert("now".into(), Value::String(direct_member));
+        obj.insert(
+            "all".into(),
+            Value::Array(visible_members.iter().cloned().map(Value::String).collect()),
+        );
+        obj.insert(
+            "selectedChain".into(),
+            Value::Array(selected_chain.iter().cloned().map(Value::String).collect()),
+        );
+        obj.insert(
+            "resolvedNow".into(),
+            Value::String(selected_chain.first().cloned().unwrap_or_default()),
+        );
         // 默认填空 history / alive / delay，避免 dashboard 取不到字段
         // 时把 group 渲染为"超时"。
         if !obj.contains_key("history") {
@@ -1087,8 +1092,7 @@ fn group_json(
             .or_insert(Value::String(String::new()));
         obj.entry("emptyFallback").or_insert(Value::Bool(false));
         obj.insert("testUrl".into(), Value::String(test_url.clone()));
-        let member_capabilities: Vec<_> = g
-            .members()
+        let member_capabilities: Vec<_> = visible_members
             .iter()
             .map(|member| effective_proxy_capabilities(runtime, member))
             .collect();
@@ -1103,7 +1107,8 @@ fn group_json(
         );
         if let Some(now_node) = now.as_deref() {
             let history = node_history(urltest, runtime, now_node, &test_url);
-            let alive = urltest.alive_for_url(now_node, &test_url);
+            let alive = matches!(now_node, "DIRECT" | "REJECT" | "BLOCK")
+                || urltest.alive_for_url(now_node, &test_url);
             let delay = delay_from_history(&history);
             obj.insert("history".into(), history.clone());
             obj.insert("alive".into(), Value::Bool(alive));
@@ -1115,6 +1120,17 @@ fn group_json(
         }
     }
     json
+}
+
+fn selected_leaf_name(runtime: &Arc<Runtime>, name: &str) -> String {
+    if !runtime.groups.load().contains_key(name) {
+        return name.to_string();
+    }
+    runtime
+        .current_group_chain(name)
+        .first()
+        .cloned()
+        .unwrap_or_default()
 }
 
 fn effective_proxy_capabilities(runtime: &Arc<Runtime>, name: &str) -> (bool, bool) {
@@ -1129,12 +1145,8 @@ fn effective_proxy_capabilities_inner(
     if depth >= 16 {
         return (false, false);
     }
-    if let Some(members) = runtime
-        .groups
-        .read()
-        .get(name)
-        .map(|group| group.members().to_vec())
-    {
+    if runtime.groups.load().contains_key(name) {
+        let members = runtime.group_visible_members(name);
         return members
             .iter()
             .map(|member| effective_proxy_capabilities_inner(runtime, member, depth + 1))

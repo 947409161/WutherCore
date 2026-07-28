@@ -36,8 +36,13 @@ use core_config::{
     runtime_plan::GroupPlan,
 };
 use core_smart::{SmartContext, SmartSelector};
+use globset::{Glob, GlobMatcher};
 use lru::LruCache;
 use parking_lot::{Mutex, RwLock};
+use rand::{
+    RngExt,
+    distr::{Distribution, weighted::WeightedIndex},
+};
 use regex::Regex;
 use tracing::debug;
 
@@ -133,6 +138,8 @@ pub struct GroupOptions {
     pub test_timeout_ms: u64,
     /// 是否禁用 UDP（disable-udp）
     pub disable_udp: bool,
+    /// true 时闲置组暂停探活。
+    pub lazy: bool,
     /// 仅 dashboard 显示用
     pub hidden: bool,
     pub icon: String,
@@ -154,6 +161,7 @@ impl Default for GroupOptions {
             max_failed_times: 5,
             test_timeout_ms: 5_000,
             disable_udp: false,
+            lazy: true,
             hidden: false,
             icon: String::new(),
         }
@@ -254,6 +262,7 @@ pub struct GroupSelector {
     filter_regs: RwLock<Vec<Regex>>,
     exclude_filter_regs: RwLock<Vec<Regex>>,
     exclude_type_set: RwLock<Vec<String>>,
+    weight_matchers: Vec<(GlobMatcher, u32)>,
     health_revision: AtomicU64,
     /// 所有组类型共享的用户固定选择。
     pin: RwLock<Option<GroupPin>>,
@@ -283,6 +292,7 @@ impl GroupSelector {
             max_failed_times: plan.max_failed_times,
             test_timeout_ms: plan.test_timeout.as_millis().min(u64::MAX as u128) as u64,
             disable_udp: plan.disable_udp,
+            lazy: plan.lazy,
             hidden: plan.hidden,
             icon: plan.icon.clone(),
         };
@@ -290,12 +300,22 @@ impl GroupSelector {
     }
 
     pub fn with_options(plan: GroupPlan, opts: GroupOptions) -> Self {
+        let weight_matchers = plan
+            .weights
+            .iter()
+            .filter_map(|(pattern, weight)| {
+                Glob::new(pattern)
+                    .ok()
+                    .map(|glob| (glob.compile_matcher(), *weight))
+            })
+            .collect();
         let me = Self {
             plan,
             opts: RwLock::new(GroupOptions::default()),
             filter_regs: RwLock::new(Vec::new()),
             exclude_filter_regs: RwLock::new(Vec::new()),
             exclude_type_set: RwLock::new(Vec::new()),
+            weight_matchers,
             health_revision: AtomicU64::new(0),
             pin: RwLock::new(None),
             pin_generation: AtomicU64::new(0),
@@ -348,8 +368,7 @@ impl GroupSelector {
         let filt = self.filter_regs.read();
         let excl = self.exclude_filter_regs.read();
         let etypes = self.exclude_type_set.read();
-        let mut out: Vec<String> = self
-            .plan
+        self.plan
             .members
             .iter()
             .filter(|n| {
@@ -368,12 +387,7 @@ impl GroupSelector {
                 true
             })
             .cloned()
-            .collect();
-        if out.is_empty() {
-            // 兼容 mihomo："filter 空命中时回退原 members"（不会让 group 完全不可用）。
-            out = self.plan.members.clone();
-        }
-        out
+            .collect()
     }
 
     pub fn has_unresolved_feed_placeholders(&self) -> bool {
@@ -516,7 +530,11 @@ impl GroupSelector {
         }
         let before_eligibility = members.len();
         members.retain(|m| eligible(m));
-        if members.is_empty() {
+        if self.plan.max_members > 0 && members.len() > self.plan.max_members {
+            members.truncate(self.plan.max_members);
+        }
+        let required_members = self.plan.min_members.max(1);
+        if members.len() < required_members {
             tracing::warn!(
                 target: "group::pick",
                 group = %self.plan.name,
@@ -524,8 +542,10 @@ impl GroupSelector {
                 host = %meta.host,
                 unresolved_feeds,
                 candidates_before_eligibility = before_eligibility,
+                candidates_after_eligibility = members.len(),
+                required_members,
                 network = meta.network,
-                "no selectable members after filter/provider expansion -> caller will fall back",
+                "not enough selectable members after filter/provider expansion",
             );
             return None;
         }
@@ -534,8 +554,17 @@ impl GroupSelector {
                 .map(|t| t.current_config().default_url)
                 .unwrap_or_default()
         });
-        if let Some(tester) = tester {
+        // manual 是上层分流策略组时，成员可能是地区节点组而不是实际
+        // outbound。它只负责保存用户选择，健康检查由下级节点组执行。
+        if !matches!(self.plan.choose, ChooseStrategy::Manual)
+            && let Some(tester) = tester
+        {
             let opts = self.opts.read().clone();
+            let idle_timeout = if opts.lazy {
+                opts.idle_timeout
+            } else {
+                Duration::from_secs(10 * 365 * 24 * 60 * 60)
+            };
             tester.activate_group(
                 self.name(),
                 self.health_revision.load(Ordering::Acquire),
@@ -544,7 +573,7 @@ impl GroupSelector {
                 &opts.expected_status,
                 opts.unified_delay,
                 opts.interval,
-                opts.idle_timeout,
+                idle_timeout,
             );
         }
         let started = std::time::Instant::now();
@@ -556,6 +585,8 @@ impl GroupSelector {
                 ChooseStrategy::Fast => self.pick_url_test(&members, &url, tester),
                 ChooseStrategy::Stable => self.pick_fallback(&members, &url, tester),
                 ChooseStrategy::Spread => self.pick_load_balance(meta, &members, &url, tester),
+                ChooseStrategy::Random => self.pick_random(&members, &url, tester),
+                ChooseStrategy::Weighted => self.pick_weighted(&members, &url, tester),
                 ChooseStrategy::Chain => self.pick_chain(&members),
             });
         match &chosen {
@@ -637,12 +668,20 @@ impl GroupSelector {
         tester: &Arc<UrlTester>,
         protocol_of: impl Fn(&str) -> String,
     ) {
+        if matches!(self.plan.choose, ChooseStrategy::Manual) {
+            return;
+        }
         let members = self.filtered_members(protocol_of);
         let opts = self.opts.read().clone();
         let url = opts
             .url
             .clone()
             .unwrap_or_else(|| tester.current_config().default_url);
+        let idle_timeout = if opts.lazy {
+            opts.idle_timeout
+        } else {
+            Duration::from_secs(10 * 365 * 24 * 60 * 60)
+        };
         tester.activate_group(
             self.name(),
             self.health_revision.load(Ordering::Acquire),
@@ -651,12 +690,76 @@ impl GroupSelector {
             &opts.expected_status,
             opts.unified_delay,
             opts.interval,
-            opts.idle_timeout,
+            idle_timeout,
         );
     }
 
     fn pick_manual(&self, members: &[String]) -> Option<String> {
-        members.first().cloned()
+        members
+            .iter()
+            .find(|member| **member == self.plan.default_selected)
+            .cloned()
+            .or_else(|| members.first().cloned())
+    }
+
+    fn pick_random(
+        &self,
+        members: &[String],
+        url: &str,
+        tester: Option<&Arc<UrlTester>>,
+    ) -> Option<String> {
+        let candidates = self.non_avoided_members(members, url, tester.map(Arc::as_ref));
+        let available: Vec<String> = candidates
+            .iter()
+            .filter(|member| {
+                tester
+                    .map(|tester| tester.alive_for_url(member, url))
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        if available.is_empty() {
+            return members.first().cloned();
+        }
+        let index = rand::rng().random_range(0..available.len());
+        Some(available[index].clone())
+    }
+
+    fn pick_weighted(
+        &self,
+        members: &[String],
+        url: &str,
+        tester: Option<&Arc<UrlTester>>,
+    ) -> Option<String> {
+        let candidates = self.non_avoided_members(members, url, tester.map(Arc::as_ref));
+        let available: Vec<String> = candidates
+            .iter()
+            .filter(|member| {
+                tester
+                    .map(|tester| tester.alive_for_url(member, url))
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        if available.is_empty() {
+            return members.first().cloned();
+        }
+        let weights: Vec<u32> = available
+            .iter()
+            .map(|member| self.weight_for(member))
+            .collect();
+        let index = WeightedIndex::new(&weights)
+            .map(|distribution| distribution.sample(&mut rand::rng()))
+            .unwrap_or(0);
+        Some(available[index].clone())
+    }
+
+    fn weight_for(&self, member: &str) -> u32 {
+        self.weight_matchers
+            .iter()
+            .filter_map(|(matcher, weight)| matcher.is_match(member).then_some(*weight))
+            .max()
+            .unwrap_or(1)
     }
 
     /* ====================================================================
@@ -1049,6 +1152,8 @@ impl GroupSelector {
             ChooseStrategy::Spread => {
                 self.pick_load_balance(&meta, members, tested_url, Some(tester))
             }
+            ChooseStrategy::Random => self.pick_random(members, tested_url, Some(tester)),
+            ChooseStrategy::Weighted => self.pick_weighted(members, tested_url, Some(tester)),
             ChooseStrategy::Chain => self.pick_chain(members),
         };
         if let Some(node) = selected.as_ref() {
@@ -1069,6 +1174,8 @@ impl GroupSelector {
             ChooseStrategy::Fast => "URLTest",
             ChooseStrategy::Stable => "Fallback",
             ChooseStrategy::Spread => "LoadBalance",
+            ChooseStrategy::Random => "Random",
+            ChooseStrategy::Weighted => "Weighted",
             ChooseStrategy::Chain => "Relay",
         };
         let now = self
@@ -1078,7 +1185,18 @@ impl GroupSelector {
             .filter(|node| self.plan.members.iter().any(|member| member == node))
             .or_else(|| self.current_manual())
             .filter(|node| self.plan.members.iter().any(|member| member == node))
-            .unwrap_or_else(|| self.plan.members.first().cloned().unwrap_or_default());
+            .or_else(|| {
+                (!self.plan.default_selected.is_empty()
+                    && self.plan.members.contains(&self.plan.default_selected))
+                .then(|| self.plan.default_selected.clone())
+            })
+            .unwrap_or_else(|| {
+                self.plan
+                    .members
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| self.plan.empty_fallback.clone())
+            });
         let pin = self.current_pin();
         let mut body = serde_json::json!({
             "type": strategy,
@@ -1086,6 +1204,12 @@ impl GroupSelector {
             "now": now,
             "all": self.plan.members,
             "udp": !opts.disable_udp,
+            "lazy": opts.lazy,
+            "defaultSelected": self.plan.default_selected,
+            "emptyFallback": self.plan.empty_fallback,
+            "minMembers": self.plan.min_members,
+            "maxMembers": self.plan.max_members,
+            "weights": self.plan.weights,
             "alive": true,
             "history": [],
             "extra": {},
@@ -1173,6 +1297,12 @@ mod tests {
             name: "g".into(),
             choose,
             members: members.iter().map(|s| s.to_string()).collect(),
+            min_members: 0,
+            max_members: 0,
+            default_selected: String::new(),
+            empty_fallback: "BLOCK".into(),
+            lazy: true,
+            weights: Default::default(),
             prefer: vec![],
             avoid: vec![],
             check: None,
@@ -1221,6 +1351,43 @@ mod tests {
         let s = smart();
         g.set_manual("ghost");
         assert_eq!(g.pick(&meta("x"), &s, None).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn manual_uses_default_selected_before_the_first_member() {
+        let mut group_plan = plan(ChooseStrategy::Manual, &["a", "b"]);
+        group_plan.default_selected = "b".into();
+        let g = GroupSelector::new(group_plan);
+
+        assert_eq!(g.pick(&meta("x"), &smart(), None).as_deref(), Some("b"));
+        assert_eq!(g.to_clash_json()["now"], "b");
+    }
+
+    #[test]
+    fn weighted_strategy_compiles_glob_weights_and_selects_members() {
+        let mut group_plan = plan(ChooseStrategy::Weighted, &["HK-1", "US-1"]);
+        group_plan.weights.insert("*".into(), 1);
+        group_plan.weights.insert("HK-*".into(), 20);
+        let g = GroupSelector::new(group_plan);
+
+        assert_eq!(g.weight_for("HK-1"), 20);
+        assert_eq!(g.weight_for("US-1"), 1);
+        let picked = g.pick(&meta("x"), &smart(), None).unwrap();
+        assert!(matches!(picked.as_str(), "HK-1" | "US-1"));
+    }
+
+    #[test]
+    fn candidate_limits_are_enforced_after_filtering() {
+        let mut group_plan = plan(ChooseStrategy::Manual, &["a", "b", "c"]);
+        group_plan.max_members = 2;
+        group_plan.min_members = 2;
+        let g = GroupSelector::new(group_plan);
+        assert_eq!(g.pick(&meta("x"), &smart(), None).as_deref(), Some("a"));
+
+        let mut group_plan = plan(ChooseStrategy::Manual, &["a"]);
+        group_plan.min_members = 2;
+        let g = GroupSelector::new(group_plan);
+        assert!(g.pick(&meta("x"), &smart(), None).is_none());
     }
 
     #[test]
@@ -1349,6 +1516,8 @@ mod tests {
             ChooseStrategy::Fast,
             ChooseStrategy::Stable,
             ChooseStrategy::Spread,
+            ChooseStrategy::Random,
+            ChooseStrategy::Weighted,
             ChooseStrategy::Chain,
         ] {
             let g = GroupSelector::new(plan(strategy, &["a", "b"]));
@@ -1368,6 +1537,8 @@ mod tests {
             ChooseStrategy::Fast,
             ChooseStrategy::Stable,
             ChooseStrategy::Spread,
+            ChooseStrategy::Random,
+            ChooseStrategy::Weighted,
             ChooseStrategy::Chain,
         ] {
             let g = GroupSelector::new(plan(strategy, &["a", "b"]));
@@ -1511,14 +1682,39 @@ mod tests {
     }
 
     #[test]
-    fn filter_empty_match_falls_back_to_full_members() {
+    fn filter_empty_match_uses_configured_empty_fallback_in_runtime() {
         let g = GroupSelector::new(plan(ChooseStrategy::Manual, &["a", "b"]));
         g.set_options(GroupOptions {
             filter: "^never_match$".into(),
             ..GroupOptions::default()
         });
         let mems = g.filtered_members(|_| String::new());
-        assert_eq!(mems, vec!["a".to_string(), "b".to_string()]);
+        assert!(mems.is_empty());
+    }
+
+    #[test]
+    fn official_region_groups_do_not_mix_nodes_from_other_countries() {
+        let runtime = core_config::loader::load_from_str(include_str!(
+            "../../../examples/official/multi-platform.yaml"
+        ))
+        .unwrap();
+        let members = vec![
+            "[订阅] 香港 HK-01".to_string(),
+            "[订阅] 日本 JP-01".to_string(),
+            "[订阅] 美国 US-01".to_string(),
+            "DIRECT-FALLBACK".to_string(),
+        ];
+
+        for (group_name, expected) in [
+            ("香港节点", "[订阅] 香港 HK-01"),
+            ("日本节点", "[订阅] 日本 JP-01"),
+            ("美国节点", "[订阅] 美国 US-01"),
+        ] {
+            let mut plan = runtime.groups[group_name].clone();
+            plan.members.clone_from(&members);
+            let filtered = GroupSelector::new(plan).filtered_members(|_| String::new());
+            assert_eq!(filtered, vec![expected.to_string()]);
+        }
     }
 
     #[test]

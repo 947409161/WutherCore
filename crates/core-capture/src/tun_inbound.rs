@@ -199,7 +199,7 @@ pub struct TunOutboundMeta {
 impl From<&core_runtime::engine::DialResult> for TunOutboundMeta {
     fn from(res: &core_runtime::engine::DialResult) -> Self {
         Self {
-            chains: res.chain.clone(),
+            chains: res.chain.to_vec(),
             provider_chains: res.provider_chains.clone(),
             remote_destination: res.remote_destination.clone(),
             smart_target: res.smart_target.clone(),
@@ -212,7 +212,7 @@ impl From<&core_runtime::engine::DialResult> for TunOutboundMeta {
 impl From<&core_runtime::engine::UdpDialResult> for TunOutboundMeta {
     fn from(res: &core_runtime::engine::UdpDialResult) -> Self {
         Self {
-            chains: res.chain.clone(),
+            chains: res.chain.to_vec(),
             provider_chains: res.provider_chains.clone(),
             remote_destination: res.remote_destination.clone(),
             smart_target: res.smart_target.clone(),
