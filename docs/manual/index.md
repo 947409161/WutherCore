@@ -25,6 +25,7 @@ description: 从配置加载到运行时行为的完整使用手册
 | 写第一份配置 | [配置文件](configuration-file.md) | [根字段索引](generated/core.md) |
 | 开本地端口或服务端入站 | [监听与入站](inbounds.md) | [入站字段索引](generated/inbounds.md) |
 | 导入订阅或手动节点 | [订阅与节点](feeds-nodes.md) | [节点字段索引](generated/feeds-nodes.md) |
+| 直接使用正式多平台基线 | [官方多平台完整配置](official-configuration.md) | [示例配置](../examples.md) |
 | 配置分组、路由和 DNS | [路由与 DNS](routing-dns.md) | [路由与 DNS 字段索引](generated/routing-dns.md) |
 | 启用 TUN 或透明接管 | [系统接管](capture.md) | [接管字段索引](generated/capture-runtime.md) |
 | 部署 Android root 或 VpnService | [Android 完整部署](android.md) | [接管字段索引](generated/capture-runtime.md) |

@@ -633,4 +633,25 @@ route:
             assert!(!capture.tun.auto_redirect);
         }
     }
+
+    #[test]
+    fn official_multi_platform_example_compiles_as_a_complete_runtime_plan() {
+        let plan = load_from_str(include_str!(
+            "../../../examples/official/multi-platform.yaml"
+        ))
+        .unwrap();
+
+        assert_eq!(plan.name, "official-multi-platform");
+        assert_eq!(plan.feeds.len(), 1);
+        assert_eq!(plan.groups.len(), 10);
+        assert_eq!(plan.route.sets.len(), 24);
+        assert!(plan.capture.on);
+        assert_eq!(plan.capture.method, CaptureMethod::Auto);
+        assert!(!plan.capture.tun.auto_redirect);
+        assert!(plan.groups.contains_key("auto"));
+        assert!(plan.groups.contains_key("load-balance"));
+        assert!(plan.route.sets.contains_key("ads"));
+        assert!(plan.route.sets.contains_key("cn-ip"));
+        assert!(plan.route.sets.contains_key("global"));
+    }
 }

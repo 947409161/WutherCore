@@ -38,6 +38,7 @@ REQUIRED_FILES = (
     "docs/manual/routing-dns.md",
     "docs/manual/capture.md",
     "docs/manual/android.md",
+    "docs/manual/official-configuration.md",
     "docs/manual/runtime-management.md",
     "docs/manual/xhttp-stream.md",
     "docs/manual/advanced-nodes.md",
@@ -61,6 +62,8 @@ REQUIRED_FILES = (
     "examples/advanced/android-root-tun.yaml",
     "examples/advanced/android-root-tproxy.yaml",
     "examples/advanced/android-root-redirect.yaml",
+    "examples/official/multi-platform.yaml",
+    "examples/official/provider-demo.yaml",
     "scripts/config-reference.py",
 )
 

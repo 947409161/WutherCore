@@ -1,0 +1,7 @@
+# WutherCore 官方远程订阅示例。
+#
+# 这个 provider 只包含 Direct 节点，用于验证远程下载、缓存、重命名、
+# 策略组展开和无代理兜底。它不是公共代理服务。
+proxies:
+  - name: Official Direct
+    type: direct

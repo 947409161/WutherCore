@@ -1613,4 +1613,17 @@ proxies:
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].name, "HK premium");
     }
+
+    #[test]
+    fn official_demo_provider_is_a_valid_remote_subscription_document() {
+        let nodes = parse_feed_payload_checked(
+            include_bytes!("../../../examples/official/provider-demo.yaml"),
+            FormatHint::Auto,
+        )
+        .unwrap();
+
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].name, "Official Direct");
+        assert_eq!(nodes[0].protocol, NodeProtocol::Direct);
+    }
 }

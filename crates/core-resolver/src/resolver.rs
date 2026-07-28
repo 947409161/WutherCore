@@ -3101,6 +3101,27 @@ nameserver-policy:
     }
 
     #[test]
+    fn official_multi_platform_resolver_builds_with_all_ruleset_references() {
+        let plan = core_config::loader::load_from_str(include_str!(
+            "../../../examples/official/multi-platform.yaml"
+        ))
+        .unwrap();
+        let rulesets = core_ruleset::RulesetIndex::new();
+        rulesets.declare(plan.route.sets.keys().cloned());
+
+        let resolver = Resolver::try_new_with_rulesets(plan.resolver, Some(rulesets)).unwrap();
+
+        assert!(resolver.groups().contains_key("domestic"));
+        assert!(resolver.groups().contains_key("public"));
+        let crate::policy::DnsAction::Proxy(group) =
+            resolver.policy().decide("unmatched.wuther.test")
+        else {
+            panic!("official resolver final rule must use the public DNS group");
+        };
+        assert_eq!(group, "public");
+    }
+
+    #[test]
     fn advanced_nested_groups_keep_their_boundaries_and_rule_override() {
         let cfg: ResolverCfg = serde_yaml::from_str(
             r#"

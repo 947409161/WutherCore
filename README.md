@@ -251,13 +251,13 @@ cargo build --release -p wuther-core
 复制桌面示例：
 
 ```bash
-cp examples/desktop.yaml config.yaml
+cp examples/official/multi-platform.yaml config.yaml
 ```
 
 Windows PowerShell：
 
 ```powershell
-Copy-Item examples\desktop.yaml config.yaml
+Copy-Item examples\official\multi-platform.yaml config.yaml
 ```
 
 检查配置并启动：
@@ -300,6 +300,7 @@ resolver:
 
 可以直接修改这些示例：
 
+* [`examples/official/multi-platform.yaml`](examples/official/multi-platform.yaml) 是带远程订阅、24 个规则集、10 个策略组、DNS 和跨平台 TUN 的官方完整配置。
 * [`examples/desktop.yaml`](examples/desktop.yaml) 用于桌面普通代理。
 * [`examples/router.yaml`](examples/router.yaml) 用于路由器和透明代理。
 * [`examples/android.yaml`](examples/android.yaml) 用于 Android VpnService。

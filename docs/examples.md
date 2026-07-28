@@ -12,6 +12,7 @@ description: WutherCore Desktop、Router、Android、订阅和 DNS 示例
 
 | 场景 | 文件 | 重点 |
 | --- | --- | --- |
+| 官方多平台完整配置 | [`multi-platform.yaml`](https://github.com/MiChongs/WutherCore/blob/main/examples/official/multi-platform.yaml) | 远程订阅、完整策略组、24 个规则集、DNS 和跨平台 TUN |
 | 桌面普通代理 | [`desktop.yaml`](https://github.com/MiChongs/WutherCore/blob/main/examples/desktop.yaml) | Mixed 监听、手动节点和基本路由 |
 | 路由器/网关 | [`router.yaml`](https://github.com/MiChongs/WutherCore/blob/main/examples/router.yaml) | TUN、自动路由和严格路由 |
 | Android VpnService | [`android.yaml`](https://github.com/MiChongs/WutherCore/blob/main/examples/android.yaml) | 非 root TUN、应用过滤和移动网络 |
@@ -23,6 +24,16 @@ description: WutherCore Desktop、Router、Android、订阅和 DNS 示例
 | Feed | [`with_feed.yaml`](https://github.com/MiChongs/WutherCore/blob/main/examples/with_feed.yaml) | 订阅过滤、重命名和策略组 |
 | 纯手动节点 | [`manual_only.yaml`](https://github.com/MiChongs/WutherCore/blob/main/examples/manual_only.yaml) | 不依赖订阅服务 |
 | 日常策略 | [`daily.yaml`](https://github.com/MiChongs/WutherCore/blob/main/examples/daily.yaml) | 自定义策略组和规则 |
+
+## 官方多平台完整配置
+
+```yaml title="examples/official/multi-platform.yaml"
+--8<-- "examples/official/multi-platform.yaml"
+```
+
+这份配置可以直接启动，默认远程订阅只提供 Direct 演示节点。把一个订阅 URL 换成
+自己的地址后，全部策略组会自动使用订阅节点。使用方法、规则顺序、平台权限和兜底
+行为见[官方多平台完整配置](manual/official-configuration.md)。
 
 ## Desktop
 
