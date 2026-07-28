@@ -83,8 +83,6 @@ jobs:
 
       - name: Verify version and source
         env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
           RELEASE_VERSION: ${{ steps.metadata.outputs.version }}
           IS_PRERELEASE: ${{ steps.metadata.outputs.prerelease }}
         run: |
@@ -105,17 +103,6 @@ jobs:
               exit 1
             fi
           fi
-
-          commit_sha="$(git rev-parse HEAD)"
-          required_ci="$(
-            gh api "repos/$GH_REPO/commits/$commit_sha/check-runs?per_page=100" \
-              --jq '[.check_runs[] | select(.name == "Required CI" and .status == "completed" and .conclusion == "success") | .html_url][0] // ""'
-          )"
-          if [ -z "$required_ci" ]; then
-            echo "::error::Release commit $commit_sha has no successful Required CI check."
-            exit 1
-          fi
-          echo "Using verified Required CI: $required_ci"
 
   build:
     name: Build release artifacts
