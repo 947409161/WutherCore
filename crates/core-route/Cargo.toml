@@ -11,6 +11,7 @@ ipnet        = { workspace = true }
 ahash        = { workspace = true }
 once_cell    = { workspace = true }
 regex        = { workspace = true }
+fancy-regex  = { workspace = true }
 serde        = { workspace = true }
 tracing      = { workspace = true }
 parking_lot  = { workspace = true }

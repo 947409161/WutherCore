@@ -17,9 +17,9 @@
 //! * `domain_suffix`       后缀（`.example.com` 命中 `a.example.com`）
 //! * `domain_keyword`      子串
 //! * `domain_regex`        正则
-//! * `ip_cidr`             v4/v6 CIDR
-//! * `process_name`        进程名
-//! * `port`                destination/source 单端口或区间
+//! * `ip_cidr`             source/destination v4/v6 CIDR
+//! * `process_name/path`   进程名或完整路径
+//! * `port`                source/destination 单端口或区间
 //! * `network`             TCP / UDP / ICMP
 //! * `classical`（混合）   每行 `KIND,VALUE[,policy]`
 //!
@@ -37,6 +37,7 @@ pub mod format;
 pub mod ir;
 pub mod manager;
 pub mod matcher;
+pub mod mihomo_regex;
 pub mod parser;
 pub mod rrs;
 pub mod spec;
@@ -55,5 +56,6 @@ pub use matcher::{
     RulesetIpPrefixSet, RulesetIpPrefixSnapshot, RulesetIpPrefixStatus, RulesetMatcher,
     RulesetPrefixError,
 };
+pub use mihomo_regex::compile_mihomo_domain_regex;
 pub use parser::{ParseError, RulesetCompiled, parse_ruleset, parse_ruleset_compiled};
 pub use spec::{RulesetSpec, RulesetType};

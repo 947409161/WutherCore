@@ -218,9 +218,13 @@ route:
 | `domain` | 完整域名 |
 | `suffix` | 域名后缀 |
 | `keyword` | 域名包含文本 |
+| `regex` 或 `domain-regex` | Mihomo 风格域名正则 |
 | `ip` | 目标 IP 或 CIDR |
+| `source-ip` 或 `src-ip-cidr` | 源 IP 或 CIDR |
 | `port` | 端口或范围 |
+| `source-port` 或 `src-port` | 源端口或范围 |
 | `process` | 进程名 |
+| `process-path` | 完整进程路径 |
 | `set` | 规则集 |
 | `network` | `tcp` 或 `udp` |
 | `proto` | 协议嗅探结果 |
@@ -234,11 +238,15 @@ route:
 route:
   steps:
     - "domain:api.example.com -> direct"
+    - "domain-regex:^(?!api0\\.)api[0-9]+\\.example\\.com$ -> quality"
     - "suffix:example.net -> quality"
     - "ip:10.0.0.0/8 -> direct"
+    - "src-ip-cidr:192.168.0.0/16 -> direct"
     - "port:22 -> manual"
+    - "src-port:1024-65535 -> quality"
     - "network:udp -> latency"
     - "process:git -> quality"
+    - "process-path:C:\\Program Files\\Browser\\browser.exe -> quality"
     - "set:streaming -> latency"
     - "proto:bittorrent -> block"
     - "sni:cdn.example.com -> quality"
@@ -257,10 +265,14 @@ route:
 | `any`、`*`、`final`、`default` | 任意请求 |
 | `domain:NAME` | 完整域名 |
 | `domain-suffix:NAME` 或 `suffix:NAME` | 后缀 |
+| `domain-regex:EXPR` | Mihomo 风格域名正则 |
 | `ip:CIDR` | IP 或网段 |
+| `source-ip:CIDR`、`src-ip:CIDR` 或 `src-ip-cidr:CIDR` | 源 IP 或网段 |
 | `port:PORT` | 目标端口 |
+| `source-port:PORT` 或 `src-port:PORT` | 源端口 |
 | `network:tcp` | 网络类型 |
 | `process:NAME` | 进程名 |
+| `process-path:PATH` | 完整进程路径 |
 | `set:NAME` | 规则集 |
 | `proto:NAME` | 嗅探协议 |
 | `sni:NAME` | TLS Server Name |
@@ -276,25 +288,25 @@ route:
 DOMAIN,api.example.com,quality
 DOMAIN-SUFFIX,example.net,quality
 DOMAIN-KEYWORD,video,latency
+DOMAIN-REGEX,^(?!api0\.)api[0-9]+\.example\.com$,quality
 IP-CIDR,10.0.0.0/8,DIRECT
 IP-CIDR6,2001:db8::/32,DIRECT
+SRC-IP-CIDR,192.168.0.0/16,DIRECT
 DST-PORT,8000-8999,manual
+SRC-PORT,1024-65535,quality
 PROCESS-NAME,curl,DIRECT
+PROCESS-PATH,C:\Program Files\Browser\browser.exe,quality
 NETWORK,udp,latency
 RULE-SET,streaming,latency
 MATCH,latency
 ```
 
-端口支持单值和闭区间 `LOW-HIGH`。
+源端口和目的端口都支持单值及闭区间 `LOW-HIGH`。源地址和源端口只读取连接源元数据，
+不会错误回退到目的地址或目的端口。`PROCESS-PATH` 对完整路径做大小写不敏感的精确匹配，
+并复用按需进程查询，只有路由求值真正到达进程规则时才请求系统进程信息。
 
-当前明确不支持：
-
-- `SRC-IP-CIDR`
-- `SRC-PORT`
-- `DOMAIN-REGEX`
-- `PROCESS-PATH`
-
-不支持的类型会报错，不能依赖静默跳过。
+`DOMAIN-REGEX` 按 Mihomo 的不区分大小写语义编译，支持 look-around 和 backreference，
+并设置回溯执行上限，避免远程规则集中的恶意表达式无限消耗 CPU。
 
 ## 规则集
 
@@ -339,6 +351,12 @@ route:
 - `every` 决定刷新周期。
 - `type` 表示规则行为，常用 `domain`、`ipcidr` 和 `classical`。
 - `format` 表示正文格式，例如 `yaml`、`text` 或 `mrs`。
+
+Mihomo MRS v1 二进制只定义 `domain` 和 `ipcidr` 两种 behavior。`SRC-IP-CIDR`、
+`SRC-PORT`、`DOMAIN-REGEX` 和 `PROCESS-PATH` 属于 classical 规则类型，应放在
+`type: classical` 且 `format: yaml` 或 `format: text` 的 provider 中。核心会完整解析并
+接入路由 matcher，不会静默跳过。把 `type: classical` 配成 `format: mrs` 会在启动前
+明确报错；MRS 文件头 behavior 与配置 type 不一致也会拒绝加载。
 
 远程规则集首次下载失败且没有缓存时不可用。更新失败时保留上次成功内容，避免把
 正在工作的规则替换为空。

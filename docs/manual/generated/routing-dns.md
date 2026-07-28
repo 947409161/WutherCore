@@ -14,7 +14,7 @@ hide:
 
 选择策略、逐步路由、兼容规则集、DNS 服务和 Fake IP。
 
-全手册当前覆盖 **766 个字段**、**55 个枚举类型**。
+全手册当前覆盖 **770 个字段**、**55 个枚举类型**。
 行为说明和跨字段约束请同时阅读同分类下的人工手册页面。
 
 ## `GroupSpec`
@@ -70,137 +70,141 @@ hide:
 | `domain` | `MatcherValue（可选）` | 可选；默认不设置 | 无 | `Single(String)`<br>`List(Vec<String>)` | 严格相等的域名。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4448) |
 | `suffix` | `MatcherValue（可选）` | 可选；默认不设置 | `domain-suffix`<br>`domain_suffix` | `Single(String)`<br>`List(Vec<String>)` | 域名后缀。canonical: `suffix`；mihomo 友好别名 `domain-suffix` / `domain_suffix`。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4451) |
 | `keyword` | `MatcherValue（可选）` | 可选；默认不设置 | `domain-keyword`<br>`domain_keyword` | `Single(String)`<br>`List(Vec<String>)` | 子串关键字。canonical: `keyword`；mihomo 友好别名 `domain-keyword`。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4454) |
-| `ip` | `MatcherValue（可选）` | 可选；默认不设置 | `cidr`<br>`ip-cidr`<br>`ip_cidr` | `Single(String)`<br>`List(Vec<String>)` | IP CIDR。canonical: `ip`；别名 `cidr` / `ip-cidr`。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4457) |
-| `port` | `MatcherValue（可选）` | 可选；默认不设置 | `dst-port`<br>`dst_port` | `Single(String)`<br>`List(Vec<String>)` | 目的端口（单个 `53` 或区间 `1000-2000`）。canonical: `port`；别名 `dst-port`。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4460) |
-| `process` | `MatcherValue（可选）` | 可选；默认不设置 | `process-name`<br>`process_name` | `Single(String)`<br>`List(Vec<String>)` | 进程名。canonical: `process`；别名 `process-name`。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4463) |
-| `set` | `MatcherValue（可选）` | 可选；默认不设置 | `rule-set`<br>`rule_set` | `Single(String)`<br>`List(Vec<String>)` | 外部规则集名（`route.sets.<name>`）。canonical: `set`；别名 `rule-set`。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4466) |
-| `network` | `字符串（可选）` | 可选；默认不设置 | 无 | 无 | 网络协议（`tcp` / `udp`）。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4469) |
-| `proto` | `字符串（可选）` | 可选；默认不设置 | 无 | 无 | L7 协议指纹（`tls` / `quic` / `stun` / `http` / `webrtc`...）。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4472) |
-| `outbound` | `字符串` | 必填 | `proxy`<br>`target`<br>`action` | 无 | 出站 / 分组名 / `direct` / `block`。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4476) |
+| `regex` | `MatcherValue（可选）` | 可选；默认不设置 | `domain-regex`<br>`domain_regex` | `Single(String)`<br>`List(Vec<String>)` | Mihomo `DOMAIN-REGEX`，大小写不敏感并支持 look-around / backreference。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4457) |
+| `ip` | `MatcherValue（可选）` | 可选；默认不设置 | `cidr`<br>`ip-cidr`<br>`ip_cidr` | `Single(String)`<br>`List(Vec<String>)` | IP CIDR。canonical: `ip`；别名 `cidr` / `ip-cidr`。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4460) |
+| `source-ip` | `MatcherValue（可选）` | 可选；默认不设置 | `source_ip`<br>`src-ip`<br>`src_ip`<br>`src-ip-cidr`<br>`src_ip_cidr` | `Single(String)`<br>`List(Vec<String>)` | 源 IP CIDR。canonical: `source-ip`；兼容 Mihomo `src-ip-cidr`。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4471) |
+| `port` | `MatcherValue（可选）` | 可选；默认不设置 | `dst-port`<br>`dst_port` | `Single(String)`<br>`List(Vec<String>)` | 目的端口（单个 `53` 或区间 `1000-2000`）。canonical: `port`；别名 `dst-port`。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4474) |
+| `source-port` | `MatcherValue（可选）` | 可选；默认不设置 | `source_port`<br>`src-port`<br>`src_port` | `Single(String)`<br>`List(Vec<String>)` | 源端口（单个或闭区间）。canonical: `source-port`；兼容 Mihomo `src-port`。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4483) |
+| `process` | `MatcherValue（可选）` | 可选；默认不设置 | `process-name`<br>`process_name` | `Single(String)`<br>`List(Vec<String>)` | 进程名。canonical: `process`；别名 `process-name`。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4486) |
+| `process-path` | `MatcherValue（可选）` | 可选；默认不设置 | `process_path` | `Single(String)`<br>`List(Vec<String>)` | 完整进程路径，大小写不敏感精确匹配。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4489) |
+| `set` | `MatcherValue（可选）` | 可选；默认不设置 | `rule-set`<br>`rule_set` | `Single(String)`<br>`List(Vec<String>)` | 外部规则集名（`route.sets.<name>`）。canonical: `set`；别名 `rule-set`。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4492) |
+| `network` | `字符串（可选）` | 可选；默认不设置 | 无 | 无 | 网络协议（`tcp` / `udp`）。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4495) |
+| `proto` | `字符串（可选）` | 可选；默认不设置 | 无 | 无 | L7 协议指纹（`tls` / `quic` / `stun` / `http` / `webrtc`...）。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4498) |
+| `outbound` | `字符串` | 必填 | `proxy`<br>`target`<br>`action` | 无 | 出站 / 分组名 / `direct` / `block`。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4502) |
 
 ## `RuleSetSpec`
 
 `route.sets.<name>` 配置：与 `core_ruleset::RulesetSpec` 一一对应， 这里只做 YAML 反序列化所需的最小字段；运行时由 core-ruleset 编译。
 
-[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4574)
+[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4600)
 
 | YAML / JSON 字段 | 类型 | 必填与默认 | 兼容别名 | 取值 / 形态 | 解析与用途 |
 | --- | --- | --- | --- | --- | --- |
-| `url` | `字符串（可选）` | 可选；默认不设置 | 无 | 无 | 远程来源；与 `path` 同时出现时，`path` 是该远程规则集的显式缓存。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4577) |
-| `path` | `字符串（可选）` | 可选；默认不设置 | 无 | 无 | `url` 为空时是本地来源；`url` 存在时是远程缓存位置。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4580) |
-| `payload` | `字符串 列表` | 可选；默认空 | 无 | 无 | `RuleSetSpec` 的 `payload` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4582) |
-| `format` | `字符串（可选）` | 可选；默认不设置 | 无 | 无 | `RuleSetSpec` 的 `format` 参数。解析类型为 `字符串（可选）`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4586) |
-| `every` | `时长` | 可选；默认 `1d` | 无 | 无 | 周期性任务的执行间隔；时长字段接受 humantime 写法。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4588) |
-| `via` | `字符串` | 可选；默认 `direct` | 无 | 无 | `RuleSetSpec` 的 `via` 参数。解析类型为 `字符串`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4590) |
+| `url` | `字符串（可选）` | 可选；默认不设置 | 无 | 无 | 远程来源；与 `path` 同时出现时，`path` 是该远程规则集的显式缓存。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4603) |
+| `path` | `字符串（可选）` | 可选；默认不设置 | 无 | 无 | `url` 为空时是本地来源；`url` 存在时是远程缓存位置。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4606) |
+| `payload` | `字符串 列表` | 可选；默认空 | 无 | 无 | `RuleSetSpec` 的 `payload` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4608) |
+| `format` | `字符串（可选）` | 可选；默认不设置 | 无 | 无 | `RuleSetSpec` 的 `format` 参数。解析类型为 `字符串（可选）`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4612) |
+| `every` | `时长` | 可选；默认 `1d` | 无 | 无 | 周期性任务的执行间隔；时长字段接受 humantime 写法。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4614) |
+| `via` | `字符串` | 可选；默认 `direct` | 无 | 无 | `RuleSetSpec` 的 `via` 参数。解析类型为 `字符串`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4616) |
 
 ## `SingboxRuleSetSpec`
 
 sing-box `route.rule_set[]` 原始配置。 这里保留上游字段名与互斥关系；`runtime_plan` 编译阶段会严格校验后转换成 [`RuleSetSpec`]。因此 sing-box 的 source-kind `type` 不会与 WutherCore 表示 behavior 的 `RuleSetSpec::type` 混淆。
 
-[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4600)
+[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4626)
 
 | YAML / JSON 字段 | 类型 | 必填与默认 | 兼容别名 | 取值 / 形态 | 解析与用途 |
 | --- | --- | --- | --- | --- | --- |
-| `type` | `字符串（可选）` | 可选；默认不设置 | 无 | 无 | `inline` / `local` / `remote`；inline 可省略。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4603) |
-| `tag` | `SingboxRuleSetTags` | 必填 | 无 | `One(String)`<br>`Many(Vec<String>)` | 用于显示、日志和其它配置项引用的稳定名称。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4604) |
-| `format` | `字符串（可选）` | 可选；默认不设置 | 无 | 无 | `SingboxRuleSetSpec` 的 `format` 参数。解析类型为 `字符串（可选）`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4606) |
-| `path` | `字符串（可选）` | 可选；默认不设置 | 无 | 无 | 文件或 URL 路径；相对路径按运行进程的工作目录解析。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4608) |
-| `url` | `字符串（可选）` | 可选；默认不设置 | 无 | 无 | `SingboxRuleSetSpec` 的 `url` 参数。解析类型为 `字符串（可选）`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4610) |
-| `rules` | `serde_yaml::Value 列表（可选）` | 可选；默认不设置 | 无 | 无 | `SingboxRuleSetSpec` 的 `rules` 参数。解析类型为 `serde_yaml::Value 列表（可选）`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4612) |
-| `update_interval` | `Compat时长（可选）` | 可选；默认不设置 | 无 | `Seconds(u64)`<br>`Human(#[serde(with = "humantime_serde")] Duration)` | 周期性任务的执行间隔；时长字段接受 humantime 写法。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4614) |
-| `download_detour` | `字符串（可选）` | 可选；默认不设置 | 无 | 无 | `SingboxRuleSetSpec` 的 `download_detour` 参数。解析类型为 `字符串（可选）`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4616) |
-| `http_client` | `serde_yaml::Value（可选）` | 可选；默认不设置 | 无 | 无 | 兼容任务所需的 `http_client.download_detour`。使用 `Value` 是为了让 归一化层能对 string/object 与不支持的嵌套字段给出精确错误。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4620) |
+| `type` | `字符串（可选）` | 可选；默认不设置 | 无 | 无 | `inline` / `local` / `remote`；inline 可省略。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4629) |
+| `tag` | `SingboxRuleSetTags` | 必填 | 无 | `One(String)`<br>`Many(Vec<String>)` | 用于显示、日志和其它配置项引用的稳定名称。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4630) |
+| `format` | `字符串（可选）` | 可选；默认不设置 | 无 | 无 | `SingboxRuleSetSpec` 的 `format` 参数。解析类型为 `字符串（可选）`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4632) |
+| `path` | `字符串（可选）` | 可选；默认不设置 | 无 | 无 | 文件或 URL 路径；相对路径按运行进程的工作目录解析。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4634) |
+| `url` | `字符串（可选）` | 可选；默认不设置 | 无 | 无 | `SingboxRuleSetSpec` 的 `url` 参数。解析类型为 `字符串（可选）`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4636) |
+| `rules` | `serde_yaml::Value 列表（可选）` | 可选；默认不设置 | 无 | 无 | `SingboxRuleSetSpec` 的 `rules` 参数。解析类型为 `serde_yaml::Value 列表（可选）`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4638) |
+| `update_interval` | `Compat时长（可选）` | 可选；默认不设置 | 无 | `Seconds(u64)`<br>`Human(#[serde(with = "humantime_serde")] Duration)` | 周期性任务的执行间隔；时长字段接受 humantime 写法。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4640) |
+| `download_detour` | `字符串（可选）` | 可选；默认不设置 | 无 | 无 | `SingboxRuleSetSpec` 的 `download_detour` 参数。解析类型为 `字符串（可选）`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4642) |
+| `http_client` | `serde_yaml::Value（可选）` | 可选；默认不设置 | 无 | 无 | 兼容任务所需的 `http_client.download_detour`。使用 `Value` 是为了让 归一化层能对 string/object 与不支持的嵌套字段给出精确错误。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4646) |
 
 ## `MihomoRuleProviderSpec`
 
 Mihomo 顶层 `rule-providers.<name>` 原始配置。
 
-[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4634)
+[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4660)
 
 | YAML / JSON 字段 | 类型 | 必填与默认 | 兼容别名 | 取值 / 形态 | 解析与用途 |
 | --- | --- | --- | --- | --- | --- |
-| `type` | `字符串` | 必填 | 无 | 无 | `http` / `file` / `inline`。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4637) |
-| `url` | `字符串（可选）` | 可选；默认不设置 | 无 | 无 | `MihomoRuleProviderSpec` 的 `url` 参数。解析类型为 `字符串（可选）`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4639) |
-| `path` | `字符串（可选）` | 可选；默认不设置 | 无 | 无 | 文件或 URL 路径；相对路径按运行进程的工作目录解析。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4641) |
-| `payload` | `字符串 列表（可选）` | 可选；默认不设置 | 无 | 无 | `MihomoRuleProviderSpec` 的 `payload` 参数。解析类型为 `字符串 列表（可选）`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4643) |
-| `behavior` | `字符串` | 必填 | 无 | 无 | `MihomoRuleProviderSpec` 的 `behavior` 参数。解析类型为 `字符串`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4644) |
-| `format` | `字符串（可选）` | 可选；默认不设置 | 无 | 无 | `MihomoRuleProviderSpec` 的 `format` 参数。解析类型为 `字符串（可选）`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4646) |
-| `interval` | `Compat时长（可选）` | 可选；默认不设置 | 无 | `Seconds(u64)`<br>`Human(#[serde(with = "humantime_serde")] Duration)` | `MihomoRuleProviderSpec` 的 `interval` 参数。解析类型为 `Compat时长（可选）`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4648) |
-| `proxy` | `字符串（可选）` | 可选；默认不设置 | 无 | 无 | `MihomoRuleProviderSpec` 的 `proxy` 参数。解析类型为 `字符串（可选）`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4650) |
+| `type` | `字符串` | 必填 | 无 | 无 | `http` / `file` / `inline`。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4663) |
+| `url` | `字符串（可选）` | 可选；默认不设置 | 无 | 无 | `MihomoRuleProviderSpec` 的 `url` 参数。解析类型为 `字符串（可选）`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4665) |
+| `path` | `字符串（可选）` | 可选；默认不设置 | 无 | 无 | 文件或 URL 路径；相对路径按运行进程的工作目录解析。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4667) |
+| `payload` | `字符串 列表（可选）` | 可选；默认不设置 | 无 | 无 | `MihomoRuleProviderSpec` 的 `payload` 参数。解析类型为 `字符串 列表（可选）`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4669) |
+| `behavior` | `字符串` | 必填 | 无 | 无 | `MihomoRuleProviderSpec` 的 `behavior` 参数。解析类型为 `字符串`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4670) |
+| `format` | `字符串（可选）` | 可选；默认不设置 | 无 | 无 | `MihomoRuleProviderSpec` 的 `format` 参数。解析类型为 `字符串（可选）`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4672) |
+| `interval` | `Compat时长（可选）` | 可选；默认不设置 | 无 | `Seconds(u64)`<br>`Human(#[serde(with = "humantime_serde")] Duration)` | `MihomoRuleProviderSpec` 的 `interval` 参数。解析类型为 `Compat时长（可选）`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4674) |
+| `proxy` | `字符串（可选）` | 可选；默认不设置 | 无 | 无 | `MihomoRuleProviderSpec` 的 `proxy` 参数。解析类型为 `字符串（可选）`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4676) |
 
 ## `Resolver`
 
 `Resolver` 配置对象。
 
-[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4681)
+[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4707)
 
 | YAML / JSON 字段 | 类型 | 必填与默认 | 兼容别名 | 取值 / 形态 | 解析与用途 |
 | --- | --- | --- | --- | --- | --- |
-| `mode` | `ResolverMode` | 可选；默认 `normal` | 无 | `system`<br>`normal`<br>`fake` | `Resolver` 的 `mode` 参数。解析类型为 `ResolverMode`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4683) |
-| `fake` | `FakeMode` | 可选；默认 `auto` | 无 | `off`<br>`auto`<br>`force` | `Resolver` 的 `fake` 参数。解析类型为 `FakeMode`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4685) |
-| `cache` | `时长` | 可选；默认 `1d` | 无 | 无 | `Resolver` 的 `cache` 参数。解析类型为 `时长`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4687) |
-| `ipv6` | `布尔值` | 可选；默认 `true` | 无 | 无 | `Resolver` 的 `ipv6` 参数。解析类型为 `布尔值`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4689) |
-| `ipv6-timeout` | `时长` | 可选；默认 `100ms` | 无 | 无 | 超时上限；时长字段接受 `ms`、`s`、`m`、`h` 等 humantime 写法。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4695) |
-| `use-hosts` | `布尔值` | 可选；默认 `true` | 无 | 无 | `Resolver` 的 `use-hosts` 参数。解析类型为 `布尔值`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4697) |
-| `use-system-hosts` | `布尔值` | 可选；默认 `true` | 无 | 无 | `Resolver` 的 `use-system-hosts` 参数。解析类型为 `布尔值`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4699) |
-| `hosts` | `serde_yaml::Mapping` | 可选；默认 `serde_yaml::Mapping::new()` | 无 | 无 | `Resolver` 的 `hosts` 参数。解析类型为 `serde_yaml::Mapping`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4701) |
-| `fake-ip-filter` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `Resolver` 的 `fake-ip-filter` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4703) |
-| `fake-ip-filter-mode` | `FakeIpFilterMode` | 可选；默认 `FakeIpFilterMode::default()` | 无 | `blacklist（默认）`<br>`whitelist` | `Resolver` 的 `fake-ip-filter-mode` 参数。解析类型为 `FakeIpFilterMode`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4705) |
-| `prefer-h3` | `布尔值` | 可选；默认 `false` | 无 | 无 | `Resolver` 的 `prefer-h3` 参数。解析类型为 `布尔值`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4707) |
-| `nameserver` | `字符串 列表` | 可选；默认 `vec!["ali".into()]` | 无 | 无 | `Resolver` 的 `nameserver` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4709) |
-| `fallback` | `字符串 列表` | 可选；默认 `vec!["cloudflare".into()]` | 无 | 无 | `Resolver` 的 `fallback` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4711) |
-| `fallback-filter` | `ResolverFallbackFilter` | 可选；默认 `ResolverFallbackFilter::default()` | 无 | 无 | `Resolver` 的 `fallback-filter` 参数。解析类型为 `ResolverFallbackFilter`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4713) |
-| `default-nameserver` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `Resolver` 的 `default-nameserver` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4715) |
-| `nameserver-policy` | `serde_yaml::Mapping` | 可选；默认 `serde_yaml::Mapping::new()` | 无 | 无 | `Resolver` 的 `nameserver-policy` 参数。解析类型为 `serde_yaml::Mapping`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4717) |
-| `proxy-server-nameserver` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `Resolver` 的 `proxy-server-nameserver` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4719) |
-| `proxy-server-nameserver-policy` | `serde_yaml::Mapping` | 可选；默认 `serde_yaml::Mapping::new()` | 无 | 无 | `Resolver` 的 `proxy-server-nameserver-policy` 参数。解析类型为 `serde_yaml::Mapping`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4721) |
-| `direct-nameserver` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `Resolver` 的 `direct-nameserver` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4723) |
-| `direct-nameserver-follow-policy` | `布尔值` | 可选；默认 `false` | 无 | 无 | `Resolver` 的 `direct-nameserver-follow-policy` 参数。解析类型为 `布尔值`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4725) |
-| `servers` | `名称 → ResolverServer 映射` | 可选；默认 `BTreeMap::from([ ( "ali".into(), ResolverServer::from("https://223.5.5.5/dns-query"), ), ( "cloudflare".into(), ResolverServer::from("https://1.1.1.1/dns-query"), ), ])` | 无 | `Simple(String)`<br>`Advanced(ResolverServerAdvanced)` | 命名 DNS server。字符串是兼容/简洁写法；对象写法可让同一个 endpoint 通过多个代理出口查询。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4729) |
-| `groups` | `名称 → ResolverGroup 映射` | 可选；默认 空 | 无 | `Simple(Vec<String>)`<br>`Advanced(ResolverGroupAdvanced)` | 可嵌套 DNS group。列表是简洁写法；对象写法可覆盖策略、超时和并发上限。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4732) |
-| `rules` | `serde_yaml::Value 列表` | 可选；默认 空 | 无 | 无 | `Resolver` 的 `rules` 参数。解析类型为 `serde_yaml::Value 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4734) |
-| `listen` | `字符串（可选）` | 可选；默认 不设置 | 无 | 无 | 标准 DNS 监听地址，对标 mihomo `dns.listen`。 例：`0.0.0.0:1053`、`127.0.0.1:53`、`[::]:5353`。 空 / None / 空串 = 不启动独立 DNS server。 同地址同时承载 UDP 和 TCP（与 mihomo 一致）。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4740) |
+| `mode` | `ResolverMode` | 可选；默认 `normal` | 无 | `system`<br>`normal`<br>`fake` | `Resolver` 的 `mode` 参数。解析类型为 `ResolverMode`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4709) |
+| `fake` | `FakeMode` | 可选；默认 `auto` | 无 | `off`<br>`auto`<br>`force` | `Resolver` 的 `fake` 参数。解析类型为 `FakeMode`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4711) |
+| `cache` | `时长` | 可选；默认 `1d` | 无 | 无 | `Resolver` 的 `cache` 参数。解析类型为 `时长`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4713) |
+| `ipv6` | `布尔值` | 可选；默认 `true` | 无 | 无 | `Resolver` 的 `ipv6` 参数。解析类型为 `布尔值`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4715) |
+| `ipv6-timeout` | `时长` | 可选；默认 `100ms` | 无 | 无 | 超时上限；时长字段接受 `ms`、`s`、`m`、`h` 等 humantime 写法。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4721) |
+| `use-hosts` | `布尔值` | 可选；默认 `true` | 无 | 无 | `Resolver` 的 `use-hosts` 参数。解析类型为 `布尔值`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4723) |
+| `use-system-hosts` | `布尔值` | 可选；默认 `true` | 无 | 无 | `Resolver` 的 `use-system-hosts` 参数。解析类型为 `布尔值`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4725) |
+| `hosts` | `serde_yaml::Mapping` | 可选；默认 `serde_yaml::Mapping::new()` | 无 | 无 | `Resolver` 的 `hosts` 参数。解析类型为 `serde_yaml::Mapping`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4727) |
+| `fake-ip-filter` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `Resolver` 的 `fake-ip-filter` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4729) |
+| `fake-ip-filter-mode` | `FakeIpFilterMode` | 可选；默认 `FakeIpFilterMode::default()` | 无 | `blacklist（默认）`<br>`whitelist` | `Resolver` 的 `fake-ip-filter-mode` 参数。解析类型为 `FakeIpFilterMode`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4731) |
+| `prefer-h3` | `布尔值` | 可选；默认 `false` | 无 | 无 | `Resolver` 的 `prefer-h3` 参数。解析类型为 `布尔值`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4733) |
+| `nameserver` | `字符串 列表` | 可选；默认 `vec!["ali".into()]` | 无 | 无 | `Resolver` 的 `nameserver` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4735) |
+| `fallback` | `字符串 列表` | 可选；默认 `vec!["cloudflare".into()]` | 无 | 无 | `Resolver` 的 `fallback` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4737) |
+| `fallback-filter` | `ResolverFallbackFilter` | 可选；默认 `ResolverFallbackFilter::default()` | 无 | 无 | `Resolver` 的 `fallback-filter` 参数。解析类型为 `ResolverFallbackFilter`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4739) |
+| `default-nameserver` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `Resolver` 的 `default-nameserver` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4741) |
+| `nameserver-policy` | `serde_yaml::Mapping` | 可选；默认 `serde_yaml::Mapping::new()` | 无 | 无 | `Resolver` 的 `nameserver-policy` 参数。解析类型为 `serde_yaml::Mapping`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4743) |
+| `proxy-server-nameserver` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `Resolver` 的 `proxy-server-nameserver` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4745) |
+| `proxy-server-nameserver-policy` | `serde_yaml::Mapping` | 可选；默认 `serde_yaml::Mapping::new()` | 无 | 无 | `Resolver` 的 `proxy-server-nameserver-policy` 参数。解析类型为 `serde_yaml::Mapping`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4747) |
+| `direct-nameserver` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `Resolver` 的 `direct-nameserver` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4749) |
+| `direct-nameserver-follow-policy` | `布尔值` | 可选；默认 `false` | 无 | 无 | `Resolver` 的 `direct-nameserver-follow-policy` 参数。解析类型为 `布尔值`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4751) |
+| `servers` | `名称 → ResolverServer 映射` | 可选；默认 `BTreeMap::from([ ( "ali".into(), ResolverServer::from("https://223.5.5.5/dns-query"), ), ( "cloudflare".into(), ResolverServer::from("https://1.1.1.1/dns-query"), ), ])` | 无 | `Simple(String)`<br>`Advanced(ResolverServerAdvanced)` | 命名 DNS server。字符串是兼容/简洁写法；对象写法可让同一个 endpoint 通过多个代理出口查询。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4755) |
+| `groups` | `名称 → ResolverGroup 映射` | 可选；默认 空 | 无 | `Simple(Vec<String>)`<br>`Advanced(ResolverGroupAdvanced)` | 可嵌套 DNS group。列表是简洁写法；对象写法可覆盖策略、超时和并发上限。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4758) |
+| `rules` | `serde_yaml::Value 列表` | 可选；默认 空 | 无 | 无 | `Resolver` 的 `rules` 参数。解析类型为 `serde_yaml::Value 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4760) |
+| `listen` | `字符串（可选）` | 可选；默认 不设置 | 无 | 无 | 标准 DNS 监听地址，对标 mihomo `dns.listen`。 例：`0.0.0.0:1053`、`127.0.0.1:53`、`[::]:5353`。 空 / None / 空串 = 不启动独立 DNS server。 同地址同时承载 UDP 和 TCP（与 mihomo 一致）。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4766) |
 
 ## `ResolverServerAdvanced`
 
 `ResolverServerAdvanced` 配置对象。
 
-[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4879)
+[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4905)
 
 | YAML / JSON 字段 | 类型 | 必填与默认 | 兼容别名 | 取值 / 形态 | 解析与用途 |
 | --- | --- | --- | --- | --- | --- |
-| `endpoint` | `字符串` | 必填 | `address`<br>`upstream` | 无 | 唯一 DNS 服务 endpoint。服务级冗余应由 `resolver.groups` 表达。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4882) |
-| `exits` | `字符串 列表` | 可选；默认空 | `outbound`<br>`outbounds`<br>`nodes` | 无 | 访问该 endpoint 的代理节点数组；空数组表示沿用默认直连 DNS socket。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4891) |
-| `strategy` | `ResolverStrategy` | 可选；默认 `Adaptive` | 无 | `roundrobin`<br>`random`<br>`parallel`<br>`adaptive（默认）`<br>`sequential`<br>`all` | `ResolverServerAdvanced` 的 `strategy` 参数。解析类型为 `ResolverStrategy`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4893) |
-| `timeout` | `时长` | 可选；默认 `5s` | 无 | 无 | 超时上限；时长字段接受 `ms`、`s`、`m`、`h` 等 humantime 写法。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4895) |
-| `max-parallel` | `非负整数` | 可选；默认 `2` | `max_parallel` | 无 | 对应资源或并发量的硬上限，用于限制内存、连接或任务扩张。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4901) |
+| `endpoint` | `字符串` | 必填 | `address`<br>`upstream` | 无 | 唯一 DNS 服务 endpoint。服务级冗余应由 `resolver.groups` 表达。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4908) |
+| `exits` | `字符串 列表` | 可选；默认空 | `outbound`<br>`outbounds`<br>`nodes` | 无 | 访问该 endpoint 的代理节点数组；空数组表示沿用默认直连 DNS socket。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4917) |
+| `strategy` | `ResolverStrategy` | 可选；默认 `Adaptive` | 无 | `roundrobin`<br>`random`<br>`parallel`<br>`adaptive（默认）`<br>`sequential`<br>`all` | `ResolverServerAdvanced` 的 `strategy` 参数。解析类型为 `ResolverStrategy`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4919) |
+| `timeout` | `时长` | 可选；默认 `5s` | 无 | 无 | 超时上限；时长字段接受 `ms`、`s`、`m`、`h` 等 humantime 写法。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4921) |
+| `max-parallel` | `非负整数` | 可选；默认 `2` | `max_parallel` | 无 | 对应资源或并发量的硬上限，用于限制内存、连接或任务扩张。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4927) |
 
 ## `ResolverGroupAdvanced`
 
 `ResolverGroupAdvanced` 配置对象。
 
-[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4944)
+[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4970)
 
 | YAML / JSON 字段 | 类型 | 必填与默认 | 兼容别名 | 取值 / 形态 | 解析与用途 |
 | --- | --- | --- | --- | --- | --- |
-| `members` | `字符串 列表` | 可选；默认空 | `member`<br>`servers`<br>`upstreams` | 无 | 成员可以引用命名 server、其它 group，或直接写 endpoint。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4953) |
-| `strategy` | `ResolverStrategy` | 可选；默认 `Adaptive` | 无 | `roundrobin`<br>`random`<br>`parallel`<br>`adaptive（默认）`<br>`sequential`<br>`all` | `ResolverGroupAdvanced` 的 `strategy` 参数。解析类型为 `ResolverStrategy`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4955) |
-| `timeout` | `时长` | 可选；默认 `5s` | 无 | 无 | 超时上限；时长字段接受 `ms`、`s`、`m`、`h` 等 humantime 写法。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4957) |
-| `max-parallel` | `非负整数` | 可选；默认 `2` | `max_parallel` | 无 | 对应资源或并发量的硬上限，用于限制内存、连接或任务扩张。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4963) |
+| `members` | `字符串 列表` | 可选；默认空 | `member`<br>`servers`<br>`upstreams` | 无 | 成员可以引用命名 server、其它 group，或直接写 endpoint。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4979) |
+| `strategy` | `ResolverStrategy` | 可选；默认 `Adaptive` | 无 | `roundrobin`<br>`random`<br>`parallel`<br>`adaptive（默认）`<br>`sequential`<br>`all` | `ResolverGroupAdvanced` 的 `strategy` 参数。解析类型为 `ResolverStrategy`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4981) |
+| `timeout` | `时长` | 可选；默认 `5s` | 无 | 无 | 超时上限；时长字段接受 `ms`、`s`、`m`、`h` 等 humantime 写法。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4983) |
+| `max-parallel` | `非负整数` | 可选；默认 `2` | `max_parallel` | 无 | 对应资源或并发量的硬上限，用于限制内存、连接或任务扩张。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4989) |
 
 ## `ResolverFallbackFilter`
 
 `ResolverFallbackFilter` 配置对象。
 
-[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4985)
+[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5011)
 
 | YAML / JSON 字段 | 类型 | 必填与默认 | 兼容别名 | 取值 / 形态 | 解析与用途 |
 | --- | --- | --- | --- | --- | --- |
-| `geoip` | `布尔值` | 可选；默认 `true` | 无 | 无 | `ResolverFallbackFilter` 的 `geoip` 参数。解析类型为 `布尔值`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4987) |
-| `geoip-code` | `字符串` | 可选；默认 `CN` | 无 | 无 | `ResolverFallbackFilter` 的 `geoip-code` 参数。解析类型为 `字符串`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4989) |
-| `ipcidr` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `ResolverFallbackFilter` 的 `ipcidr` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4991) |
-| `domain` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `ResolverFallbackFilter` 的 `domain` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4993) |
-| `geosite` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `ResolverFallbackFilter` 的 `geosite` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4995) |
+| `geoip` | `布尔值` | 可选；默认 `true` | 无 | 无 | `ResolverFallbackFilter` 的 `geoip` 参数。解析类型为 `布尔值`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5013) |
+| `geoip-code` | `字符串` | 可选；默认 `CN` | 无 | 无 | `ResolverFallbackFilter` 的 `geoip-code` 参数。解析类型为 `字符串`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5015) |
+| `ipcidr` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `ResolverFallbackFilter` 的 `ipcidr` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5017) |
+| `domain` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `ResolverFallbackFilter` 的 `domain` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5019) |
+| `geosite` | `字符串 列表` | 可选；默认 空 | 无 | 无 | `ResolverFallbackFilter` 的 `geosite` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5021) |
 
 ## 本分类枚举
 
@@ -228,7 +232,7 @@ Mihomo 顶层 `rule-providers.<name>` 原始配置。
 
 ### `MatcherValue`
 
-单个或多个值的统一表示：让 `port: 53`、`port: "53"`、`port: [53, "5353"]` 都能解析。列表值在编译阶段会被包裹成 `RouteMatcher::Or`，匹配时短路求值。 自实现 `Deserialize` 而非 `derive(untagged)`，是为了把整型 / 布尔自动转成字符串：YAML 写 `port: 53` 时值是 i64，不会自动落到 `Single(String)` 上， 用户体验上为难。统一收敛成字符串，编译期再把 port 解析回 u16。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4487)
+单个或多个值的统一表示：让 `port: 53`、`port: "53"`、`port: [53, "5353"]` 都能解析。列表值在编译阶段会被包裹成 `RouteMatcher::Or`，匹配时短路求值。 自实现 `Deserialize` 而非 `derive(untagged)`，是为了把整型 / 布尔自动转成字符串：YAML 写 `port: 53` 时值是 i64，不会自动落到 `Single(String)` 上， 用户体验上为难。统一收敛成字符串，编译期再把 port 解析回 u16。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4513)
 
 | 写法 | 兼容别名 | 含义 |
 | --- | --- | --- |
@@ -237,7 +241,7 @@ Mihomo 顶层 `rule-providers.<name>` 原始配置。
 
 ### `SingboxRuleSetTags`
 
-sing-box 1.14+ 允许一个 local/remote 配置用 tag 列表批量定义规则集。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4626)
+sing-box 1.14+ 允许一个 local/remote 配置用 tag 列表批量定义规则集。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4652)
 
 | 写法 | 兼容别名 | 含义 |
 | --- | --- | --- |
@@ -246,7 +250,7 @@ sing-box 1.14+ 允许一个 local/remote 配置用 tag 列表批量定义规则�
 
 ### `CompatDuration`
 
-上游刷新周期兼容表示：Mihomo 使用整数秒，sing-box 使用 duration 字符串。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4656)
+上游刷新周期兼容表示：Mihomo 使用整数秒，sing-box 使用 duration 字符串。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4682)
 
 | 写法 | 兼容别名 | 含义 |
 | --- | --- | --- |
@@ -255,7 +259,7 @@ sing-box 1.14+ 允许一个 local/remote 配置用 tag 列表批量定义规则�
 
 ### `ResolverStrategy`
 
-DNS 成员选择策略。 `random` 是均匀随机；`adaptive` 使用查询过程中学习到的平均 RTT 做加权随机， 与 AdGuard dnsproxy 的 load-balance 算法一致：平均 RTT 越小，权重越大。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4780)
+DNS 成员选择策略。 `random` 是均匀随机；`adaptive` 使用查询过程中学习到的平均 RTT 做加权随机， 与 AdGuard dnsproxy 的 load-balance 算法一致：平均 RTT 越小，权重越大。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4806)
 
 | 写法 | 兼容别名 | 含义 |
 | --- | --- | --- |
@@ -268,7 +272,7 @@ DNS 成员选择策略。 `random` 是均匀随机；`adaptive` 使用查询过�
 
 ### `ResolverServer`
 
-命名 server 的兼容字符串写法或高级多出口写法。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4803)
+命名 server 的兼容字符串写法或高级多出口写法。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4829)
 
 | 写法 | 兼容别名 | 含义 |
 | --- | --- | --- |
@@ -277,7 +281,7 @@ DNS 成员选择策略。 `random` 是均匀随机；`adaptive` 使用查询过�
 
 ### `ResolverGroup`
 
-DNS group 的简洁列表写法或高级对象写法。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4907)
+DNS group 的简洁列表写法或高级对象写法。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L4933)
 
 | 写法 | 兼容别名 | 含义 |
 | --- | --- | --- |
@@ -286,7 +290,7 @@ DNS group 的简洁列表写法或高级对象写法。 [源码](https://github.
 
 ### `ResolverMode`
 
-`ResolverMode` 的可接受配置形态。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5016)
+`ResolverMode` 的可接受配置形态。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5042)
 
 | 写法 | 兼容别名 | 含义 |
 | --- | --- | --- |
@@ -296,7 +300,7 @@ DNS group 的简洁列表写法或高级对象写法。 [源码](https://github.
 
 ### `FakeMode`
 
-`FakeMode` 的可接受配置形态。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5026)
+`FakeMode` 的可接受配置形态。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5052)
 
 | 写法 | 兼容别名 | 含义 |
 | --- | --- | --- |
@@ -306,7 +310,7 @@ DNS group 的简洁列表写法或高级对象写法。 [源码](https://github.
 
 ### `FakeIpFilterMode`
 
-`FakeIpFilterMode` 的可接受配置形态。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5034)
+`FakeIpFilterMode` 的可接受配置形态。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5060)
 
 | 写法 | 兼容别名 | 含义 |
 | --- | --- | --- |

@@ -9,12 +9,12 @@
 //! | **准确性** | 4B magic + 2B version + 8B createdAt + **CRC32(body)** + body length；任一字段错都立刻拒绝 |
 //! | **跨工具** | encode/decode 完整双向；CLI `ruleset convert` 把 yaml/txt/json ↔ rrs 互转 |
 //!
-//! ## 文件布局（v1）
+//! ## 文件布局（v2）
 //!
 //! ```text
 //!   offset  bytes  field
 //!   0       4      magic = "RRS\0"
-//!   4       2      version (u16 LE) = 1
+//!   4       2      version (u16 LE) = 2
 //!   6       2      flags  (u16 LE) —— 保留位（bit0 future zstd）
 //!   8       8      created_at (u64 LE epoch_secs)
 //!   16      4      body_len (u32 LE)
@@ -22,11 +22,12 @@
 //!   24      ...    body
 //! ```
 //!
-//! ## body —— 8 个固定顺序的 section
+//! ## body —— 12 个固定顺序的 section
 //!
 //! ```text
 //!   for kind in [DomainExact, DomainSuffix, DomainKeyword, DomainRegex,
-//!                CidrV4, CidrV6, Port, Process]:
+//!                DstCidrV4, DstCidrV6, SrcCidrV4, SrcCidrV6,
+//!                DstPort, SrcPort, ProcessName, ProcessPath]:
 //!     count   var-len u32
 //!     for i in 0..count:
 //!       payload_for_kind
@@ -54,21 +55,10 @@ use crate::{
 };
 
 pub const MAGIC: [u8; 4] = *b"RRS\0";
-pub const VERSION: u16 = 1;
+const VERSION_V1: u16 = 1;
+pub const VERSION: u16 = 2;
 pub const HEADER_LEN: usize = 24;
 pub const MAX_STR_LEN: usize = 4096;
-
-/// 8 个 section 的固定顺序。decode 与 encode 必须保持一致。
-const SECTION_ORDER: &[ClassicalKind] = &[
-    ClassicalKind::Domain,
-    ClassicalKind::DomainSuffix,
-    ClassicalKind::DomainKeyword,
-    ClassicalKind::DomainRegex,
-    ClassicalKind::IpCidr,    // V4
-    ClassicalKind::SrcIpCidr, // V6（占位 —— 复用 SrcIpCidr 当作 V6 入口）
-    ClassicalKind::DstPort,
-    ClassicalKind::ProcessName,
-];
 
 /* ============================================================
 Encode
@@ -81,10 +71,14 @@ pub fn encode(entries: &[ClassicalEntry]) -> Vec<u8> {
     let mut suffixes: Vec<String> = Vec::new();
     let mut keywords: Vec<String> = Vec::new();
     let mut regex: Vec<String> = Vec::new();
-    let mut v4: Vec<(Ipv4Addr, u8)> = Vec::new();
-    let mut v6: Vec<(Ipv6Addr, u8)> = Vec::new();
-    let mut ports: Vec<(u16, u16)> = Vec::new();
+    let mut dst_v4: Vec<(Ipv4Addr, u8)> = Vec::new();
+    let mut dst_v6: Vec<(Ipv6Addr, u8)> = Vec::new();
+    let mut src_v4: Vec<(Ipv4Addr, u8)> = Vec::new();
+    let mut src_v6: Vec<(Ipv6Addr, u8)> = Vec::new();
+    let mut dst_ports: Vec<(u16, u16)> = Vec::new();
+    let mut src_ports: Vec<(u16, u16)> = Vec::new();
     let mut processes: Vec<String> = Vec::new();
+    let mut process_paths: Vec<String> = Vec::new();
 
     for e in entries {
         match e.kind {
@@ -94,20 +88,34 @@ pub fn encode(entries: &[ClassicalEntry]) -> Vec<u8> {
             }
             ClassicalKind::DomainKeyword => keywords.push(e.value.to_ascii_lowercase()),
             ClassicalKind::DomainRegex => regex.push(e.value.clone()),
-            ClassicalKind::IpCidr | ClassicalKind::SrcIpCidr => {
+            ClassicalKind::IpCidr => {
                 if let Ok(net) = e.value.parse::<ipnet::IpNet>() {
                     match net {
-                        ipnet::IpNet::V4(n) => v4.push((n.network(), n.prefix_len())),
-                        ipnet::IpNet::V6(n) => v6.push((n.network(), n.prefix_len())),
+                        ipnet::IpNet::V4(n) => dst_v4.push((n.network(), n.prefix_len())),
+                        ipnet::IpNet::V6(n) => dst_v6.push((n.network(), n.prefix_len())),
                     }
                 }
             }
-            ClassicalKind::DstPort | ClassicalKind::SrcPort => {
+            ClassicalKind::SrcIpCidr => {
+                if let Ok(net) = e.value.parse::<ipnet::IpNet>() {
+                    match net {
+                        ipnet::IpNet::V4(n) => src_v4.push((n.network(), n.prefix_len())),
+                        ipnet::IpNet::V6(n) => src_v6.push((n.network(), n.prefix_len())),
+                    }
+                }
+            }
+            ClassicalKind::DstPort => {
                 if let Some(r) = parse_port_range(&e.value) {
-                    ports.push(r);
+                    dst_ports.push(r);
+                }
+            }
+            ClassicalKind::SrcPort => {
+                if let Some(r) = parse_port_range(&e.value) {
+                    src_ports.push(r);
                 }
             }
             ClassicalKind::ProcessName => processes.push(e.value.to_ascii_lowercase()),
+            ClassicalKind::ProcessPath => process_paths.push(e.value.clone()),
         }
     }
 
@@ -120,12 +128,19 @@ pub fn encode(entries: &[ClassicalEntry]) -> Vec<u8> {
     dedup_sort(&mut keywords);
     dedup_sort(&mut regex);
     dedup_sort(&mut processes);
-    v4.sort_by_key(|(ip, p)| (u32::from(*ip), *p));
-    v4.dedup();
-    v6.sort_by_key(|(ip, p)| (u128::from(*ip), *p));
-    v6.dedup();
-    ports.sort();
-    ports.dedup();
+    dedup_sort(&mut process_paths);
+    dst_v4.sort_by_key(|(ip, p)| (u32::from(*ip), *p));
+    dst_v4.dedup();
+    dst_v6.sort_by_key(|(ip, p)| (u128::from(*ip), *p));
+    dst_v6.dedup();
+    src_v4.sort_by_key(|(ip, p)| (u32::from(*ip), *p));
+    src_v4.dedup();
+    src_v6.sort_by_key(|(ip, p)| (u128::from(*ip), *p));
+    src_v6.dedup();
+    dst_ports.sort();
+    dst_ports.dedup();
+    src_ports.sort();
+    src_ports.dedup();
 
     // 拼 body
     let mut body = Vec::with_capacity(256 + entries.len() * 16);
@@ -133,10 +148,14 @@ pub fn encode(entries: &[ClassicalEntry]) -> Vec<u8> {
     encode_string_section(&mut body, &suffixes);
     encode_string_section(&mut body, &keywords);
     encode_string_section(&mut body, &regex);
-    encode_v4_section(&mut body, &v4);
-    encode_v6_section(&mut body, &v6);
-    encode_port_section(&mut body, &ports);
+    encode_v4_section(&mut body, &dst_v4);
+    encode_v6_section(&mut body, &dst_v6);
+    encode_v4_section(&mut body, &src_v4);
+    encode_v6_section(&mut body, &src_v6);
+    encode_port_section(&mut body, &dst_ports);
+    encode_port_section(&mut body, &src_ports);
     encode_string_section(&mut body, &processes);
+    encode_string_section(&mut body, &process_paths);
 
     let body_len = body.len() as u32;
     let body_crc = crc32fast::hash(&body);
@@ -212,7 +231,7 @@ pub fn decode(buf: &[u8]) -> Result<Vec<ClassicalEntry>, ParseError> {
         return Err(err(format!("bad magic: {:?}", magic)));
     }
     let version = r.read_u16_le()?;
-    if version != VERSION {
+    if !matches!(version, VERSION_V1 | VERSION) {
         return Err(err(format!("unsupported RRS version: {}", version)));
     }
     let _flags = r.read_u16_le()?;
@@ -237,92 +256,143 @@ pub fn decode(buf: &[u8]) -> Result<Vec<ClassicalEntry>, ParseError> {
 
     let mut br = Reader::new(body);
     let mut out = Vec::new();
-    for kind in SECTION_ORDER.iter().copied() {
-        match kind {
-            ClassicalKind::Domain
-            | ClassicalKind::DomainSuffix
-            | ClassicalKind::DomainKeyword
-            | ClassicalKind::DomainRegex
-            | ClassicalKind::ProcessName => {
-                let n = br.read_varlen()? as usize;
-                for _ in 0..n {
-                    let len = br.read_varlen()? as usize;
-                    if len > MAX_STR_LEN {
-                        return Err(err(format!("string too long: {}", len)));
-                    }
-                    let bytes = br.take(len)?;
-                    let s = std::str::from_utf8(bytes)
-                        .map_err(|e| err(format!("non-utf8: {e}")))?
-                        .to_string();
-                    out.push(ClassicalEntry {
-                        kind,
-                        value: s,
-                        policy: None,
-                    });
-                }
-            }
-            ClassicalKind::IpCidr => {
-                // V4 section
-                let n = br.read_varlen()? as usize;
-                for _ in 0..n {
-                    let oct = br.take(4)?;
-                    let prefix = br.take(1)?[0];
-                    if prefix > 32 {
-                        return Err(err(format!("v4 prefix > 32: {}", prefix)));
-                    }
-                    let ip = Ipv4Addr::new(oct[0], oct[1], oct[2], oct[3]);
-                    out.push(ClassicalEntry {
-                        kind: ClassicalKind::IpCidr,
-                        value: format!("{ip}/{prefix}"),
-                        policy: None,
-                    });
-                }
-            }
-            ClassicalKind::SrcIpCidr => {
-                // V6 section
-                let n = br.read_varlen()? as usize;
-                for _ in 0..n {
-                    let raw = br.take(16)?;
-                    let mut octets = [0u8; 16];
-                    octets.copy_from_slice(raw);
-                    let prefix = br.take(1)?[0];
-                    if prefix > 128 {
-                        return Err(err(format!("v6 prefix > 128: {}", prefix)));
-                    }
-                    let ip = Ipv6Addr::from(octets);
-                    out.push(ClassicalEntry {
-                        kind: ClassicalKind::IpCidr,
-                        value: format!("{ip}/{prefix}"),
-                        policy: None,
-                    });
-                }
-            }
-            ClassicalKind::DstPort => {
-                let n = br.read_varlen()? as usize;
-                for _ in 0..n {
-                    let lo_b = br.take(2)?;
-                    let hi_b = br.take(2)?;
-                    let lo = u16::from_be_bytes([lo_b[0], lo_b[1]]);
-                    let hi = u16::from_be_bytes([hi_b[0], hi_b[1]]);
-                    let v = if lo == hi {
-                        format!("{lo}")
-                    } else {
-                        format!("{lo}-{hi}")
-                    };
-                    out.push(ClassicalEntry {
-                        kind: ClassicalKind::DstPort,
-                        value: v,
-                        policy: None,
-                    });
-                }
-            }
-            _ => unreachable!(),
-        }
+    if version == VERSION_V1 {
+        decode_v1_body(&mut br, &mut out)?;
+    } else {
+        decode_v2_body(&mut br, &mut out)?;
     }
     if br.remaining() != 0 {
         return Err(err(format!("trailing bytes in body: {}", br.remaining())));
     }
     Ok(out)
+}
+
+fn decode_v1_body(
+    reader: &mut Reader<'_>,
+    out: &mut Vec<ClassicalEntry>,
+) -> Result<(), ParseError> {
+    decode_string_section(reader, ClassicalKind::Domain, out)?;
+    decode_string_section(reader, ClassicalKind::DomainSuffix, out)?;
+    decode_string_section(reader, ClassicalKind::DomainKeyword, out)?;
+    decode_string_section(reader, ClassicalKind::DomainRegex, out)?;
+    decode_v4_section(reader, ClassicalKind::IpCidr, out)?;
+    decode_v6_section(reader, ClassicalKind::IpCidr, out)?;
+    decode_port_section(reader, ClassicalKind::DstPort, out)?;
+    decode_string_section(reader, ClassicalKind::ProcessName, out)
+}
+
+fn decode_v2_body(
+    reader: &mut Reader<'_>,
+    out: &mut Vec<ClassicalEntry>,
+) -> Result<(), ParseError> {
+    decode_string_section(reader, ClassicalKind::Domain, out)?;
+    decode_string_section(reader, ClassicalKind::DomainSuffix, out)?;
+    decode_string_section(reader, ClassicalKind::DomainKeyword, out)?;
+    decode_string_section(reader, ClassicalKind::DomainRegex, out)?;
+    decode_v4_section(reader, ClassicalKind::IpCidr, out)?;
+    decode_v6_section(reader, ClassicalKind::IpCidr, out)?;
+    decode_v4_section(reader, ClassicalKind::SrcIpCidr, out)?;
+    decode_v6_section(reader, ClassicalKind::SrcIpCidr, out)?;
+    decode_port_section(reader, ClassicalKind::DstPort, out)?;
+    decode_port_section(reader, ClassicalKind::SrcPort, out)?;
+    decode_string_section(reader, ClassicalKind::ProcessName, out)?;
+    decode_string_section(reader, ClassicalKind::ProcessPath, out)
+}
+
+fn decode_string_section(
+    reader: &mut Reader<'_>,
+    kind: ClassicalKind,
+    out: &mut Vec<ClassicalEntry>,
+) -> Result<(), ParseError> {
+    let count = reader.read_varlen()? as usize;
+    for _ in 0..count {
+        let len = reader.read_varlen()? as usize;
+        if len > MAX_STR_LEN {
+            return Err(err(format!("string too long: {len}")));
+        }
+        let bytes = reader.take(len)?;
+        let value = std::str::from_utf8(bytes)
+            .map_err(|error| err(format!("non-utf8: {error}")))?
+            .to_string();
+        out.push(ClassicalEntry {
+            kind,
+            value,
+            policy: None,
+        });
+    }
+    Ok(())
+}
+
+fn decode_v4_section(
+    reader: &mut Reader<'_>,
+    kind: ClassicalKind,
+    out: &mut Vec<ClassicalEntry>,
+) -> Result<(), ParseError> {
+    let count = reader.read_varlen()? as usize;
+    for _ in 0..count {
+        let octets = reader.take(4)?;
+        let prefix = reader.take(1)?[0];
+        if prefix > 32 {
+            return Err(err(format!("v4 prefix > 32: {prefix}")));
+        }
+        let ip = Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]);
+        out.push(ClassicalEntry {
+            kind,
+            value: format!("{ip}/{prefix}"),
+            policy: None,
+        });
+    }
+    Ok(())
+}
+
+fn decode_v6_section(
+    reader: &mut Reader<'_>,
+    kind: ClassicalKind,
+    out: &mut Vec<ClassicalEntry>,
+) -> Result<(), ParseError> {
+    let count = reader.read_varlen()? as usize;
+    for _ in 0..count {
+        let raw = reader.take(16)?;
+        let mut octets = [0u8; 16];
+        octets.copy_from_slice(raw);
+        let prefix = reader.take(1)?[0];
+        if prefix > 128 {
+            return Err(err(format!("v6 prefix > 128: {prefix}")));
+        }
+        out.push(ClassicalEntry {
+            kind,
+            value: format!("{}/{prefix}", Ipv6Addr::from(octets)),
+            policy: None,
+        });
+    }
+    Ok(())
+}
+
+fn decode_port_section(
+    reader: &mut Reader<'_>,
+    kind: ClassicalKind,
+    out: &mut Vec<ClassicalEntry>,
+) -> Result<(), ParseError> {
+    let count = reader.read_varlen()? as usize;
+    for _ in 0..count {
+        let lo_bytes = reader.take(2)?;
+        let hi_bytes = reader.take(2)?;
+        let lo = u16::from_be_bytes([lo_bytes[0], lo_bytes[1]]);
+        let hi = u16::from_be_bytes([hi_bytes[0], hi_bytes[1]]);
+        if lo > hi {
+            return Err(err(format!("port range starts after its end: {lo}-{hi}")));
+        }
+        out.push(ClassicalEntry {
+            kind,
+            value: if lo == hi {
+                lo.to_string()
+            } else {
+                format!("{lo}-{hi}")
+            },
+            policy: None,
+        });
+    }
+    Ok(())
 }
 
 fn parse_port_range(s: &str) -> Option<(u16, u16)> {
@@ -437,6 +507,7 @@ pub fn entries_to_singbox_json(entries: &[ClassicalEntry]) -> String {
     let mut destination: BTreeMap<&'static str, Vec<Value>> = BTreeMap::new();
     let mut source_ips = Vec::new();
     let mut processes = Vec::new();
+    let mut process_paths = Vec::new();
     let mut destination_ports = Vec::new();
     let mut destination_port_ranges = Vec::new();
     let mut source_ports = Vec::new();
@@ -491,6 +562,7 @@ pub fn entries_to_singbox_json(entries: &[ClassicalEntry]) -> String {
                 }
             }
             ClassicalKind::ProcessName => processes.push(json!(e.value)),
+            ClassicalKind::ProcessPath => process_paths.push(json!(e.value)),
         }
     }
 
@@ -528,6 +600,9 @@ pub fn entries_to_singbox_json(entries: &[ClassicalEntry]) -> String {
     if !processes.is_empty() {
         rules.push(json!({"process_name": processes}));
     }
+    if !process_paths.is_empty() {
+        rules.push(json!({"process_path": process_paths}));
+    }
 
     let mut output = serde_json::to_string_pretty(&json!({"version": 2, "rules": rules}))
         .expect("serializing a JSON value cannot fail");
@@ -546,6 +621,7 @@ fn kind_str(k: ClassicalKind) -> &'static str {
         ClassicalKind::DstPort => "DST-PORT",
         ClassicalKind::SrcPort => "SRC-PORT",
         ClassicalKind::ProcessName => "PROCESS-NAME",
+        ClassicalKind::ProcessPath => "PROCESS-PATH",
     }
 }
 
@@ -570,14 +646,16 @@ mod tests {
             entry(ClassicalKind::DomainRegex, r"^a\.b$"),
             entry(ClassicalKind::IpCidr, "1.2.3.0/24"),
             entry(ClassicalKind::IpCidr, "fd00::/8"),
+            entry(ClassicalKind::SrcIpCidr, "10.0.0.0/8"),
             entry(ClassicalKind::DstPort, "443"),
             entry(ClassicalKind::DstPort, "1000-2000"),
+            entry(ClassicalKind::SrcPort, "5353"),
             entry(ClassicalKind::ProcessName, "Code"),
+            entry(ClassicalKind::ProcessPath, r"C:\Apps\Code.exe"),
         ];
         let bin = encode(&input);
         assert_eq!(&bin[..4], &MAGIC);
         let out = decode(&bin).unwrap();
-        // 同样数量（去重 + 排序后 9 → 9）
         assert_eq!(out.len(), input.len());
         // 关键值可还原
         let values: std::collections::BTreeSet<_> = out.iter().map(|e| e.value.clone()).collect();
@@ -587,7 +665,60 @@ mod tests {
         assert!(values.contains("fd00::/8"));
         assert!(values.contains("443"));
         assert!(values.contains("1000-2000"));
+        assert!(values.contains("10.0.0.0/8"));
+        assert!(values.contains("5353"));
         assert!(values.contains("code")); // 进程名小写
+        assert!(values.contains(r"C:\Apps\Code.exe"));
+        assert!(
+            out.iter()
+                .any(|entry| entry.kind == ClassicalKind::SrcIpCidr && entry.value == "10.0.0.0/8")
+        );
+        assert!(
+            out.iter()
+                .any(|entry| entry.kind == ClassicalKind::SrcPort && entry.value == "5353")
+        );
+        assert!(
+            out.iter()
+                .any(|entry| entry.kind == ClassicalKind::ProcessPath
+                    && entry.value == r"C:\Apps\Code.exe")
+        );
+    }
+
+    #[test]
+    fn decodes_legacy_v1_without_reinterpreting_its_sections() {
+        let mut body = Vec::new();
+        encode_string_section(&mut body, &["legacy.example".into()]);
+        encode_string_section(&mut body, &[]);
+        encode_string_section(&mut body, &[]);
+        encode_string_section(&mut body, &[]);
+        encode_v4_section(&mut body, &[("192.0.2.0".parse().unwrap(), 24)]);
+        encode_v6_section(&mut body, &[]);
+        encode_port_section(&mut body, &[(443, 443)]);
+        encode_string_section(&mut body, &["legacy.exe".into()]);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MAGIC);
+        bytes.extend_from_slice(&VERSION_V1.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&crc32fast::hash(&body).to_le_bytes());
+        bytes.extend_from_slice(&body);
+
+        let entries = decode(&bytes).unwrap();
+        assert!(entries.iter().any(
+            |entry| entry.kind == ClassicalKind::Domain && entry.value == "legacy.example"
+        ));
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.kind == ClassicalKind::IpCidr && entry.value == "192.0.2.0/24")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.kind == ClassicalKind::DstPort && entry.value == "443")
+        );
     }
 
     #[test]
@@ -658,6 +789,7 @@ mod tests {
             entry(ClassicalKind::DomainSuffix, ".example.com"),
             entry(ClassicalKind::DstPort, "443"),
             entry(ClassicalKind::DstPort, "1000-2000"),
+            entry(ClassicalKind::ProcessPath, r"C:\Apps\browser.exe"),
         ];
         let direct_json = entries_to_singbox_json(&input);
         let direct_value: serde_json::Value = serde_json::from_str(&direct_json).unwrap();
@@ -681,5 +813,10 @@ mod tests {
         assert!(matcher.matches("unrelated.test", None, Some(443), None));
         assert!(matcher.matches("unrelated.test", None, Some(1500), None));
         assert!(!matcher.matches("unrelated.test", None, Some(80), None));
+        let context = crate::RulesetMatchContext {
+            process_path: Some(r"C:\Apps\browser.exe"),
+            ..Default::default()
+        };
+        assert!(matcher.matches_context(&context));
     }
 }

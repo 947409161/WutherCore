@@ -75,10 +75,10 @@ struct RawRule {
     source_port: OneOrMany<u16>,
     source_port_range: OneOrMany<String>,
     process_name: OneOrMany<String>,
+    process_path: OneOrMany<String>,
     network: OneOrMany<String>,
 
     query_type: Option<Value>,
-    process_path: Option<Value>,
     process_path_regex: Option<Value>,
     package_name: Option<Value>,
     package_name_regex: Option<Value>,
@@ -96,7 +96,6 @@ impl RawRule {
     fn unsupported_field(&self) -> Option<&'static str> {
         [
             ("query_type", self.query_type.is_some()),
-            ("process_path", self.process_path.is_some()),
             ("process_path_regex", self.process_path_regex.is_some()),
             ("package_name", self.package_name.is_some()),
             ("package_name_regex", self.package_name_regex.is_some()),
@@ -134,6 +133,7 @@ impl RawRule {
             || !self.source_port.is_empty()
             || !self.source_port_range.is_empty()
             || !self.process_name.is_empty()
+            || !self.process_path.is_empty()
             || !self.network.is_empty()
     }
 }
@@ -289,6 +289,17 @@ fn compile_default(rule: RawRule) -> Result<RulesetExpr, ParseError> {
         )));
     }
 
+    let process_paths = normalize_strings(
+        "process_path",
+        rule.process_path.into_vec(),
+        normalize_trim_nonempty,
+    )?;
+    if !process_paths.is_empty() {
+        groups.push(RulesetExpr::Predicate(RulesetPredicate::ProcessPath(
+            process_paths,
+        )));
+    }
+
     let networks = normalize_networks(rule.network.into_vec())?;
     if !networks.is_empty() {
         groups.push(RulesetExpr::Predicate(RulesetPredicate::Network(networks)));
@@ -432,7 +443,9 @@ fn parse_port_range(field: &'static str, value: &str) -> Result<PortRange, Parse
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{RulesetMatchContext, RulesetMatcher, parser::RulesetCompiled};
+    use crate::{
+        RulesetMatchContext, RulesetMatchOutcome, RulesetMatcher, parser::RulesetCompiled,
+    };
 
     fn matcher(json: &[u8]) -> RulesetMatcher {
         let program = parse(json).unwrap();
@@ -643,6 +656,23 @@ mod tests {
         let error = parse(br#"{"version":5,"rules":[{"totally_unknown":[]}]}"#).unwrap_err();
         assert!(matches!(error, ParseError::Json(_)));
         assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn process_path_is_supported_and_requires_process_metadata() {
+        let program =
+            parse(br#"{"version":5,"rules":[{"process_path":"C:\\Apps\\browser.exe"}]}"#).unwrap();
+        let matcher = RulesetMatcher::compile_semantic("path", program);
+        let unresolved = RulesetMatchContext::default();
+        assert_eq!(
+            matcher.matches_context_lazy(&unresolved, false),
+            RulesetMatchOutcome::NeedsProcess
+        );
+        let context = RulesetMatchContext {
+            process_path: Some(r"C:\Apps\browser.exe"),
+            ..Default::default()
+        };
+        assert!(matcher.matches_context(&context));
     }
 
     #[test]

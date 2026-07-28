@@ -6,6 +6,7 @@ use std::{
 };
 
 use ahash::{AHashMap, AHashSet};
+use fancy_regex::Regex as FancyRegex;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use parking_lot::RwLock;
 use regex::RegexSet;
@@ -13,6 +14,7 @@ use thiserror::Error;
 use tokio::sync::watch;
 
 use crate::ir::{RulesetMatchContext, RulesetMatchOutcome, RulesetProgram};
+use crate::mihomo_regex::compile_mihomo_domain_regex;
 
 const MAX_IP_PREFIX_SNAPSHOT_ITEMS: usize = 4 * 1024 * 1024;
 
@@ -105,6 +107,7 @@ pub enum ClassicalKind {
     DstPort,
     SrcPort,
     ProcessName,
+    ProcessPath,
 }
 
 impl ClassicalKind {
@@ -119,6 +122,7 @@ impl ClassicalKind {
             "DST-PORT" => Self::DstPort,
             "SRC-PORT" => Self::SrcPort,
             "PROCESS-NAME" => Self::ProcessName,
+            "PROCESS-PATH" => Self::ProcessPath,
             _ => return None,
         })
     }
@@ -134,8 +138,10 @@ pub struct RulesetMatcher {
     suffix_trie: SuffixTrie,
     /// 子串关键字
     keywords: Vec<String>,
-    /// 正则集合
+    /// Rust `regex` 可以无损处理的快速正则集合。
     regex_set: Option<RegexSet>,
+    /// 需要 look-around / backreference 等 regexp2 语义的正则。
+    fancy_regexes: Vec<FancyRegex>,
     /// CIDR：v4 与 v6 分桶
     cidr_v4: Vec<ipnet::Ipv4Net>,
     cidr_v6: Vec<ipnet::Ipv6Net>,
@@ -144,6 +150,8 @@ pub struct RulesetMatcher {
     src_cidr_v6: Vec<ipnet::Ipv6Net>,
     /// 进程名（精确）
     processes: AHashSet<String>,
+    /// 完整进程路径（精确，大小写不敏感）。
+    process_paths: AHashSet<String>,
     /// 端口（单值或区间，u16..=u16）
     ports: Vec<(u16, u16)>,
     /// source 端口，不能退化为 destination 端口。
@@ -243,10 +251,26 @@ impl RulesetMatcher {
                     saw_non_destination_rule = true;
                     m.processes.insert(e.value.to_ascii_lowercase());
                 }
+                ClassicalKind::ProcessPath => {
+                    saw_non_destination_rule = true;
+                    m.process_paths.insert(e.value.to_lowercase());
+                }
             }
         }
         if !regex_pats.is_empty() {
-            if let Ok(rs) = RegexSet::new(&regex_pats) {
+            let mut fast = Vec::new();
+            for pattern in regex_pats {
+                if regex::Regex::new(&pattern).is_ok() {
+                    fast.push(pattern);
+                } else if let Ok(regex) = compile_mihomo_domain_regex(&pattern) {
+                    m.fancy_regexes.push(regex);
+                }
+            }
+            if !fast.is_empty()
+                && let Ok(rs) = regex::RegexSetBuilder::new(&fast)
+                    .case_insensitive(true)
+                    .build()
+            {
                 m.regex_set = Some(rs);
             }
         }
@@ -473,6 +497,13 @@ impl RulesetMatcher {
                     return true;
                 }
             }
+            if self
+                .fancy_regexes
+                .iter()
+                .any(|regex| regex.is_match(&host_lc).unwrap_or(false))
+            {
+                return true;
+            }
             // mihomo MRS domain succinct trie（含 wildcard 语义）
             if let Some(set) = &self.mrs_domain_set {
                 if set.has(&host_lc) {
@@ -537,6 +568,11 @@ impl RulesetMatcher {
                 return true;
             }
         }
+        if let Some(path) = ctx.process_path {
+            if self.process_paths.contains(&path.to_lowercase()) {
+                return true;
+            }
+        }
         false
     }
 
@@ -555,7 +591,9 @@ impl RulesetMatcher {
         }
         if self.matches_context(ctx) {
             RulesetMatchOutcome::Matched
-        } else if !process_resolved && !self.processes.is_empty() {
+        } else if !process_resolved
+            && (!self.processes.is_empty() || !self.process_paths.is_empty())
+        {
             RulesetMatchOutcome::NeedsProcess
         } else {
             RulesetMatchOutcome::NotMatched
@@ -576,10 +614,10 @@ impl RulesetMatcher {
             domains: domains_total,
             suffixes: self.suffix_trie.len(),
             keywords: self.keywords.len(),
-            regex: self.regex_set.as_ref().map(|r| r.len()).unwrap_or(0),
+            regex: self.regex_set.as_ref().map(|r| r.len()).unwrap_or(0) + self.fancy_regexes.len(),
             cidr_v4: self.cidr_v4.len() + self.src_cidr_v4.len() + self.mrs_v4_ranges.len(),
             cidr_v6: self.cidr_v6.len() + self.src_cidr_v6.len() + self.mrs_v6_ranges.len(),
-            processes: self.processes.len(),
+            processes: self.processes.len() + self.process_paths.len(),
             ports: self.ports.len() + self.src_ports.len(),
         }
     }
@@ -1239,6 +1277,19 @@ mod tests {
     }
 
     #[test]
+    fn domain_regex_is_case_insensitive_and_supports_lookaround() {
+        let m = RulesetMatcher::compile(
+            "regexp2",
+            vec![entry(
+                ClassicalKind::DomainRegex,
+                r"^(?!api0\.)(api[0-9]+)\.example\.com$",
+            )],
+        );
+        assert!(m.matches("API42.EXAMPLE.COM", None, None, None));
+        assert!(!m.matches("api0.example.com", None, None, None));
+    }
+
+    #[test]
     fn cidr_v4_v6() {
         let m = RulesetMatcher::compile(
             "t",
@@ -1307,6 +1358,34 @@ mod tests {
             ..Default::default()
         };
         assert!(m.matches_context(&source_port));
+    }
+
+    #[test]
+    fn process_path_is_exact_case_insensitive_and_lazy() {
+        let m = RulesetMatcher::compile(
+            "path",
+            vec![entry(
+                ClassicalKind::ProcessPath,
+                r"C:\Program Files\Browser\browser.exe",
+            )],
+        );
+        let unresolved = RulesetMatchContext::default();
+        assert_eq!(
+            m.matches_context_lazy(&unresolved, false),
+            RulesetMatchOutcome::NeedsProcess
+        );
+
+        let exact = RulesetMatchContext {
+            process_path: Some(r"c:\program files\browser\BROWSER.EXE"),
+            ..Default::default()
+        };
+        assert!(m.matches_context(&exact));
+
+        let child = RulesetMatchContext {
+            process_path: Some(r"C:\Program Files\Browser\helper.exe"),
+            ..Default::default()
+        };
+        assert!(!m.matches_context(&child));
     }
 
     #[test]

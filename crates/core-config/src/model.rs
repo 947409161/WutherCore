@@ -4452,15 +4452,41 @@ pub struct RouteStepObject {
     /// 子串关键字。canonical: `keyword`；mihomo 友好别名 `domain-keyword`。
     #[serde(default, alias = "domain-keyword", alias = "domain_keyword")]
     pub keyword: Option<MatcherValue>,
+    /// Mihomo `DOMAIN-REGEX`，大小写不敏感并支持 look-around / backreference。
+    #[serde(default, alias = "domain-regex", alias = "domain_regex")]
+    pub regex: Option<MatcherValue>,
     /// IP CIDR。canonical: `ip`；别名 `cidr` / `ip-cidr`。
     #[serde(default, alias = "cidr", alias = "ip-cidr", alias = "ip_cidr")]
     pub ip: Option<MatcherValue>,
+    /// 源 IP CIDR。canonical: `source-ip`；兼容 Mihomo `src-ip-cidr`。
+    #[serde(
+        default,
+        rename = "source-ip",
+        alias = "source_ip",
+        alias = "src-ip",
+        alias = "src_ip",
+        alias = "src-ip-cidr",
+        alias = "src_ip_cidr"
+    )]
+    pub source_ip: Option<MatcherValue>,
     /// 目的端口（单个 `53` 或区间 `1000-2000`）。canonical: `port`；别名 `dst-port`。
     #[serde(default, alias = "dst-port", alias = "dst_port")]
     pub port: Option<MatcherValue>,
+    /// 源端口（单个或闭区间）。canonical: `source-port`；兼容 Mihomo `src-port`。
+    #[serde(
+        default,
+        rename = "source-port",
+        alias = "source_port",
+        alias = "src-port",
+        alias = "src_port"
+    )]
+    pub source_port: Option<MatcherValue>,
     /// 进程名。canonical: `process`；别名 `process-name`。
     #[serde(default, alias = "process-name", alias = "process_name")]
     pub process: Option<MatcherValue>,
+    /// 完整进程路径，大小写不敏感精确匹配。
+    #[serde(default, rename = "process-path", alias = "process_path")]
+    pub process_path: Option<MatcherValue>,
     /// 外部规则集名（`route.sets.<name>`）。canonical: `set`；别名 `rule-set`。
     #[serde(default, alias = "rule-set", alias = "rule_set")]
     pub set: Option<MatcherValue>,

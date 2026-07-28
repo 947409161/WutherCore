@@ -67,7 +67,8 @@ WutherCore 负责节点接入、订阅更新、DNS、规则分流、透明代理
 
 ### 规则集
 
-* 支持 Mihomo YAML、文本规则、MRS v1、sing-box JSON、SRS v1 至 v5、内联 Payload 和 WutherCore RRS。
+* 支持 Mihomo YAML、文本规则、MRS v1、sing-box JSON、SRS v1 至 v5、内联 Payload 和 WutherCore RRS v2。
+* Classical provider 完整支持 `SRC-IP-CIDR`、`SRC-PORT`、`DOMAIN-REGEX` 和 `PROCESS-PATH`；MRS v1 严格遵循 Mihomo 的 domain/ipcidr behavior。
 * 二进制输入会经过有界解压、结构校验和统一 matcher 编译。
 * 规则集支持运行时热更新、版本化 IP 前缀快照和变更通知。
 * `ruleset convert` 可在常用文本、YAML、JSON 和 RRS 格式之间转换。

@@ -12,6 +12,7 @@ serde_yaml  = { workspace = true }
 ipnet       = { workspace = true }
 ahash       = { workspace = true }
 regex       = { workspace = true }
+fancy-regex = { workspace = true }
 once_cell   = { workspace = true }
 parking_lot = { workspace = true }
 dashmap     = { workspace = true }

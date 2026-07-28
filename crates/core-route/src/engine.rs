@@ -5,10 +5,13 @@
 
 use std::{collections::BTreeSet, net::IpAddr, sync::Arc};
 
+use ahash::AHashMap;
 use core_config::runtime_plan::{RouteAction, RouteMatcher, RoutePlan};
 use core_ruleset::{
     RulesetIndex, RulesetInterfaceAddress, RulesetMatchContext, RulesetMatchOutcome,
+    compile_mihomo_domain_regex,
 };
+use fancy_regex::Regex as FancyRegex;
 use ipnet::IpNet;
 
 use crate::builtin;
@@ -162,24 +165,29 @@ pub struct RouteEngine {
     plan: Arc<RoutePlan>,
     extra_cidrs: Vec<IpNet>,
     rulesets: Option<Arc<RulesetIndex>>,
+    domain_regexes: Arc<AHashMap<String, FancyRegex>>,
     disabled_rules: Arc<parking_lot::RwLock<BTreeSet<usize>>>,
 }
 
 impl RouteEngine {
     pub fn new(plan: RoutePlan) -> Self {
+        let domain_regexes = Arc::new(compile_route_domain_regexes(&plan));
         Self {
             plan: Arc::new(plan),
             extra_cidrs: Vec::new(),
             rulesets: None,
+            domain_regexes,
             disabled_rules: Arc::new(parking_lot::RwLock::new(BTreeSet::new())),
         }
     }
 
     pub fn with_rulesets(plan: RoutePlan, rulesets: Arc<RulesetIndex>) -> Self {
+        let domain_regexes = Arc::new(compile_route_domain_regexes(&plan));
         Self {
             plan: Arc::new(plan),
             extra_cidrs: Vec::new(),
             rulesets: Some(rulesets),
+            domain_regexes,
             disabled_rules: Arc::new(parking_lot::RwLock::new(BTreeSet::new())),
         }
     }
@@ -221,6 +229,7 @@ impl RouteEngine {
                 ctx,
                 &self.extra_cidrs,
                 self.rulesets.as_ref(),
+                &self.domain_regexes,
             ) {
                 return (
                     RouteDecision::from_action(&step.action),
@@ -248,6 +257,7 @@ impl RouteEngine {
                 ctx,
                 &self.extra_cidrs,
                 self.rulesets.as_ref(),
+                &self.domain_regexes,
                 false,
             ) {
                 MatchState::Matched => return false,
@@ -266,6 +276,32 @@ enum MatchState {
     NeedsProcess,
 }
 
+fn compile_route_domain_regexes(plan: &RoutePlan) -> AHashMap<String, FancyRegex> {
+    fn collect(matcher: &RouteMatcher, out: &mut AHashMap<String, FancyRegex>) {
+        match matcher {
+            RouteMatcher::DomainRegex(pattern) => {
+                if !out.contains_key(pattern)
+                    && let Ok(regex) = compile_mihomo_domain_regex(pattern)
+                {
+                    out.insert(pattern.clone(), regex);
+                }
+            }
+            RouteMatcher::And(parts) | RouteMatcher::Or(parts) => {
+                for part in parts {
+                    collect(part, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut regexes = AHashMap::new();
+    for step in &plan.steps {
+        collect(&step.matcher, &mut regexes);
+    }
+    regexes
+}
+
 fn matcher_kind(m: &RouteMatcher) -> &'static str {
     match m {
         RouteMatcher::Any => "any",
@@ -276,13 +312,18 @@ fn matcher_kind(m: &RouteMatcher) -> &'static str {
         RouteMatcher::Domain(_) => "domain",
         RouteMatcher::Suffix(_) => "suffix",
         RouteMatcher::Keyword(_) => "keyword",
+        RouteMatcher::DomainRegex(_) => "domain_regex",
         RouteMatcher::Cidr(_) => "ip",
+        RouteMatcher::SrcCidr(_) => "src_ip",
         RouteMatcher::Port(_) => "port",
         RouteMatcher::PortRange(_, _) => "port_range",
+        RouteMatcher::SrcPort(_) => "src_port",
+        RouteMatcher::SrcPortRange(_, _) => "src_port_range",
         RouteMatcher::And(_) => "and",
         RouteMatcher::Or(_) => "or",
         RouteMatcher::Network(_) => "network",
         RouteMatcher::Process(_) => "process",
+        RouteMatcher::ProcessPath(_) => "process_path",
         RouteMatcher::Set(_) => "set",
         RouteMatcher::Proto(_) => "proto",
     }
@@ -293,8 +334,9 @@ fn step_matches(
     ctx: &FlowContext,
     extra_cidrs: &[IpNet],
     rulesets: Option<&Arc<RulesetIndex>>,
+    domain_regexes: &AHashMap<String, FancyRegex>,
 ) -> bool {
-    step_match_state(m, ctx, extra_cidrs, rulesets, true) == MatchState::Matched
+    step_match_state(m, ctx, extra_cidrs, rulesets, domain_regexes, true) == MatchState::Matched
 }
 
 fn step_match_state(
@@ -302,6 +344,7 @@ fn step_match_state(
     ctx: &FlowContext,
     extra_cidrs: &[IpNet],
     rulesets: Option<&Arc<RulesetIndex>>,
+    domain_regexes: &AHashMap<String, FancyRegex>,
     process_resolved: bool,
 ) -> MatchState {
     use MatchState::{Matched, NeedsProcess, NotMatched};
@@ -318,21 +361,44 @@ fn step_match_state(
         RouteMatcher::Domain(d) => bool_state(host_eq(&ctx.host, d)),
         RouteMatcher::Suffix(s) => bool_state(host_suffix(&ctx.host, s)),
         RouteMatcher::Keyword(k) => bool_state(host_contains(&ctx.host, k)),
+        RouteMatcher::DomainRegex(pattern) => bool_state(
+            domain_regexes
+                .get(pattern)
+                .and_then(|regex| regex.is_match(&ctx.host).ok())
+                .unwrap_or(false),
+        ),
         RouteMatcher::Cidr(s) => bool_state(match_cidr(ctx, s, extra_cidrs)),
+        RouteMatcher::SrcCidr(s) => bool_state(match_source_cidr(ctx, s)),
         RouteMatcher::Port(p) => bool_state(ctx.port == *p),
         RouteMatcher::PortRange(lo, hi) => bool_state(ctx.port >= *lo && ctx.port <= *hi),
+        RouteMatcher::SrcPort(p) => bool_state(ctx.ruleset.source_port == Some(*p)),
+        RouteMatcher::SrcPortRange(lo, hi) => bool_state(
+            ctx.ruleset
+                .source_port
+                .map(|port| port >= *lo && port <= *hi)
+                .unwrap_or(false),
+        ),
         RouteMatcher::Network(n) => bool_state(n.eq_ignore_ascii_case(ctx.network.as_str())),
-        RouteMatcher::Process(_) if !process_resolved => NeedsProcess,
+        RouteMatcher::Process(_) | RouteMatcher::ProcessPath(_) if !process_resolved => {
+            NeedsProcess
+        }
         RouteMatcher::Process(name) => bool_state(
             ctx.process
                 .as_ref()
-                .map(|p| p.eq_ignore_ascii_case(name))
+                .map(|p| text_eq_ignore_case(p, name))
                 .unwrap_or(false)
                 || ctx
                     .ruleset
                     .package_names
                     .iter()
-                    .any(|package| package.eq_ignore_ascii_case(name)),
+                    .any(|package| text_eq_ignore_case(package, name)),
+        ),
+        RouteMatcher::ProcessPath(path) => bool_state(
+            ctx.ruleset
+                .process_path
+                .as_deref()
+                .map(|actual| text_eq_ignore_case(actual, path))
+                .unwrap_or(false),
         ),
         RouteMatcher::Set(name) => match rulesets {
             Some(idx) => idx
@@ -356,7 +422,14 @@ fn step_match_state(
         RouteMatcher::And(parts) => {
             let mut needs_process = false;
             for part in parts {
-                match step_match_state(part, ctx, extra_cidrs, rulesets, process_resolved) {
+                match step_match_state(
+                    part,
+                    ctx,
+                    extra_cidrs,
+                    rulesets,
+                    domain_regexes,
+                    process_resolved,
+                ) {
                     NotMatched => return NotMatched,
                     NeedsProcess => needs_process = true,
                     Matched => {}
@@ -367,7 +440,14 @@ fn step_match_state(
         RouteMatcher::Or(parts) => {
             let mut needs_process = false;
             for part in parts {
-                match step_match_state(part, ctx, extra_cidrs, rulesets, process_resolved) {
+                match step_match_state(
+                    part,
+                    ctx,
+                    extra_cidrs,
+                    rulesets,
+                    domain_regexes,
+                    process_resolved,
+                ) {
                     Matched => return Matched,
                     NeedsProcess => needs_process = true,
                     NotMatched => {}
@@ -404,6 +484,10 @@ fn host_suffix(host: &str, suffix: &str) -> bool {
 fn host_contains(host: &str, keyword: &str) -> bool {
     host.to_ascii_lowercase()
         .contains(&keyword.to_ascii_lowercase())
+}
+
+fn text_eq_ignore_case(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right) || left.to_lowercase() == right.to_lowercase()
 }
 
 fn match_suffix_list(host: &str, list: &[&str]) -> bool {
@@ -449,6 +533,16 @@ fn match_cidr(ctx: &FlowContext, cidr: &str, extra: &[IpNet]) -> bool {
     false
 }
 
+fn match_source_cidr(ctx: &FlowContext, cidr: &str) -> bool {
+    let Ok(net) = cidr.parse::<IpNet>() else {
+        return false;
+    };
+    ctx.ruleset
+        .source_ip
+        .map(|ip| net.contains(&ip))
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use core_config::runtime_plan::{RoutePlan, RouteStep};
@@ -481,6 +575,19 @@ mod tests {
         p
     }
 
+    fn engine_for(matcher: RouteMatcher) -> RouteEngine {
+        RouteEngine::new(RoutePlan {
+            preset: "custom".into(),
+            r#final: "main".into(),
+            steps: vec![RouteStep {
+                matcher,
+                action: RouteAction::Group("matched".into()),
+                source: "test".into(),
+            }],
+            sets: Default::default(),
+        })
+    }
+
     #[test]
     fn cn_domain_goes_direct() {
         let eng = RouteEngine::new(plan_cn_smart());
@@ -509,6 +616,65 @@ mod tests {
     fn host_suffix_case_insensitive() {
         assert!(super::host_suffix("Mail.QQ.com", "qq.com"));
         assert!(!super::host_suffix("noqq.com", "qq.com"));
+    }
+
+    #[test]
+    fn mihomo_domain_regex_uses_case_insensitive_advanced_matching() {
+        let engine = engine_for(RouteMatcher::DomainRegex(
+            r"^(?!api0\.)(api[0-9]+)\.example\.com$".into(),
+        ));
+        let matched = FlowContext::for_domain("API42.EXAMPLE.COM", 443, NetworkKind::Tcp);
+        assert_eq!(
+            engine.decide(&matched).0,
+            RouteDecision::Group("matched".into())
+        );
+        let excluded = FlowContext::for_domain("api0.example.com", 443, NetworkKind::Tcp);
+        assert_eq!(engine.decide(&excluded).0, RouteDecision::Direct);
+    }
+
+    #[test]
+    fn source_matchers_never_fall_back_to_destination() {
+        let source_ip = engine_for(RouteMatcher::SrcCidr("10.0.0.0/8".into()));
+        let destination_only =
+            FlowContext::for_ip("10.2.3.4".parse().unwrap(), 1500, NetworkKind::Tcp);
+        assert_eq!(source_ip.decide(&destination_only).0, RouteDecision::Direct);
+
+        let mut with_source =
+            FlowContext::for_ip("203.0.113.8".parse().unwrap(), 80, NetworkKind::Tcp);
+        with_source.ruleset.source_ip = Some("10.2.3.4".parse().unwrap());
+        assert_eq!(
+            source_ip.decide(&with_source).0,
+            RouteDecision::Group("matched".into())
+        );
+
+        let source_port = engine_for(RouteMatcher::SrcPortRange(1000, 2000));
+        assert_eq!(
+            source_port.decide(&destination_only).0,
+            RouteDecision::Direct
+        );
+        with_source.ruleset.source_port = Some(1500);
+        assert_eq!(
+            source_port.decide(&with_source).0,
+            RouteDecision::Group("matched".into())
+        );
+    }
+
+    #[test]
+    fn process_path_is_exact_case_insensitive_and_triggers_lazy_lookup() {
+        let engine = engine_for(RouteMatcher::ProcessPath(
+            r"C:\Program Files\Browser\browser.exe".into(),
+        ));
+        let mut context = FlowContext::for_domain("example.com", 443, NetworkKind::Tcp);
+        assert!(engine.needs_process(&context));
+
+        context.ruleset.process_path = Some(r"c:\program files\browser\BROWSER.EXE".into());
+        assert_eq!(
+            engine.decide(&context).0,
+            RouteDecision::Group("matched".into())
+        );
+
+        context.ruleset.process_path = Some(r"C:\Program Files\Browser\helper.exe".into());
+        assert_eq!(engine.decide(&context).0, RouteDecision::Direct);
     }
 
     #[test]

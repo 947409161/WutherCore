@@ -374,12 +374,21 @@ pub enum RouteMatcher {
     Suffix(String),
     /// mihomo `DOMAIN-KEYWORD` —— 子串匹配（大小写不敏感）。
     Keyword(String),
+    /// mihomo `DOMAIN-REGEX` —— regexp2 风格、大小写不敏感。
+    DomainRegex(String),
     Cidr(String),
+    /// mihomo `SRC-IP-CIDR`，只匹配连接源地址。
+    SrcCidr(String),
     Port(u16),
     /// `DST-PORT,LOW-HIGH` —— 闭区间端口范围。
     PortRange(u16, u16),
+    /// mihomo `SRC-PORT`，只匹配连接源端口。
+    SrcPort(u16),
+    SrcPortRange(u16, u16),
     Network(String),
     Process(String),
+    /// mihomo `PROCESS-PATH`，完整路径精确匹配。
+    ProcessPath(String),
     /// 外部规则集（`route.sets.<name>`）。
     Set(String),
     /// L7 协议指纹（stun/dtls/quic/tls/sni/http/webrtc）。
@@ -3391,18 +3400,37 @@ fn compile_object(
             Ok(RouteMatcher::Keyword(s.into()))
         })?);
     }
+    if let Some(v) = &obj.regex {
+        clauses.push(matcher_from_values(v, |s| {
+            validate_mihomo_domain_regex(s)?;
+            Ok(RouteMatcher::DomainRegex(s.into()))
+        })?);
+    }
     if let Some(v) = &obj.ip {
         clauses.push(matcher_from_values(v, |s| {
-            Ok(RouteMatcher::Cidr(s.into()))
+            Ok(RouteMatcher::Cidr(normalize_classical_cidr(s)?))
+        })?);
+    }
+    if let Some(v) = &obj.source_ip {
+        clauses.push(matcher_from_values(v, |s| {
+            Ok(RouteMatcher::SrcCidr(normalize_classical_cidr(s)?))
         })?);
     }
     if let Some(v) = &obj.port {
         // port 字段单独处理：值字符串里可能有 `1000-2000` 区间，要分流到 PortRange。
         clauses.push(matcher_from_values(v, |s| parse_classical_port(s))?);
     }
+    if let Some(v) = &obj.source_port {
+        clauses.push(matcher_from_values(v, parse_classical_source_port)?);
+    }
     if let Some(v) = &obj.process {
         clauses.push(matcher_from_values(v, |s| {
             Ok(RouteMatcher::Process(s.into()))
+        })?);
+    }
+    if let Some(v) = &obj.process_path {
+        clauses.push(matcher_from_values(v, |s| {
+            Ok(RouteMatcher::ProcessPath(s.into()))
         })?);
     }
     if let Some(v) = &obj.set {
@@ -3420,7 +3448,7 @@ fn compile_object(
             "规则对象缺少匹配字段: outbound={}",
             obj.outbound
         ))
-        .hint("加上 `match`/`domain`/`suffix`/`keyword`/`ip`/`port`/`process`/`set`/`network`/`proto` 之一"));
+        .hint("加上 `match`/`domain`/`suffix`/`keyword`/`regex`/`ip`/`source-ip`/`port`/`source-port`/`process`/`process-path`/`set`/`network`/`proto` 之一"));
     }
 
     let final_matcher = if clauses.len() == 1 {
@@ -3473,16 +3501,41 @@ fn parse_match_lhs(lhs: &str) -> ConfigResult<Vec<RouteMatcher>> {
             .into_iter()
             .map(|v| RouteMatcher::Suffix(v.into()))
             .collect(),
+        s if s.starts_with("domain-regex:") => split_values(&s[13..])
+            .into_iter()
+            .map(|v| {
+                validate_mihomo_domain_regex(v)?;
+                Ok(RouteMatcher::DomainRegex(v.into()))
+            })
+            .collect::<ConfigResult<Vec<_>>>()?,
         s if s.starts_with("suffix:") => split_values(&s[7..])
             .into_iter()
             .map(|v| RouteMatcher::Suffix(v.into()))
             .collect(),
         s if s.starts_with("ip:") => split_values(&s[3..])
             .into_iter()
-            .map(|v| RouteMatcher::Cidr(v.into()))
-            .collect(),
+            .map(|v| normalize_classical_cidr(v).map(RouteMatcher::Cidr))
+            .collect::<ConfigResult<Vec<_>>>()?,
+        s if s.starts_with("source-ip:") => split_values(&s[10..])
+            .into_iter()
+            .map(|v| normalize_classical_cidr(v).map(RouteMatcher::SrcCidr))
+            .collect::<ConfigResult<Vec<_>>>()?,
+        s if s.starts_with("src-ip:") => split_values(&s[7..])
+            .into_iter()
+            .map(|v| normalize_classical_cidr(v).map(RouteMatcher::SrcCidr))
+            .collect::<ConfigResult<Vec<_>>>()?,
+        s if s.starts_with("src-ip-cidr:") => split_values(&s[12..])
+            .into_iter()
+            .map(|v| normalize_classical_cidr(v).map(RouteMatcher::SrcCidr))
+            .collect::<ConfigResult<Vec<_>>>()?,
         s if s.starts_with("port:") => {
             vec![parse_classical_port(s[5..].trim())?]
+        }
+        s if s.starts_with("source-port:") => {
+            vec![parse_classical_source_port(s[12..].trim())?]
+        }
+        s if s.starts_with("src-port:") => {
+            vec![parse_classical_source_port(s[9..].trim())?]
         }
         s if s.starts_with("network:") => split_values(&s[8..])
             .into_iter()
@@ -3491,6 +3544,10 @@ fn parse_match_lhs(lhs: &str) -> ConfigResult<Vec<RouteMatcher>> {
         s if s.starts_with("process:") => split_values(&s[8..])
             .into_iter()
             .map(|v| RouteMatcher::Process(v.into()))
+            .collect(),
+        s if s.starts_with("process-path:") => split_values(&s[13..])
+            .into_iter()
+            .map(|v| RouteMatcher::ProcessPath(v.into()))
             .collect(),
         s if s.starts_with("set:") => split_values(&s[4..])
             .into_iter()
@@ -3527,14 +3584,26 @@ fn format_object_source(obj: &RouteStepObject) -> String {
     if obj.keyword.is_some() {
         parts.push("keyword");
     }
+    if obj.regex.is_some() {
+        parts.push("regex");
+    }
     if obj.ip.is_some() {
         parts.push("ip");
+    }
+    if obj.source_ip.is_some() {
+        parts.push("source-ip");
     }
     if obj.port.is_some() {
         parts.push("port");
     }
+    if obj.source_port.is_some() {
+        parts.push("source-port");
+    }
     if obj.process.is_some() {
         parts.push("process");
+    }
+    if obj.process_path.is_some() {
+        parts.push("process-path");
     }
     if obj.set.is_some() {
         parts.push("set");
@@ -3583,9 +3652,9 @@ fn parse_classical_lhs(lhs: &str) -> ConfigResult<Vec<RouteMatcher>> {
     if lhs.eq_ignore_ascii_case("MATCH") {
         return Ok(vec![RouteMatcher::Any]);
     }
-    let mut parts = lhs.splitn(2, ',');
-    let kind = parts.next().unwrap_or("").trim();
-    let value = parts.next().unwrap_or("").trim();
+    let mut parts = lhs.split(',').map(str::trim);
+    let kind = parts.next().unwrap_or("");
+    let value = parts.next().unwrap_or("");
     if value.is_empty() {
         return Err(
             ConfigError::bad_route(format!("classical 规则缺少 value: `{lhs}`"))
@@ -3594,28 +3663,41 @@ fn parse_classical_lhs(lhs: &str) -> ConfigResult<Vec<RouteMatcher>> {
     }
 
     let kind_uc = kind.to_ascii_uppercase();
+    let mut source_modifier = false;
+    for option in parts {
+        if option.eq_ignore_ascii_case("no-resolve")
+            && matches!(kind_uc.as_str(), "IP-CIDR" | "IP-CIDR6" | "SRC-IP-CIDR")
+        {
+            continue;
+        }
+        if option.eq_ignore_ascii_case("src") && matches!(kind_uc.as_str(), "IP-CIDR" | "IP-CIDR6")
+        {
+            source_modifier = true;
+            continue;
+        }
+        return Err(ConfigError::bad_route(format!(
+            "classical 规则 `{kind_uc}` 的附加字段 `{option}` 不受支持"
+        )));
+    }
     let m = match kind_uc.as_str() {
         "DOMAIN" => RouteMatcher::Domain(value.into()),
         "DOMAIN-SUFFIX" => RouteMatcher::Suffix(value.into()),
         "DOMAIN-KEYWORD" => RouteMatcher::Keyword(value.into()),
-        "IP-CIDR" | "IP-CIDR6" => RouteMatcher::Cidr(value.into()),
+        "DOMAIN-REGEX" => {
+            validate_mihomo_domain_regex(value)?;
+            RouteMatcher::DomainRegex(value.into())
+        }
+        "IP-CIDR" | "IP-CIDR6" if source_modifier => {
+            RouteMatcher::SrcCidr(normalize_classical_cidr(value)?)
+        }
+        "IP-CIDR" | "IP-CIDR6" => RouteMatcher::Cidr(normalize_classical_cidr(value)?),
+        "SRC-IP-CIDR" => RouteMatcher::SrcCidr(normalize_classical_cidr(value)?),
+        "SRC-PORT" => parse_classical_source_port(value)?,
         "DST-PORT" => parse_classical_port(value)?,
         "PROCESS-NAME" => RouteMatcher::Process(value.into()),
+        "PROCESS-PATH" => RouteMatcher::ProcessPath(value.into()),
         "NETWORK" => RouteMatcher::Network(value.into()),
         "RULE-SET" => RouteMatcher::Set(value.into()),
-        // mihomo 标准里有但 WutherCore 当前 FlowContext 还没暴露的字段
-        "SRC-IP-CIDR" | "SRC-PORT" => {
-            return Err(ConfigError::bad_route(format!(
-                "暂不支持 source-side classical 规则: `{kind_uc}`"
-            ))
-            .hint("WutherCore FlowContext 当前仅暴露 dst 端信息；如确需匹配源 IP/端口请改用 RULE-SET 外部规则集"));
-        }
-        "DOMAIN-REGEX" | "PROCESS-PATH" => {
-            return Err(
-                ConfigError::bad_route(format!("classical 规则 `{kind_uc}` 暂未实现"))
-                    .hint("可用 DOMAIN-KEYWORD / PROCESS-NAME 替代，或写入 set: 外部规则集"),
-            );
-        }
         other => {
             return Err(
                 ConfigError::bad_route(format!("未知 classical TYPE: `{other}`"))
@@ -3624,6 +3706,33 @@ fn parse_classical_lhs(lhs: &str) -> ConfigResult<Vec<RouteMatcher>> {
         }
     };
     Ok(vec![m])
+}
+
+fn normalize_classical_cidr(value: &str) -> ConfigResult<String> {
+    let value = value.trim();
+    if let Ok(net) = value.parse::<ipnet::IpNet>() {
+        return Ok(net.to_string());
+    }
+    if let Ok(ip) = value.parse::<IpAddr>() {
+        return Ok(match ip {
+            IpAddr::V4(ip) => format!("{ip}/32"),
+            IpAddr::V6(ip) => format!("{ip}/128"),
+        });
+    }
+    Err(ConfigError::bad_route(format!("非法 IP/CIDR: `{value}`")))
+}
+
+fn validate_mihomo_domain_regex(pattern: &str) -> ConfigResult<()> {
+    let mut builder = fancy_regex::RegexBuilder::new(pattern);
+    builder
+        .case_insensitive(true)
+        .oniguruma_mode(true)
+        .backtrack_limit(1_000_000)
+        .delegate_size_limit(8 * 1024 * 1024);
+    builder
+        .build()
+        .map(|_| ())
+        .map_err(|error| ConfigError::bad_route(format!("非法 DOMAIN-REGEX `{pattern}`: {error}")))
 }
 
 /// 解析 `DST-PORT,53` 中的 value：单端口或 `LOW-HIGH` 闭区间。
@@ -3649,6 +3758,14 @@ fn parse_classical_port(value: &str) -> ConfigResult<RouteMatcher> {
             .map_err(|_| ConfigError::bad_route(format!("非法端口: `{value}`")))?;
         Ok(RouteMatcher::Port(p))
     }
+}
+
+fn parse_classical_source_port(value: &str) -> ConfigResult<RouteMatcher> {
+    Ok(match parse_classical_port(value)? {
+        RouteMatcher::Port(port) => RouteMatcher::SrcPort(port),
+        RouteMatcher::PortRange(lo, hi) => RouteMatcher::SrcPortRange(lo, hi),
+        _ => unreachable!("parse_classical_port only returns destination port matchers"),
+    })
 }
 
 /// 把 mihomo classical 三段式 `TYPE,VALUE,POLICY[,FLAG]` 改写为 WutherCore 的统一
@@ -5773,9 +5890,13 @@ route:
     - {domain: example.com, outbound: direct}
     - {suffix: cn, outbound: direct}
     - {keyword: google, outbound: ai}
+    - {regex: "^(?!blocked\\.)api[0-9]+\\.example\\.com$", outbound: ai}
     - {ip: 10.0.0.0/8, outbound: direct}
+    - {source-ip: 192.168.0.0/16, outbound: direct}
     - {port: 80, outbound: main}
+    - {source-port: 1000-2000, outbound: main}
     - {process: chrome, outbound: ai}
+    - {process-path: "C:\\Apps\\chrome.exe", outbound: ai}
     - {set: ads, outbound: block}
     - {network: udp, outbound: main}
     - {proto: quic, outbound: main}
@@ -5797,12 +5918,28 @@ route:
         );
         assert!(
             m.iter()
+                .any(|x| matches!(x, RouteMatcher::DomainRegex(r) if r.contains("api[0-9]+")))
+        );
+        assert!(
+            m.iter()
                 .any(|x| matches!(x, RouteMatcher::Cidr(c) if c == "10.0.0.0/8"))
+        );
+        assert!(
+            m.iter()
+                .any(|x| matches!(x, RouteMatcher::SrcCidr(c) if c == "192.168.0.0/16"))
         );
         assert!(m.iter().any(|x| matches!(x, RouteMatcher::Port(80))));
         assert!(
             m.iter()
+                .any(|x| matches!(x, RouteMatcher::SrcPortRange(1000, 2000)))
+        );
+        assert!(
+            m.iter()
                 .any(|x| matches!(x, RouteMatcher::Process(p) if p == "chrome"))
+        );
+        assert!(
+            m.iter()
+                .any(|x| matches!(x, RouteMatcher::ProcessPath(p) if p == r"C:\Apps\chrome.exe"))
         );
         assert!(
             m.iter()
@@ -5836,8 +5973,12 @@ route:
     - {dst-port: 53, outbound: hijack}
     - {domain-suffix: example.com, outbound: direct}
     - {domain-keyword: google, outbound: main}
+    - {domain-regex: "^api\\.example\\.com$", outbound: main}
     - {ip-cidr: 10.0.0.0/8, outbound: direct}
+    - {src-ip-cidr: 192.168.0.0/16, outbound: direct}
+    - {src-port: 1024-2048, outbound: direct}
     - {process-name: chrome.exe, outbound: direct}
+    - {process-path: "C:\\Apps\\chrome.exe", outbound: direct}
     - "any -> main"
 "#,
         );
@@ -5853,11 +5994,27 @@ route:
         );
         assert!(
             m.iter()
+                .any(|x| matches!(x, RouteMatcher::DomainRegex(r) if r.contains("api")))
+        );
+        assert!(
+            m.iter()
                 .any(|x| matches!(x, RouteMatcher::Cidr(c) if c == "10.0.0.0/8"))
         );
         assert!(
             m.iter()
+                .any(|x| matches!(x, RouteMatcher::SrcCidr(c) if c == "192.168.0.0/16"))
+        );
+        assert!(
+            m.iter()
+                .any(|x| matches!(x, RouteMatcher::SrcPortRange(1024, 2048)))
+        );
+        assert!(
+            m.iter()
                 .any(|x| matches!(x, RouteMatcher::Process(p) if p == "chrome.exe"))
+        );
+        assert!(
+            m.iter()
+                .any(|x| matches!(x, RouteMatcher::ProcessPath(p) if p == r"C:\Apps\chrome.exe"))
         );
     }
 
@@ -6042,8 +6199,9 @@ route:
     }
 
     #[test]
-    fn route_step_classical_unsupported_kind_errors() {
-        let yaml = r#"
+    fn route_step_classical_source_regex_and_process_path_compile() {
+        let plan = compile_cfg(
+            r#"
 version: 1
 profile: desktop
 nodes: ["ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@1.2.3.4:8388#HK"]
@@ -6053,12 +6211,33 @@ route:
   preset: custom
   final: main
   steps:
-    - {match: "SRC-PORT,1234", outbound: main}
-"#;
-        let mut cfg: UserConfig = serde_yaml::from_str(yaml).unwrap();
-        apply_defaults(&mut cfg);
-        let err = compile(cfg).unwrap_err().to_string();
-        assert!(err.contains("SRC-PORT"), "err = {err}");
+    - {match: "SRC-IP-CIDR,192.168.0.0/16", outbound: direct}
+    - {match: "SRC-PORT,1234-2345", outbound: main}
+    - {match: "DOMAIN-REGEX,^(?!api0\\.)api[0-9]+\\.example\\.com$", outbound: main}
+    - {match: "PROCESS-PATH,C:\\Apps\\browser.exe", outbound: direct}
+    - "any -> main"
+"#,
+        );
+        let matchers: Vec<&RouteMatcher> =
+            plan.route.steps.iter().map(|step| &step.matcher).collect();
+        assert!(
+            matchers
+                .iter()
+                .any(|m| matches!(m, RouteMatcher::SrcCidr(c) if c == "192.168.0.0/16"))
+        );
+        assert!(
+            matchers
+                .iter()
+                .any(|m| matches!(m, RouteMatcher::SrcPortRange(1234, 2345)))
+        );
+        assert!(
+            matchers
+                .iter()
+                .any(|m| matches!(m, RouteMatcher::DomainRegex(_)))
+        );
+        assert!(matchers.iter().any(
+            |m| matches!(m, RouteMatcher::ProcessPath(path) if path == r"C:\Apps\browser.exe")
+        ));
     }
 
     #[test]

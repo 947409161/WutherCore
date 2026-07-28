@@ -13,10 +13,10 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use ipnet::IpNet;
-use regex::{Regex, RegexSet};
 
 use crate::{
     matcher::{ClassicalEntry, ClassicalKind},
+    mihomo_regex::compile_mihomo_domain_regex,
     parser::ParseError,
     spec::RulesetType,
 };
@@ -67,19 +67,17 @@ pub(crate) fn parse_lines_for_type<'a>(
         entries.push(parsed);
     }
 
-    // RulesetMatcher::compile uses RegexSet for all classical/domain wildcard regexes.
-    // Validate the exact batch here so a size/syntax error cannot make the matcher silently
-    // omit every regex.
-    let regexes: Vec<&str> = entries
-        .iter()
-        .filter_map(|entry| {
-            (entry.kind == ClassicalKind::DomainRegex).then_some(entry.value.as_str())
-        })
-        .collect();
-    if !regexes.is_empty() {
-        RegexSet::new(regexes).map_err(|error| {
-            ParseError::BadLine(format!("domain regex set cannot be compiled: {error}"))
-        })?;
+    // Validate every regexp2-style expression before the matcher is published.
+    // This prevents a malformed provider from turning into a partially loaded set.
+    for entry in &entries {
+        if entry.kind == ClassicalKind::DomainRegex {
+            compile_mihomo_domain_regex(&entry.value).map_err(|error| {
+                ParseError::BadLine(format!(
+                    "DOMAIN-REGEX `{}` cannot be compiled: {error}",
+                    entry.value
+                ))
+            })?;
+        }
     }
 
     Ok(entries)
@@ -293,7 +291,8 @@ fn parse_classical_line_strict(value: &str) -> Result<ClassicalEntry, String> {
             raw_value.to_ascii_lowercase()
         }
         ClassicalKind::DomainRegex => {
-            Regex::new(raw_value).map_err(|error| format!("invalid DOMAIN-REGEX: {error}"))?;
+            compile_mihomo_domain_regex(raw_value)
+                .map_err(|error| format!("invalid DOMAIN-REGEX: {error}"))?;
             raw_value.into()
         }
         ClassicalKind::IpCidr | ClassicalKind::SrcIpCidr => {
@@ -304,7 +303,7 @@ fn parse_classical_line_strict(value: &str) -> Result<ClassicalEntry, String> {
             validate_port_range(raw_value)?;
             raw_value.into()
         }
-        ClassicalKind::ProcessName => raw_value.into(),
+        ClassicalKind::ProcessName | ClassicalKind::ProcessPath => raw_value.into(),
     };
     let normalized_kind = if kind == ClassicalKind::IpCidr && source_modifier {
         ClassicalKind::SrcIpCidr
@@ -512,7 +511,7 @@ mod tests {
     #[test]
     fn classical_behavior_accepts_supported_kinds_and_rejects_every_other_line() {
         let entries = parse_for_type(
-            b"DOMAIN-SUFFIX,google.com\nDOMAIN-KEYWORD,google\nDOMAIN,ad.com\nSRC-IP-CIDR,192.168.1.201/32\nIP-CIDR,127.0.0.0/8,no-resolve\nIP-CIDR,198.51.100.0/24,src\nIP-CIDR,2001:db8::/32\nIP-CIDR6,192.0.2.0/24\nDST-PORT,80\nSRC-PORT,7777\nPROCESS-NAME,browser.exe\nDOMAIN-REGEX,^api[0-9]+\\.example\\.com$\n",
+            b"DOMAIN-SUFFIX,google.com\nDOMAIN-KEYWORD,google\nDOMAIN,ad.com\nSRC-IP-CIDR,192.168.1.201/32\nIP-CIDR,127.0.0.0/8,no-resolve\nIP-CIDR,198.51.100.0/24,src\nIP-CIDR,2001:db8::/32\nIP-CIDR6,192.0.2.0/24\nDST-PORT,80\nSRC-PORT,7777\nPROCESS-NAME,browser.exe\nPROCESS-PATH,C:\\Program Files\\Browser\\browser.exe\nDOMAIN-REGEX,^(?!api0\\.)api[0-9]+\\.example\\.com$\n",
             RulesetType::Classical,
         )
         .unwrap();
@@ -521,7 +520,8 @@ mod tests {
         }));
         let matcher = RulesetMatcher::compile("classical", entries);
         assert!(matcher.matches("mail.google.com", None, None, None));
-        assert!(matcher.matches("api42.example.com", None, None, None));
+        assert!(matcher.matches("API42.EXAMPLE.COM", None, None, None));
+        assert!(!matcher.matches("api0.example.com", None, None, None));
         assert!(matcher.matches("", Some("127.0.0.1".parse().unwrap()), None, None));
         assert!(matcher.matches("", Some("2001:db8::1".parse().unwrap()), None, None));
         assert!(matcher.matches("", Some("192.0.2.1".parse().unwrap()), None, None));
@@ -545,5 +545,23 @@ mod tests {
     fn strict_text_rejects_invalid_utf8() {
         let error = parse_for_type(&[0xff, 0xfe], RulesetType::Domain).unwrap_err();
         assert!(matches!(error, ParseError::Utf8(_)));
+    }
+
+    #[test]
+    fn classical_process_path_is_preserved_and_matchable() {
+        let entries = parse_for_type(
+            b"PROCESS-PATH,C:\\Program Files\\Browser\\browser.exe\n",
+            RulesetType::Classical,
+        )
+        .unwrap();
+        assert_eq!(entries[0].kind, ClassicalKind::ProcessPath);
+        assert_eq!(entries[0].value, "C:\\Program Files\\Browser\\browser.exe");
+
+        let matcher = RulesetMatcher::compile("paths", entries);
+        let context = crate::RulesetMatchContext {
+            process_path: Some("c:\\program files\\browser\\BROWSER.EXE"),
+            ..Default::default()
+        };
+        assert!(matcher.matches_context(&context));
     }
 }

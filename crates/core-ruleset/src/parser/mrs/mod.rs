@@ -45,7 +45,6 @@ const MRS_MAGIC: [u8; 4] = [b'M', b'R', b'S', 1];
 
 const BEHAVIOR_DOMAIN: u8 = 0;
 const BEHAVIOR_IPCIDR: u8 = 1;
-const BEHAVIOR_CLASSICAL: u8 = 2;
 
 const MAX_COMPRESSED_BYTES: usize = 64 * 1024 * 1024;
 const MAX_DECOMPRESSED_BYTES: usize = 128 * 1024 * 1024;
@@ -183,12 +182,11 @@ fn parse_decompressed(decoded: &[u8]) -> Result<MrsPayload, ParseError> {
                 count,
             }
         }
-        BEHAVIOR_CLASSICAL => {
+        _ => {
             return Err(ParseError::UnsupportedBinary(
-                "mihomo MRS classical behavior 尚未实现（mihomo 主分支也未提供 mrs converter classical 路径）",
+                "MRS v1 behavior 非法；mihomo 格式仅定义 domain(0) 与 ipcidr(1)",
             ));
         }
-        _ => return Err(ParseError::UnsupportedBinary("MRS behavior 未知（>2）")),
     };
     if reader.position() != decoded.len() as u64 {
         return Err(mrs_error(format!(
