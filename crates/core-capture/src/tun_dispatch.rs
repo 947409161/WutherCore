@@ -23,7 +23,7 @@ use tokio::{
     sync::{Notify, mpsc, oneshot},
     time::MissedTickBehavior,
 };
-use tracing::{debug, info, trace, warn};
+use tracing::{info, trace, warn};
 
 use crate::{
     eim_nat::EimNatTable,
@@ -320,7 +320,7 @@ impl TunDispatcher {
             Err(e) => {
                 traffic.record_unparsable();
                 if traffic.should_log_unparsable_detail() {
-                    debug!(
+                    trace!(
                         target: "capture::traffic",
                         bytes = n,
                         error = %e,
@@ -334,7 +334,7 @@ impl TunDispatcher {
         let parsed = parsed_frame.packet;
         self.frame_formats.observe(&parsed, parsed_frame.format);
         let pkt_bytes = parsed_frame.ip_packet(raw_frame).to_vec();
-        debug!(
+        trace!(
             target: "capture::traffic",
             bytes = n,
             ip_bytes = pkt_bytes.len(),
@@ -348,7 +348,7 @@ impl TunDispatcher {
             Ok(packet) => packet,
             Err(reason) => {
                 traffic.record_drop();
-                debug!(
+                trace!(
                     target: "capture::tun",
                     src = %parsed.ip.src,
                     dst = %parsed.ip.dst,
@@ -361,7 +361,7 @@ impl TunDispatcher {
         match packet {
             TunPacket::Tcp { dst_port, .. } => {
                 traffic.record_tcp();
-                debug!(
+                trace!(
                     target: "capture::traffic",
                     dst_port,
                     bytes = n,
@@ -383,7 +383,7 @@ impl TunDispatcher {
                 }
                 let payload_off = payload_offset;
                 let payload = pkt_bytes[payload_off..payload_off + payload_len].to_vec();
-                debug!(
+                trace!(
                     target: "capture::traffic",
                     network = "udp",
                     src = %source,
@@ -397,7 +397,7 @@ impl TunDispatcher {
             TunPacket::Other => {
                 traffic.record_other();
                 traffic.record_drop();
-                debug!(
+                trace!(
                     target: "capture::traffic",
                     src = %parsed.ip.src,
                     dst = %parsed.ip.dst,
@@ -638,7 +638,7 @@ async fn run_accept_consumer(
                         }
                     }
                     Err(reason) => {
-                        debug!(
+                        trace!(
                             target: "capture::accept",
                             ?reason,
                             dst = %ev.original_dst,
@@ -650,7 +650,7 @@ async fn run_accept_consumer(
                         continue;
                     }
                 };
-                debug!(
+                trace!(
                     target: "capture::traffic",
                     network = "tcp",
                     src = %ev.remote,
@@ -663,7 +663,7 @@ async fn run_accept_consumer(
                     "tcp accepted -> ListenerHandler.NewConnection"
                 );
                 if inbound.should_hijack_dns(target_session.original_dst) {
-                    info!(
+                    trace!(
                         target: "capture::dns",
                         network = "tcp",
                         src = %ev.remote,
@@ -710,11 +710,11 @@ async fn run_accept_consumer(
                                 result.outbound.clone()
                             };
                             if result.rule.is_empty() {
-                                info!(target: "capture::traffic", "[TCP] #{id} {src} --> {host}:{port} using {proxy}");
+                                trace!(target: "capture::traffic", "[TCP] #{id} {src} --> {host}:{port} using {proxy}");
                             } else if result.rule_payload.is_empty() {
-                                info!(target: "capture::traffic", "[TCP] #{id} {src} --> {host}:{port} match {} using {proxy}", result.rule);
+                                trace!(target: "capture::traffic", "[TCP] #{id} {src} --> {host}:{port} match {} using {proxy}", result.rule);
                             } else {
-                                info!(target: "capture::traffic", "[TCP] #{id} {src} --> {host}:{port} match {}({}) using {proxy}", result.rule, result.rule_payload);
+                                trace!(target: "capture::traffic", "[TCP] #{id} {src} --> {host}:{port} match {}({}) using {proxy}", result.rule, result.rule_payload);
                             }
                         }
                         let mut stream = result.stream;
@@ -742,7 +742,7 @@ async fn run_accept_consumer(
                             );
                         }
                         if let Some(host) = sniff_host.as_deref() {
-                            debug!(
+                            trace!(
                                 target: "capture::accept",
                                 sniff_host = %host,
                                 "fake-ip missing recovered by TCP SNI sniff"

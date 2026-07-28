@@ -159,7 +159,7 @@ impl OutboundAdapter for TrojanOutbound {
         let stream = self
             .connect_with_header(TROJAN_CMD_TCP, &ctx.host, ctx.port)
             .await?;
-        tracing::info!(
+        tracing::debug!(
             target: "dial::trojan",
             id = ctx.dial_id,
             proxy = %self.name,
@@ -181,7 +181,7 @@ impl OutboundAdapter for TrojanOutbound {
             .connect_with_header(TROJAN_CMD_UDP, &ctx.host, ctx.port)
             .await?;
         let (read, write) = tokio::io::split(stream);
-        tracing::info!(
+        tracing::debug!(
             target: "dial::trojan",
             id = ctx.dial_id,
             proxy = %self.name,

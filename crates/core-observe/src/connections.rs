@@ -12,6 +12,7 @@
 //!   实时累计字节数（`Arc<AtomicU64>`，由 splice 路径在 copy loop 内自增）+ 取消
 //!   信号（`CancellationToken`，DELETE /connections/:id 触发后让数据流主动 shutdown）+
 //!   smart-block 旗标（AtomicU8，flip 不需要重建 meta）。
+//!   最大速率只在 dashboard 取快照时采样，数据块转发不读取时钟、不获取速率锁。
 //! * [`ConnectionGuard`] —— RAII：splice 任务持有 guard，drop 时自动从表移除，
 //!   即便 panic / early-return 也不会漏关。
 //!
@@ -39,6 +40,7 @@ use std::{
     },
 };
 
+use ahash::AHashSet;
 use compact_str::{CompactString, ToCompactString};
 use dashmap::DashMap;
 use parking_lot::Mutex;
@@ -47,7 +49,7 @@ use smallvec::SmallVec;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::{TrafficLedger, TrafficSession};
+use crate::{TrafficLedger, TrafficSession, striped_counter::StripedCounter};
 
 /// chains / geoip 类列表 —— 典型 1-4 项，内联保存避免堆分配。
 pub type StringList = SmallVec<[CompactString; 4]>;
@@ -126,6 +128,12 @@ pub struct ConnectionMeta {
     pub rule: CompactString,
     #[serde(skip)]
     pub rule_payload: CompactString,
+    #[serde(skip)]
+    pub rule_index: Option<usize>,
+    #[serde(skip)]
+    pub rule_source: CompactString,
+    #[serde(skip)]
+    pub rule_action: CompactString,
 }
 
 impl ConnectionMeta {
@@ -182,58 +190,20 @@ pub struct RateSample {
     pub at_ms: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct TimeBucket {
-    start_ms: u64,
-    bytes: u64,
-}
-
-/// 滑窗速率：保留最近 1 秒内每 100ms 桶，每次写入后返回窗口内最高 bytes/s。
-/// 桶数组长度固定（10），用 SmallVec 内联存储避免堆分配。
 #[derive(Debug)]
-struct BucketWindow {
-    buckets: SmallVec<[TimeBucket; 16]>,
-    interval_ms: u64,
-    window_ms: u64,
+struct AtomicRateSample {
+    up: AtomicU64,
+    down: AtomicU64,
+    at_ms: AtomicU64,
 }
 
-impl BucketWindow {
-    fn new(bucket_count: usize, interval_ms: u64) -> Self {
-        let mut buckets = SmallVec::with_capacity(bucket_count);
-        buckets.resize(
-            bucket_count,
-            TimeBucket {
-                start_ms: 0,
-                bytes: 0,
-            },
-        );
+impl AtomicRateSample {
+    fn new(at_ms: u64) -> Self {
         Self {
-            buckets,
-            interval_ms,
-            window_ms: interval_ms.saturating_mul(bucket_count as u64),
+            up: AtomicU64::new(0),
+            down: AtomicU64::new(0),
+            at_ms: AtomicU64::new(at_ms),
         }
-    }
-
-    fn update_max_rate(&mut self, bytes: u64) -> u64 {
-        if bytes == 0 || self.buckets.is_empty() || self.interval_ms == 0 {
-            return 0;
-        }
-        let now_ms = now_millis();
-        let bucket_start = (now_ms / self.interval_ms) * self.interval_ms;
-        let idx = ((now_ms / self.interval_ms) % self.buckets.len() as u64) as usize;
-        if self.buckets[idx].start_ms != bucket_start {
-            self.buckets[idx].start_ms = bucket_start;
-            self.buckets[idx].bytes = 0;
-        }
-        self.buckets[idx].bytes = self.buckets[idx].bytes.saturating_add(bytes);
-
-        let window_start = now_ms.saturating_sub(self.window_ms);
-        self.buckets
-            .iter()
-            .filter(|b| b.start_ms >= window_start && b.bytes > 0)
-            .map(|b| b.bytes.saturating_mul(1000) / self.interval_ms)
-            .max()
-            .unwrap_or(0)
     }
 }
 
@@ -265,7 +235,7 @@ pub struct ConnectionEntry {
     pub max_upload_rate: Arc<AtomicU64>,
     pub max_download_rate: Arc<AtomicU64>,
     pub cancel: CancellationToken,
-    pub last_sample: Arc<Mutex<RateSample>>,
+    last_sample: Arc<AtomicRateSample>,
     pub smart_block: Arc<AtomicU8>,
 }
 
@@ -308,6 +278,9 @@ pub struct ConnectionInfo {
     pub provider_chains: StringList,
     pub rule: CompactString,
     pub rule_payload: CompactString,
+    pub rule_index: Option<usize>,
+    pub rule_source: CompactString,
+    pub rule_action: CompactString,
     pub max_upload_rate: u64,
     pub max_download_rate: u64,
     /// "" 或 "blocked"；序列化时由 `serialize_smart_block` 把原子状态映射成
@@ -365,9 +338,9 @@ impl Default for ManagerRateState {
 pub struct ConnectionTable {
     next: AtomicU64,
     entries: DashMap<u64, ConnectionEntry>,
-    smart_target: DashMap<CompactString, Arc<Mutex<BTreeSet<CompactString>>>>,
-    upload_total: AtomicU64,
-    download_total: AtomicU64,
+    smart_target: DashMap<CompactString, Arc<Mutex<AHashSet<CompactString>>>>,
+    upload_total: StripedCounter,
+    download_total: StripedCounter,
     rate: Mutex<ManagerRateState>,
     traffic: Option<Arc<TrafficLedger>>,
 }
@@ -410,13 +383,7 @@ impl ConnectionTable {
         let max_download_rate = Arc::new(AtomicU64::new(0));
         let cancel = CancellationToken::new();
         let now_ms = now_millis();
-        let last_sample = Arc::new(Mutex::new(RateSample {
-            up: 0,
-            down: 0,
-            at_ms: now_ms,
-        }));
-        let upload_window = Arc::new(Mutex::new(BucketWindow::new(10, 100)));
-        let download_window = Arc::new(Mutex::new(BucketWindow::new(10, 100)));
+        let last_sample = Arc::new(AtomicRateSample::new(now_ms));
         let smart_block = Arc::new(AtomicU8::new(SMART_BLOCK_NONE));
         let meta = Arc::new(meta);
         let entry = ConnectionEntry {
@@ -438,11 +405,7 @@ impl ConnectionTable {
             id,
             up: bytes_up,
             down: bytes_down,
-            max_upload_rate,
-            max_download_rate,
             cancel,
-            upload_window,
-            download_window,
             smart_block,
             tracked: true,
             traffic,
@@ -455,7 +418,7 @@ impl ConnectionTable {
     ///
     /// 行为：
     /// * 不分配新的 connection id（统一用 0），不写 `Self::entries`；
-    /// * counter / cancel token / window 仍可用 —— 上游 splice / accounting
+    /// * counter / cancel token 仍可用 —— 上游 splice / accounting
     ///   代码不必分支判断；
     /// * Drop 时不调 `remove_silent`，因为根本没有 entry。
     ///
@@ -464,11 +427,7 @@ impl ConnectionTable {
     pub fn open_detached(self: &Arc<Self>) -> ConnectionGuard {
         let bytes_up = Arc::new(AtomicU64::new(0));
         let bytes_down = Arc::new(AtomicU64::new(0));
-        let max_upload_rate = Arc::new(AtomicU64::new(0));
-        let max_download_rate = Arc::new(AtomicU64::new(0));
         let cancel = CancellationToken::new();
-        let upload_window = Arc::new(Mutex::new(BucketWindow::new(10, 100)));
-        let download_window = Arc::new(Mutex::new(BucketWindow::new(10, 100)));
         let smart_block = Arc::new(AtomicU8::new(SMART_BLOCK_NONE));
         let traffic = self.traffic.as_ref().map(|ledger| {
             ledger.begin([
@@ -484,11 +443,7 @@ impl ConnectionTable {
             id: 0,
             up: bytes_up,
             down: bytes_down,
-            max_upload_rate,
-            max_download_rate,
             cancel,
-            upload_window,
-            download_window,
             smart_block,
             tracked: false,
             traffic,
@@ -566,27 +521,7 @@ impl ConnectionTable {
                 let entry = e.value().clone();
                 let up_now = entry.bytes_up.load(Ordering::Relaxed);
                 let down_now = entry.bytes_down.load(Ordering::Relaxed);
-                let (up_rate, down_rate) = {
-                    let mut sample = entry.last_sample.lock();
-                    let dt_ms = now_ms.saturating_sub(sample.at_ms).max(1);
-                    let up_delta = up_now.saturating_sub(sample.up);
-                    let down_delta = down_now.saturating_sub(sample.down);
-                    // 字节 / 秒：dashboard 同样发 bytes/s（不是 bits/s）。
-                    let u = (up_delta as u128 * 1000 / dt_ms as u128) as u64;
-                    let d = (down_delta as u128 * 1000 / dt_ms as u128) as u64;
-                    *sample = RateSample {
-                        up: up_now,
-                        down: down_now,
-                        at_ms: now_ms,
-                    };
-                    if u > entry.max_upload_rate.load(Ordering::Relaxed) {
-                        entry.max_upload_rate.store(u, Ordering::Relaxed);
-                    }
-                    if d > entry.max_download_rate.load(Ordering::Relaxed) {
-                        entry.max_download_rate.store(d, Ordering::Relaxed);
-                    }
-                    (u, d)
-                };
+                let (up_rate, down_rate) = sample_entry_rates(&entry, now_ms, up_now, down_now);
                 ConnectionSnapshot {
                     entry,
                     up_rate_bps: up_rate,
@@ -713,16 +648,13 @@ impl ConnectionTable {
     }
 
     pub fn total(&self) -> (u64, u64) {
-        (
-            self.upload_total.load(Ordering::Relaxed),
-            self.download_total.load(Ordering::Relaxed),
-        )
+        (self.upload_total.load(), self.download_total.load())
     }
 
     pub fn now(&self) -> (u64, u64) {
         let now_ms = now_millis();
-        let upload = self.upload_total.load(Ordering::Relaxed);
-        let download = self.download_total.load(Ordering::Relaxed);
+        let upload = self.upload_total.load();
+        let download = self.download_total.load();
         let mut rate = self.rate.lock();
         let dt = now_ms.saturating_sub(rate.at_ms);
         if dt >= 1000 {
@@ -736,8 +668,8 @@ impl ConnectionTable {
     }
 
     pub fn reset_statistic(&self) {
-        self.upload_total.store(0, Ordering::Relaxed);
-        self.download_total.store(0, Ordering::Relaxed);
+        self.upload_total.reset();
+        self.download_total.reset();
         let mut rate = self.rate.lock();
         *rate = ManagerRateState::default();
     }
@@ -754,29 +686,35 @@ impl ConnectionTable {
 
     pub fn manager_snapshot(&self) -> ConnectionManagerSnapshot {
         let (upload_total, download_total) = self.total();
-        let mut connections: Vec<_> = self
+        let now_ms = now_millis();
+        let connections: Vec<_> = self
             .entries
             .iter()
             .map(|e| {
                 let entry = e.value();
+                let upload = entry.bytes_up.load(Ordering::Relaxed);
+                let download = entry.bytes_down.load(Ordering::Relaxed);
+                sample_entry_rates(entry, now_ms, upload, download);
                 ConnectionInfo {
                     id: entry.meta.uuid.clone(),
                     // Arc::clone —— 引用计数 +1，无字符串深拷贝。
                     metadata: Arc::clone(&entry.meta),
-                    upload: entry.bytes_up.load(Ordering::Relaxed),
-                    download: entry.bytes_down.load(Ordering::Relaxed),
+                    upload,
+                    download,
                     start: entry.started_at,
                     chains: entry.meta.chains.clone(),
                     provider_chains: entry.meta.provider_chains.clone(),
                     rule: entry.meta.rule.clone(),
                     rule_payload: entry.meta.rule_payload.clone(),
+                    rule_index: entry.meta.rule_index,
+                    rule_source: entry.meta.rule_source.clone(),
+                    rule_action: entry.meta.rule_action.clone(),
                     max_upload_rate: entry.max_upload_rate.load(Ordering::Relaxed),
                     max_download_rate: entry.max_download_rate.load(Ordering::Relaxed),
                     smart_block: Arc::clone(&entry.smart_block),
                 }
             })
             .collect();
-        connections.sort_by(|a, b| a.start.cmp(&b.start).then_with(|| a.id.cmp(&b.id)));
         ConnectionManagerSnapshot {
             download_total,
             upload_total,
@@ -849,11 +787,11 @@ impl ConnectionTable {
     }
 
     fn push_uploaded(&self, size: u64) {
-        self.upload_total.fetch_add(size, Ordering::Relaxed);
+        self.upload_total.add(size);
     }
 
     fn push_downloaded(&self, size: u64) {
-        self.download_total.fetch_add(size, Ordering::Relaxed);
+        self.download_total.add(size);
     }
 
     fn join_indexes(&self, entry: &ConnectionEntry) {
@@ -885,7 +823,7 @@ impl ConnectionTable {
         let set = self
             .smart_target
             .entry(key)
-            .or_insert_with(|| Arc::new(Mutex::new(BTreeSet::new())))
+            .or_insert_with(|| Arc::new(Mutex::new(AHashSet::new())))
             .clone();
         set.lock().insert(CompactString::new(uuid));
     }
@@ -911,6 +849,29 @@ impl ConnectionTable {
     }
 }
 
+fn sample_entry_rates(
+    entry: &ConnectionEntry,
+    now_ms: u64,
+    upload: u64,
+    download: u64,
+) -> (u64, u64) {
+    let previous_at = entry.last_sample.at_ms.swap(now_ms, Ordering::AcqRel);
+    let previous_up = entry.last_sample.up.swap(upload, Ordering::AcqRel);
+    let previous_down = entry.last_sample.down.swap(download, Ordering::AcqRel);
+    let elapsed_ms = now_ms.saturating_sub(previous_at).max(1);
+    let upload_rate =
+        (upload.saturating_sub(previous_up) as u128 * 1000 / elapsed_ms as u128) as u64;
+    let download_rate =
+        (download.saturating_sub(previous_down) as u128 * 1000 / elapsed_ms as u128) as u64;
+    entry
+        .max_upload_rate
+        .fetch_max(upload_rate, Ordering::Relaxed);
+    entry
+        .max_download_rate
+        .fetch_max(download_rate, Ordering::Relaxed);
+    (upload_rate, download_rate)
+}
+
 /// RAII guard：drop 时自动从表移除。所有 splice 路径都应该握住 guard
 /// 直到双向拷贝结束 —— 即使任务 panic / early-return 也能保证表里不留死条目。
 ///
@@ -924,11 +885,7 @@ pub struct ConnectionGuard {
     pub id: u64,
     pub up: Arc<AtomicU64>,
     pub down: Arc<AtomicU64>,
-    max_upload_rate: Arc<AtomicU64>,
-    max_download_rate: Arc<AtomicU64>,
     pub cancel: CancellationToken,
-    upload_window: Arc<Mutex<BucketWindow>>,
-    download_window: Arc<Mutex<BucketWindow>>,
     smart_block: Arc<AtomicU8>,
     /// 是否真的入了 ConnectionTable —— [`ConnectionTable::open`] 路径设 true，
     /// [`Self::detached`] 路径设 false。Drop 用它判断要不要触发 `remove_silent`。
@@ -959,11 +916,7 @@ impl ConnectionGuard {
             table: self.table.clone(),
             up: self.up.clone(),
             down: self.down.clone(),
-            max_upload_rate: self.max_upload_rate.clone(),
-            max_download_rate: self.max_download_rate.clone(),
             cancel: self.cancel.clone(),
-            upload_window: self.upload_window.clone(),
-            download_window: self.download_window.clone(),
             traffic: self.traffic.clone(),
             observer: self.observer.clone(),
         }
@@ -999,11 +952,7 @@ pub struct ConnectionAccounting {
     table: Arc<ConnectionTable>,
     up: Arc<AtomicU64>,
     down: Arc<AtomicU64>,
-    max_upload_rate: Arc<AtomicU64>,
-    max_download_rate: Arc<AtomicU64>,
     cancel: CancellationToken,
-    upload_window: Arc<Mutex<BucketWindow>>,
-    download_window: Arc<Mutex<BucketWindow>>,
     traffic: Option<TrafficSession>,
     observer: Option<Arc<dyn ConnectionObserver>>,
 }
@@ -1029,10 +978,6 @@ impl ConnectionAccounting {
         if let Some(observer) = &self.observer {
             observer.on_upload(size);
         }
-        let rate = self.upload_window.lock().update_max_rate(size);
-        if rate > self.max_upload_rate.load(Ordering::Relaxed) {
-            self.max_upload_rate.store(rate, Ordering::Relaxed);
-        }
     }
 
     pub fn record_download(&self, size: u64) {
@@ -1046,10 +991,6 @@ impl ConnectionAccounting {
         }
         if let Some(observer) = &self.observer {
             observer.on_download(size);
-        }
-        let rate = self.download_window.lock().update_max_rate(size);
-        if rate > self.max_download_rate.load(Ordering::Relaxed) {
-            self.max_download_rate.store(rate, Ordering::Relaxed);
         }
     }
 }
@@ -1626,6 +1567,9 @@ mod tests {
             provider_chains: entry.meta.provider_chains.clone(),
             rule: entry.meta.rule.clone(),
             rule_payload: entry.meta.rule_payload.clone(),
+            rule_index: entry.meta.rule_index,
+            rule_source: entry.meta.rule_source.clone(),
+            rule_action: entry.meta.rule_action.clone(),
             max_upload_rate: 0,
             max_download_rate: 0,
             smart_block: entry.smart_block.clone(),
@@ -1692,7 +1636,7 @@ mod tests {
 
     #[test]
     fn open_detached_counters_still_usable_for_inner_accounting() {
-        // detached guard 的 counter / cancel / window 仍然好用 —— 这样 splice
+        // detached guard 的 counter / cancel 仍然好用 —— 这样 splice
         // / accounting 代码不需要分支处理"是否旁路"。
         let t = ConnectionTable::new();
         let g = t.open_detached();
@@ -1704,5 +1648,26 @@ mod tests {
         assert_eq!(down, 2048);
         // 但表里没有它
         assert_eq!(t.len(), 0);
+    }
+
+    #[test]
+    fn large_connection_table_keeps_accounting_and_cleanup_correct() {
+        const CONNECTIONS: usize = 20_000;
+        let table = ConnectionTable::new();
+        let mut guards = Vec::with_capacity(CONNECTIONS);
+        for index in 0..CONNECTIONS {
+            let mut meta = ConnectionMeta::default();
+            meta.network = "tcp".into();
+            meta.host = format!("bulk-{index}.example").into();
+            let guard = table.open(meta);
+            guard.record_upload(64);
+            guards.push(guard);
+        }
+        assert_eq!(table.len(), CONNECTIONS);
+        assert_eq!(table.total(), ((CONNECTIONS as u64) * 64, 0));
+        assert_eq!(table.manager_snapshot().connections.len(), CONNECTIONS);
+
+        drop(guards);
+        assert_eq!(table.len(), 0);
     }
 }

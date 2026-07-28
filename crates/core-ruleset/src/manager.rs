@@ -211,6 +211,31 @@ impl RulesetManager {
         }
     }
 
+    /// Start periodic refresh after the caller has completed an awaited
+    /// [`Self::refresh_all`] bootstrap. Unlike [`Self::start`], this does not
+    /// compile or download anything immediately, which avoids a duplicate
+    /// startup fetch while still keeping every provider hot afterwards.
+    pub fn start_periodic(self: Arc<Self>) {
+        info!(
+            target: "ruleset",
+            count = self.sets.len(),
+            "ruleset periodic refresh starting after ready bootstrap"
+        );
+        for (name, spec) in self.sets.clone() {
+            if spec.url.is_none() && spec.path.is_none() {
+                continue;
+            }
+            let me = self.clone();
+            let handle = tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(clamp_interval(spec.every)).await;
+                    let _ = me.refresh(&name).await;
+                }
+            });
+            self.handles.lock().push(handle);
+        }
+    }
+
     pub fn stop(&self) {
         for h in self.handles.lock().drain(..) {
             h.abort();
@@ -1035,15 +1060,14 @@ mod tests {
         assert!(error.contains("does not accept IP"), "{error}");
 
         spec.r#type = crate::spec::RulesetType::Classical;
-        let error = mgr
-            .compile_body(
-                "unsupported-classical",
-                &spec,
-                spec.path.as_deref(),
-                b"GEOIP,CN\n",
-            )
-            .unwrap_err();
-        assert!(error.contains("unsupported classical rule kind"), "{error}");
+        let (matcher, size) = mgr
+            .compile_body("geo-classical", &spec, spec.path.as_deref(), b"GEOIP,CN\n")
+            .unwrap();
+        assert_eq!(size, 1);
+        assert!(matcher.matches_context(&crate::RulesetMatchContext {
+            destination_geoip: &["cn".into()],
+            ..Default::default()
+        }));
     }
 
     #[test]

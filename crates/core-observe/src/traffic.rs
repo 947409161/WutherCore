@@ -1,26 +1,29 @@
 //! 任意精度持久流量汇总。
 //!
-//! 转发热路径只更新原子低位。只有跨越 2^64 边界时才锁定并扩展高位，
-//! 因此数据库累计值没有固定宽度上限，也不会让常规流量承担大整数锁开销。
+//! 转发热路径先在连接级原子中累计，达到批量阈值或周期刷新时才归并到分类。
+//! 分类计数器只有跨越 2^64 边界时才锁定并扩展高位；数据库 writer 只消费
+//! 无锁脏队列，不扫描全部历史行。
 
 use std::{
-    collections::BTreeSet,
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
 
 use core_store::{Store, TrafficTotalBlob, schema::TRAFFIC_TOTALS, store::BatchOp};
+use crossbeam_queue::SegQueue;
 use dashmap::DashMap;
 use num_bigint::BigUint;
 use parking_lot::Mutex;
+use smallvec::SmallVec;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 const FLUSH_INTERVAL: Duration = Duration::from_secs(2);
+const SESSION_BATCH_BYTES: u64 = 1024 * 1024;
 const KEY_SEPARATOR: char = '\u{1f}';
 
 #[derive(Debug)]
@@ -96,7 +99,7 @@ struct TrafficCounters {
     connections: AtomicU64,
     first_seen_secs: AtomicU64,
     last_seen_secs: AtomicU64,
-    dirty: AtomicBool,
+    queued: AtomicBool,
 }
 
 impl TrafficCounters {
@@ -109,7 +112,7 @@ impl TrafficCounters {
             connections: AtomicU64::new(0),
             first_seen_secs: AtomicU64::new(now),
             last_seen_secs: AtomicU64::new(now),
-            dirty: AtomicBool::new(true),
+            queued: AtomicBool::new(false),
         }
     }
 
@@ -122,7 +125,7 @@ impl TrafficCounters {
             connections: AtomicU64::new(blob.connections),
             first_seen_secs: AtomicU64::new(blob.first_seen_secs),
             last_seen_secs: AtomicU64::new(blob.last_seen_secs),
-            dirty: AtomicBool::new(false),
+            queued: AtomicBool::new(false),
         }
     }
 
@@ -135,19 +138,16 @@ impl TrafficCounters {
                 Some(v.saturating_add(1))
             });
         self.last_seen_secs.store(now, Ordering::Relaxed);
-        self.dirty.store(true, Ordering::Release);
     }
 
     fn record_upload(&self, size: u64, now: u64) {
         self.upload.add(size);
         self.last_seen_secs.store(now, Ordering::Relaxed);
-        self.dirty.store(true, Ordering::Release);
     }
 
     fn record_download(&self, size: u64, now: u64) {
         self.download.add(size);
         self.last_seen_secs.store(now, Ordering::Relaxed);
-        self.dirty.store(true, Ordering::Release);
     }
 
     fn blob(&self) -> TrafficTotalBlob {
@@ -163,31 +163,113 @@ impl TrafficCounters {
     }
 }
 
-/// 一条连接对应的分类计数器集合。数据路径不做字符串查找。
-#[derive(Debug, Clone, Default)]
-pub struct TrafficSession {
+#[derive(Debug)]
+struct TrafficSessionInner {
     counters: Arc<[Arc<TrafficCounters>]>,
+    upload_pending: AtomicU64,
+    download_pending: AtomicU64,
+    queued: AtomicBool,
+    dirty_sessions: Arc<SegQueue<Weak<TrafficSessionInner>>>,
+    dirty_rows: Arc<SegQueue<Weak<TrafficCounters>>>,
+}
+
+impl TrafficSessionInner {
+    fn record(self: &Arc<Self>, pending: &AtomicU64, size: u64) {
+        if size == 0 {
+            return;
+        }
+        if size >= SESSION_BATCH_BYTES {
+            if std::ptr::eq(pending, &self.upload_pending) {
+                self.apply(size, 0);
+            } else {
+                self.apply(0, size);
+            }
+            return;
+        }
+
+        let previous = pending.fetch_add(size, Ordering::Relaxed);
+        self.enqueue();
+        if previous >= SESSION_BATCH_BYTES - size {
+            let drained = pending.swap(0, Ordering::AcqRel);
+            if std::ptr::eq(pending, &self.upload_pending) {
+                self.apply(drained, 0);
+            } else {
+                self.apply(0, drained);
+            }
+        }
+    }
+
+    fn enqueue(self: &Arc<Self>) {
+        if !self.queued.load(Ordering::Relaxed)
+            && self
+                .queued
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        {
+            self.dirty_sessions.push(Arc::downgrade(self));
+        }
+    }
+
+    fn flush_pending(&self) {
+        let upload = self.upload_pending.swap(0, Ordering::AcqRel);
+        let download = self.download_pending.swap(0, Ordering::AcqRel);
+        self.apply(upload, download);
+    }
+
+    fn apply(&self, upload: u64, download: u64) {
+        if upload == 0 && download == 0 {
+            return;
+        }
+        let now = now_secs();
+        for counter in self.counters.iter() {
+            if upload != 0 {
+                counter.record_upload(upload, now);
+            }
+            if download != 0 {
+                counter.record_download(download, now);
+            }
+            enqueue_counter(&self.dirty_rows, counter);
+        }
+    }
+}
+
+/// 一条连接对应的分类计数器集合。
+///
+/// 热路径只更新连接级 pending 原子；达到 1 MiB、周期刷新或连接关闭时，
+/// 才一次性归并到全部分类，避免每个 32 KiB 数据块都遍历十余个分类。
+#[derive(Debug, Clone)]
+pub struct TrafficSession {
+    inner: Arc<TrafficSessionInner>,
+}
+
+impl Default for TrafficSession {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(TrafficSessionInner {
+                counters: Arc::from([]),
+                upload_pending: AtomicU64::new(0),
+                download_pending: AtomicU64::new(0),
+                queued: AtomicBool::new(false),
+                dirty_sessions: Arc::new(SegQueue::new()),
+                dirty_rows: Arc::new(SegQueue::new()),
+            }),
+        }
+    }
 }
 
 impl TrafficSession {
     pub fn record_upload(&self, size: u64) {
-        if size == 0 {
-            return;
-        }
-        let now = now_secs();
-        for counter in self.counters.iter() {
-            counter.record_upload(size, now);
-        }
+        self.inner.record(&self.inner.upload_pending, size);
     }
 
     pub fn record_download(&self, size: u64) {
-        if size == 0 {
-            return;
-        }
-        let now = now_secs();
-        for counter in self.counters.iter() {
-            counter.record_download(size, now);
-        }
+        self.inner.record(&self.inner.download_pending, size);
+    }
+}
+
+impl Drop for TrafficSession {
+    fn drop(&mut self) {
+        self.inner.flush_pending();
     }
 }
 
@@ -195,6 +277,8 @@ impl TrafficSession {
 pub struct TrafficLedger {
     store: Arc<Store>,
     rows: DashMap<String, Arc<TrafficCounters>>,
+    dirty_sessions: Arc<SegQueue<Weak<TrafficSessionInner>>>,
+    dirty_rows: Arc<SegQueue<Weak<TrafficCounters>>>,
     stop: CancellationToken,
     task: Mutex<Option<JoinHandle<()>>>,
 }
@@ -216,6 +300,8 @@ impl TrafficLedger {
         let ledger = Arc::new(Self {
             store,
             rows,
+            dirty_sessions: Arc::new(SegQueue::new()),
+            dirty_rows: Arc::new(SegQueue::new()),
             stop: CancellationToken::new(),
             task: Mutex::new(None),
         });
@@ -260,13 +346,18 @@ impl TrafficLedger {
         L: Into<String>,
     {
         let now = now_secs();
-        let mut unique = BTreeSet::new();
-        unique.insert(("total".to_string(), "all".to_string()));
+        let mut unique = SmallVec::<[(String, String); 16]>::new();
+        unique.push(("total".to_string(), "all".to_string()));
         for (dimension, label) in labels {
             let dimension = dimension.into();
             let label = label.into();
-            if !dimension.trim().is_empty() && !label.trim().is_empty() {
-                unique.insert((dimension, label));
+            if !dimension.trim().is_empty()
+                && !label.trim().is_empty()
+                && !unique
+                    .iter()
+                    .any(|item| item.0 == dimension && item.1 == label)
+            {
+                unique.push((dimension, label));
             }
         }
 
@@ -282,25 +373,50 @@ impl TrafficLedger {
                     })
                     .clone();
                 counter.mark_connection(now);
+                enqueue_counter(&self.dirty_rows, &counter);
                 counter
             })
             .collect::<Vec<_>>();
         TrafficSession {
-            counters: counters.into(),
+            inner: Arc::new(TrafficSessionInner {
+                counters: counters.into(),
+                upload_pending: AtomicU64::new(0),
+                download_pending: AtomicU64::new(0),
+                queued: AtomicBool::new(false),
+                dirty_sessions: Arc::clone(&self.dirty_sessions),
+                dirty_rows: Arc::clone(&self.dirty_rows),
+            }),
         }
     }
 
     pub async fn flush(&self) {
-        let mut ops = Vec::new();
-        for row in self.rows.iter() {
-            let counters = row.value();
-            if counters.dirty.swap(false, Ordering::AcqRel) {
-                ops.push(BatchOp::PutTrafficTotal(row.key().clone(), counters.blob()));
+        self.drain_pending_sessions();
+
+        let mut changed = Vec::with_capacity(self.dirty_rows.len().min(4096));
+        let budget = self.dirty_rows.len();
+        for _ in 0..budget {
+            let Some(weak) = self.dirty_rows.pop() else {
+                break;
+            };
+            if let Some(counters) = weak.upgrade() {
+                // 先允许新的更新重新入队，再生成快照。并发更新要么被当前
+                // blob 包含，要么留在下一批队列中，不会丢失。
+                counters.queued.store(false, Ordering::Release);
+                changed.push(counters);
             }
         }
-        if ops.is_empty() {
+        if changed.is_empty() {
             return;
         }
+        let ops = changed
+            .iter()
+            .map(|counters| {
+                BatchOp::PutTrafficTotal(
+                    traffic_key(&counters.dimension, &counters.label),
+                    counters.blob(),
+                )
+            })
+            .collect::<Vec<_>>();
         if let Err(error) = self.store.write_batch(&ops).await {
             warn!(
                 target: "traffic",
@@ -308,17 +424,14 @@ impl TrafficLedger {
                 rows = ops.len(),
                 "failed to persist traffic totals"
             );
-            for op in ops {
-                if let BatchOp::PutTrafficTotal(key, _) = op
-                    && let Some(row) = self.rows.get(&key)
-                {
-                    row.dirty.store(true, Ordering::Release);
-                }
+            for counters in changed {
+                enqueue_counter(&self.dirty_rows, &counters);
             }
         }
     }
 
     pub fn snapshot(&self) -> Vec<TrafficTotalBlob> {
+        self.drain_pending_sessions();
         let mut rows = self
             .rows
             .iter()
@@ -332,6 +445,21 @@ impl TrafficLedger {
         rows
     }
 
+    fn drain_pending_sessions(&self) {
+        let budget = self.dirty_sessions.len();
+        for _ in 0..budget {
+            let Some(weak) = self.dirty_sessions.pop() else {
+                break;
+            };
+            if let Some(session) = weak.upgrade() {
+                // 与记录线程的顺序配合：记录先加 pending 再尝试入队。这里
+                // 先清 queued 再 drain，竞态只会造成一次无害的重复入队。
+                session.queued.store(false, Ordering::Release);
+                session.flush_pending();
+            }
+        }
+    }
+
     pub async fn shutdown(&self) {
         self.stop.cancel();
         let task = self.task.lock().take();
@@ -340,6 +468,17 @@ impl TrafficLedger {
         } else {
             self.flush().await;
         }
+    }
+}
+
+fn enqueue_counter(queue: &SegQueue<Weak<TrafficCounters>>, counters: &Arc<TrafficCounters>) {
+    if !counters.queued.load(Ordering::Relaxed)
+        && counters
+            .queued
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+    {
+        queue.push(Arc::downgrade(counters));
     }
 }
 
@@ -404,6 +543,91 @@ mod tests {
             .unwrap();
         assert_eq!(total.upload, "18446744073709551617");
         assert_eq!(total.download, "7");
+        drop(ledger);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn hot_path_batches_small_updates_and_snapshot_drains_them() {
+        let path = std::env::temp_dir().join(format!(
+            "wuthercore-traffic-batch-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = Store::open(&path).await.unwrap();
+        let ledger = TrafficLedger::open(store.clone()).await;
+        let session = ledger.begin([
+            ("network", "tcp"),
+            ("outbound", "node-a"),
+            ("destination", "example.com"),
+        ]);
+
+        for _ in 0..100_000 {
+            session.record_upload(1);
+        }
+        assert_eq!(
+            ledger.dirty_sessions.len(),
+            1,
+            "a session must enter the dirty queue once, not once per packet"
+        );
+
+        let rows = ledger.snapshot();
+        let total = rows
+            .iter()
+            .find(|blob| blob.dimension == "total" && blob.label == "all")
+            .unwrap();
+        assert_eq!(total.upload, "100000");
+        assert_eq!(ledger.dirty_sessions.len(), 0);
+        assert!(
+            ledger.dirty_rows.len() <= 4,
+            "each changed classification should be queued at most once"
+        );
+
+        drop(session);
+        ledger.shutdown().await;
+        drop(ledger);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_session_batches_do_not_lose_bytes() {
+        let path = std::env::temp_dir().join(format!(
+            "wuthercore-traffic-concurrent-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = Store::open(&path).await.unwrap();
+        let ledger = TrafficLedger::open(store.clone()).await;
+        let session = ledger.begin([("network", "tcp")]);
+        let workers = (0..8)
+            .map(|_| {
+                let session = session.clone();
+                tokio::task::spawn_blocking(move || {
+                    for _ in 0..50_000 {
+                        session.record_download(3);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.await.unwrap();
+        }
+
+        let total = ledger
+            .snapshot()
+            .into_iter()
+            .find(|blob| blob.dimension == "total" && blob.label == "all")
+            .unwrap();
+        assert_eq!(total.download, (8_u64 * 50_000 * 3).to_string());
+
+        drop(session);
+        ledger.shutdown().await;
         drop(ledger);
         drop(store);
         let _ = std::fs::remove_file(path);

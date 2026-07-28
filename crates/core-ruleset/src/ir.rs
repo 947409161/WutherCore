@@ -31,6 +31,18 @@ pub struct RulesetMatchContext<'a> {
     pub process_name: Option<&'a str>,
     pub query_type: Option<u16>,
     pub process_path: Option<&'a str>,
+    pub inbound_port: Option<u16>,
+    pub inbound_type: Option<&'a str>,
+    pub inbound_user: Option<&'a str>,
+    pub inbound_name: Option<&'a str>,
+    pub uid: Option<u32>,
+    pub dscp: Option<u8>,
+    pub destination_geoip: &'a [String],
+    pub source_geoip: &'a [String],
+    pub destination_geosite: &'a [String],
+    pub destination_asn: Option<u32>,
+    pub source_asn: Option<u32>,
+    pub rematch_names: &'a [String],
     pub package_names: &'a [String],
     pub wifi_ssid: Option<&'a str>,
     pub wifi_bssid: Option<&'a str>,
@@ -385,6 +397,10 @@ impl RulesetPredicate {
         )
     }
 
+    fn requires_destination_ip(&self) -> bool {
+        matches!(self, Self::DstIpCidr(_))
+    }
+
     fn item_count(&self) -> usize {
         match self {
             Self::Domain(items)
@@ -433,6 +449,28 @@ pub enum RulesetMatchOutcome {
     Matched,
     NotMatched,
     NeedsProcess,
+    NeedsDestinationIp,
+    NeedsProcessAndDestinationIp,
+}
+
+impl RulesetMatchOutcome {
+    fn deferred(process: bool, destination_ip: bool) -> Self {
+        match (process, destination_ip) {
+            (false, false) => Self::NotMatched,
+            (true, false) => Self::NeedsProcess,
+            (false, true) => Self::NeedsDestinationIp,
+            (true, true) => Self::NeedsProcessAndDestinationIp,
+        }
+    }
+
+    fn requirements(self) -> (bool, bool) {
+        match self {
+            Self::NeedsProcess => (true, false),
+            Self::NeedsDestinationIp => (false, true),
+            Self::NeedsProcessAndDestinationIp => (true, true),
+            Self::Matched | Self::NotMatched => (false, false),
+        }
+    }
 }
 
 impl RulesetExpr {
@@ -460,44 +498,64 @@ impl RulesetExpr {
         &self,
         ctx: &RulesetMatchContext<'_>,
         process_resolved: bool,
+        destination_ip_resolved: bool,
     ) -> RulesetMatchOutcome {
-        use RulesetMatchOutcome::{Matched, NeedsProcess, NotMatched};
+        use RulesetMatchOutcome::{Matched, NotMatched};
 
         match self {
             Self::Any(children) => {
                 let mut needs_process = false;
+                let mut needs_destination_ip = false;
                 for child in children {
-                    match child.matches_lazy(ctx, process_resolved) {
+                    let outcome =
+                        child.matches_lazy(ctx, process_resolved, destination_ip_resolved);
+                    match outcome {
                         Matched => return Matched,
-                        NeedsProcess => needs_process = true,
                         NotMatched => {}
+                        deferred => {
+                            let (process, destination_ip) = deferred.requirements();
+                            needs_process |= process;
+                            needs_destination_ip |= destination_ip;
+                        }
                     }
                 }
-                if needs_process {
-                    NeedsProcess
-                } else {
-                    NotMatched
-                }
+                RulesetMatchOutcome::deferred(needs_process, needs_destination_ip)
             }
             Self::All(children) => {
                 let mut needs_process = false;
+                let mut needs_destination_ip = false;
                 for child in children {
-                    match child.matches_lazy(ctx, process_resolved) {
+                    let outcome =
+                        child.matches_lazy(ctx, process_resolved, destination_ip_resolved);
+                    match outcome {
                         NotMatched => return NotMatched,
-                        NeedsProcess => needs_process = true,
                         Matched => {}
+                        deferred => {
+                            let (process, destination_ip) = deferred.requirements();
+                            needs_process |= process;
+                            needs_destination_ip |= destination_ip;
+                        }
                     }
                 }
-                if needs_process { NeedsProcess } else { Matched }
+                if needs_process || needs_destination_ip {
+                    RulesetMatchOutcome::deferred(needs_process, needs_destination_ip)
+                } else {
+                    Matched
+                }
             }
-            Self::Not(child) => match child.matches_lazy(ctx, process_resolved) {
-                Matched => NotMatched,
-                NotMatched => Matched,
-                NeedsProcess => NeedsProcess,
-            },
+            Self::Not(child) => {
+                match child.matches_lazy(ctx, process_resolved, destination_ip_resolved) {
+                    Matched => NotMatched,
+                    NotMatched => Matched,
+                    deferred => deferred,
+                }
+            }
             Self::Predicate(predicate) => {
-                if !process_resolved && predicate.requires_process_metadata() {
-                    NeedsProcess
+                let needs_process = !process_resolved && predicate.requires_process_metadata();
+                let needs_destination_ip =
+                    !destination_ip_resolved && predicate.requires_destination_ip();
+                if needs_process || needs_destination_ip {
+                    RulesetMatchOutcome::deferred(needs_process, needs_destination_ip)
                 } else if predicate.matches(ctx) {
                     Matched
                 } else {
@@ -576,7 +634,17 @@ impl RulesetProgram {
         ctx: &RulesetMatchContext<'_>,
         process_resolved: bool,
     ) -> RulesetMatchOutcome {
-        self.root.matches_lazy(ctx, process_resolved)
+        self.root.matches_lazy(ctx, process_resolved, true)
+    }
+
+    pub fn matches_deferred(
+        &self,
+        ctx: &RulesetMatchContext<'_>,
+        process_resolved: bool,
+        destination_ip_resolved: bool,
+    ) -> RulesetMatchOutcome {
+        self.root
+            .matches_lazy(ctx, process_resolved, destination_ip_resolved)
     }
 
     /// Return every destination `ip_cidr` item embedded in this program.
@@ -614,7 +682,10 @@ impl RulesetProgram {
 }
 
 fn normalize_domain(value: &str) -> String {
-    value.trim_end_matches('.').to_ascii_lowercase()
+    let trimmed = value.trim().trim_end_matches('.');
+    idna::domain_to_ascii(trimmed)
+        .unwrap_or_else(|_| trimmed.to_lowercase())
+        .to_lowercase()
 }
 
 fn singbox_domain(value: &str) -> String {

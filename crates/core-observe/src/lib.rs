@@ -13,6 +13,7 @@ pub mod connections;
 pub mod copy_counted;
 pub mod log_bus;
 pub mod metrics;
+mod striped_counter;
 pub mod tracing_init;
 pub mod traffic;
 pub mod watchdog;

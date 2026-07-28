@@ -8,10 +8,12 @@ use std::{
 
 use parking_lot::Mutex;
 
+use crate::striped_counter::StripedCounter;
+
 #[derive(Debug)]
 pub struct Metrics {
-    pub bytes_up: AtomicU64,
-    pub bytes_down: AtomicU64,
+    bytes_up: StripedCounter,
+    bytes_down: StripedCounter,
     pub connections_total: AtomicU64,
     pub connections_active: AtomicU64,
     pub dns_queries: AtomicU64,
@@ -34,8 +36,8 @@ struct RateState {
 impl Default for Metrics {
     fn default() -> Self {
         Self {
-            bytes_up: AtomicU64::new(0),
-            bytes_down: AtomicU64::new(0),
+            bytes_up: StripedCounter::default(),
+            bytes_down: StripedCounter::default(),
             connections_total: AtomicU64::new(0),
             connections_active: AtomicU64::new(0),
             dns_queries: AtomicU64::new(0),
@@ -57,11 +59,11 @@ impl Metrics {
     }
 
     pub fn add_up(&self, n: u64) {
-        self.bytes_up.fetch_add(n, Ordering::Relaxed);
+        self.bytes_up.add(n);
     }
 
     pub fn add_down(&self, n: u64) {
-        self.bytes_down.fetch_add(n, Ordering::Relaxed);
+        self.bytes_down.add(n);
     }
 
     pub fn inc_connection(&self) {
@@ -86,8 +88,8 @@ impl Metrics {
         let now = Instant::now();
         let mut g = self.last.lock();
         let dt = now.saturating_duration_since(g.when).as_millis();
-        let cur_up = self.bytes_up.load(Ordering::Relaxed);
-        let cur_down = self.bytes_down.load(Ordering::Relaxed);
+        let cur_up = self.bytes_up.load();
+        let cur_down = self.bytes_down.load();
         if dt < min_ms {
             return (g.last_up_rate, g.last_down_rate);
         }
@@ -124,8 +126,8 @@ impl Metrics {
 
     pub fn snapshot(&self) -> serde_json::Value {
         serde_json::json!({
-            "bytes_up": self.bytes_up.load(Ordering::Relaxed),
-            "bytes_down": self.bytes_down.load(Ordering::Relaxed),
+            "bytes_up": self.bytes_up.load(),
+            "bytes_down": self.bytes_down.load(),
             "connections_total": self.connections_total.load(Ordering::Relaxed),
             "connections_active": self.connections_active.load(Ordering::Relaxed),
             "dns_queries": self.dns_queries.load(Ordering::Relaxed),

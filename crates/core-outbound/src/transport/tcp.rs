@@ -13,7 +13,7 @@ use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
     task::JoinSet,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::{
     adapter::{
@@ -163,7 +163,7 @@ async fn sequential_connect(
         let attempt_started = Instant::now();
         match marked_connect_with_config(addr, Duration::from_secs(10), cfg.clone()).await {
             Ok(stream) => {
-                info!(
+                debug!(
                     target: "dial::tcp",
                     %host,
                     port,
@@ -189,7 +189,7 @@ async fn sequential_connect(
             }
         }
     }
-    warn!(target: "dial::tcp", %host, port, tried = addrs.len(), "all candidates failed");
+    debug!(target: "dial::tcp", %host, port, tried = addrs.len(), "all candidates failed");
     Err(last_err.unwrap_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::AddrNotAvailable,

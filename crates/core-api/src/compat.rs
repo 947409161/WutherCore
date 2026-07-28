@@ -62,7 +62,10 @@ use axum::{
 use bytes::Bytes;
 use core_runtime::Runtime;
 use futures::Stream;
-use serde::Deserialize;
+use serde::{
+    Deserialize, Serialize, Serializer,
+    ser::{SerializeSeq, SerializeStruct},
+};
 use serde_json::{Map, Value, json};
 
 use crate::{compat_security::WsConnectionLimiter, native::NativeState};
@@ -248,6 +251,32 @@ async fn watch_to_ws(
     }
 }
 
+/// 与 [`watch_to_ws`] 相同，但只限制单个客户端的发送节奏。快照仍由共享 hub
+/// 生成，因此不同 interval 不会放大连接表扫描和 JSON 序列化成本。
+async fn watch_to_ws_throttled(
+    mut sock: WebSocket,
+    mut rx: tokio::sync::watch::Receiver<String>,
+    interval: Duration,
+    _permit: crate::compat_security::WsPermit,
+) {
+    let initial = rx.borrow_and_update().clone();
+    if !initial.is_empty() && sock.send(Message::Text(initial.into())).await.is_err() {
+        return;
+    }
+    let mut last_sent = tokio::time::Instant::now();
+    while rx.changed().await.is_ok() {
+        let wait = interval.saturating_sub(last_sent.elapsed());
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+        let payload = rx.borrow_and_update().clone();
+        if sock.send(Message::Text(payload.into())).await.is_err() {
+            break;
+        }
+        last_sent = tokio::time::Instant::now();
+    }
+}
+
 /// 进程级 WS 连接上限 —— 避免 dashboard 滥连耗尽 fd 表。
 fn ws_limiter() -> &'static Arc<WsConnectionLimiter> {
     use std::sync::OnceLock;
@@ -399,69 +428,82 @@ async fn connections(
             )
                 .into_response();
         };
-        if let Some(interval) = q.interval {
-            let interval = Duration::from_millis(interval.max(100));
-            return ws.on_upgrade(move |sock| connections_to_ws(sock, s, interval, permit));
-        }
+        // interval 只描述客户端期望的刷新频率，不能为每个 dashboard 创建
+        // 一套独立的全表快照任务。所有订阅者共享全局 producer；watch 通道
+        // 只保留最新帧，慢客户端自然跳过中间状态。
         let rx = s.ws_hubs.connections.subscribe();
+        if let Some(interval) = q.interval {
+            let interval = Duration::from_millis(interval.max(200));
+            return ws.on_upgrade(move |sock| watch_to_ws_throttled(sock, rx, interval, permit));
+        }
         return ws.on_upgrade(move |sock| watch_to_ws(sock, rx, permit));
     }
     // Mihomo returns a live snapshot here. Caching this endpoint causes
     // short-lived connections and close operations to disappear behind stale
     // state, which breaks dashboard polling semantics.
     json_bytes(
-        serde_json::to_vec(&build_connections_value(&s.runtime))
+        build_connections_json(&s.runtime)
+            .map(String::into_bytes)
             .unwrap_or_else(|_| b"{}".to_vec())
             .into(),
     )
 }
 
-async fn connections_to_ws(
-    mut sock: WebSocket,
-    s: NativeState,
-    interval: Duration,
-    _permit: crate::compat_security::WsPermit,
-) {
-    loop {
-        let payload = serde_json::to_string(&build_connections_value(&s.runtime))
-            .unwrap_or_else(|_| "{}".into());
-        if sock.send(Message::Text(payload.into())).await.is_err() {
-            return;
-        }
-        tokio::time::sleep(interval).await;
+struct CompatConnectionsSnapshot {
+    manager: core_observe::ConnectionManagerSnapshot,
+}
+
+impl Serialize for CompatConnectionsSnapshot {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("Connections", 4)?;
+        state.serialize_field("downloadTotal", &self.manager.download_total)?;
+        state.serialize_field("uploadTotal", &self.manager.upload_total)?;
+        state.serialize_field("connections", &CompatConnections(&self.manager.connections))?;
+        state.serialize_field("memory", &self.manager.memory)?;
+        state.end()
     }
 }
 
-pub(crate) fn build_connections_value(runtime: &Arc<Runtime>) -> Value {
-    let manager = runtime.connections.manager_snapshot();
-    let download_total = manager.download_total;
-    let upload_total = manager.upload_total;
-    let memory = manager.memory;
-    let conns: Vec<Value> = manager
-        .connections
-        .into_iter()
-        .map(|conn| {
-            json!({
-                "id": conn.id,
-                "metadata": conn.metadata,
-                "upload": conn.upload,
-                "download": conn.download,
-                "start": iso8601(conn.start),
-                "chains": conn.chains,
-                "providerChains": conn.provider_chains,
-                "rule": conn.rule,
-                "rulePayload": conn.rule_payload,
-                "maxUploadRate": conn.max_upload_rate,
-                "maxDownloadRate": conn.max_download_rate,
-                "smartBlock": conn.smart_block_state(),
-            })
-        })
-        .collect();
-    json!({
-        "downloadTotal": download_total,
-        "uploadTotal": upload_total,
-        "connections": conns,
-        "memory": memory,
+struct CompatConnections<'a>(&'a [core_observe::ConnectionInfo]);
+
+impl Serialize for CompatConnections<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+        for connection in self.0 {
+            seq.serialize_element(&CompatConnection(connection))?;
+        }
+        seq.end()
+    }
+}
+
+struct CompatConnection<'a>(&'a core_observe::ConnectionInfo);
+
+impl Serialize for CompatConnection<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let connection = self.0;
+        let mut state = serializer.serialize_struct("Connection", 15)?;
+        state.serialize_field("id", &connection.id)?;
+        state.serialize_field("metadata", &connection.metadata)?;
+        state.serialize_field("upload", &connection.upload)?;
+        state.serialize_field("download", &connection.download)?;
+        state.serialize_field("start", &iso8601(connection.start))?;
+        state.serialize_field("chains", &connection.chains)?;
+        state.serialize_field("providerChains", &connection.provider_chains)?;
+        state.serialize_field("rule", &connection.rule)?;
+        state.serialize_field("rulePayload", &connection.rule_payload)?;
+        state.serialize_field("ruleIndex", &connection.rule_index)?;
+        state.serialize_field("ruleSource", &connection.rule_source)?;
+        state.serialize_field("ruleAction", &connection.rule_action)?;
+        state.serialize_field("maxUploadRate", &connection.max_upload_rate)?;
+        state.serialize_field("maxDownloadRate", &connection.max_download_rate)?;
+        state.serialize_field("smartBlock", connection.smart_block_state())?;
+        state.end()
+    }
+}
+
+pub(crate) fn build_connections_json(runtime: &Arc<Runtime>) -> serde_json::Result<String> {
+    serde_json::to_string(&CompatConnectionsSnapshot {
+        manager: runtime.connections.manager_snapshot(),
     })
 }
 
@@ -1545,44 +1587,19 @@ async fn rules(State(s): State<NativeState>) -> axum::response::Response {
 }
 
 fn build_rules_value(runtime: &Arc<Runtime>) -> Value {
-    use core_config::runtime_plan::{RouteAction, RouteMatcher};
     let mut out = Vec::new();
-    for (index, st) in runtime.plan.route.steps.iter().enumerate() {
-        let (rtype, payload) = match &st.matcher {
-            RouteMatcher::Any => ("MATCH", String::new()),
-            RouteMatcher::Home => ("HOME", String::new()),
-            RouteMatcher::Cn => ("GEOIP", "CN".into()),
-            RouteMatcher::Ads => ("ADS", String::new()),
-            RouteMatcher::Service(svc) => ("SERVICE", svc.clone()),
-            RouteMatcher::Domain(d) => ("DOMAIN", d.clone()),
-            RouteMatcher::Suffix(d) => ("DOMAIN-SUFFIX", d.clone()),
-            RouteMatcher::Keyword(k) => ("DOMAIN-KEYWORD", k.clone()),
-            RouteMatcher::DomainRegex(regex) => ("DOMAIN-REGEX", regex.clone()),
-            RouteMatcher::Cidr(c) => ("IP-CIDR", c.clone()),
-            RouteMatcher::SrcCidr(c) => ("SRC-IP-CIDR", c.clone()),
-            RouteMatcher::Port(p) => ("DST-PORT", p.to_string()),
-            RouteMatcher::PortRange(lo, hi) => ("DST-PORT", format!("{lo}-{hi}")),
-            RouteMatcher::SrcPort(p) => ("SRC-PORT", p.to_string()),
-            RouteMatcher::SrcPortRange(lo, hi) => ("SRC-PORT", format!("{lo}-{hi}")),
-            RouteMatcher::Network(n) => ("NETWORK", n.clone()),
-            RouteMatcher::Process(p) => ("PROCESS-NAME", p.clone()),
-            RouteMatcher::ProcessPath(p) => ("PROCESS-PATH", p.clone()),
-            RouteMatcher::Set(s) => ("RULE-SET", s.clone()),
-            RouteMatcher::Proto(p) => ("PROTOCOL", p.clone()),
-            RouteMatcher::And(parts) => ("AND", format!("{} clauses", parts.len())),
-            RouteMatcher::Or(parts) => ("OR", format!("{} clauses", parts.len())),
-        };
-        let proxy = match &st.action {
-            RouteAction::Direct => "DIRECT".to_string(),
-            RouteAction::Block => "REJECT".to_string(),
-            RouteAction::Group(g) => g.clone(),
-        };
+    for (hit, disabled) in runtime.route.rule_descriptions() {
         out.push(json!({
-            "index": index,
-            "type": rtype,
-            "payload": payload,
-            "proxy": proxy,
+            "index": hit.index,
+            "type": hit.rule,
+            "payload": hit.payload,
+            "proxy": hit.action,
             "size": -1,
+            "source": hit.source,
+            "disabled": disabled,
+            "noResolve": hit.no_resolve,
+            "noLog": hit.no_log,
+            "noTrack": hit.no_track,
         }));
     }
     json!({"rules": out})

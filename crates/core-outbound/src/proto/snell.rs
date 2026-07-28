@@ -212,7 +212,7 @@ impl OutboundAdapter for SnellOutbound {
         let mut send = SnellCryptor::new(self.cipher, &send_key);
         let pkt = send.encrypt_chunk(&cmd_payload)?;
         stream.write_all(&pkt).await?;
-        tracing::info!(
+        tracing::debug!(
             target: "dial::snell",
             id = ctx.dial_id,
             proxy = %self.name,
@@ -244,7 +244,7 @@ impl OutboundAdapter for SnellOutbound {
         ctx.network = "udp";
         let stream = self.dial_tcp(ctx.clone()).await?;
         let (read, write) = tokio::io::split(stream);
-        tracing::info!(
+        tracing::debug!(
             target: "dial::snell",
             id = ctx.dial_id,
             proxy = %self.name,

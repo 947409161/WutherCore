@@ -315,7 +315,7 @@ impl OutboundAdapter for Ss2022Outbound {
         let (std_sock, loopback_guard) = crate::create_outbound_udp_socket(server)?;
         let sock = UdpSocket::from_std(std_sock)?;
         let client_session_id = random_nonzero_u64();
-        tracing::info!(
+        tracing::debug!(
             target: "dial::ss2022",
             id = ctx.dial_id,
             proxy = %self.name,

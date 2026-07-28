@@ -15,7 +15,7 @@ use compact_str::ToCompactString;
 use core_observe::{ConnectionGuard, ConnectionMeta, copy_bidirectional_tracked};
 use core_route::{FlowContext, FlowRulesetMetadata, L7Proto, NetworkKind};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tracing::{info, warn};
+use tracing::{trace, warn};
 
 use crate::engine::{DialResult, RoutePick, Runtime, UdpDialResult};
 
@@ -237,6 +237,12 @@ impl InboundMetadata {
             ruleset: FlowRulesetMetadata {
                 source_ip: Some(self.source.ip()),
                 source_port: Some(self.source.port()),
+                inbound_port: self.inbound.map(|address| address.port()),
+                inbound_type: Some(self.kind.as_str().to_string()),
+                inbound_user: (!self.inbound_user.is_empty()).then(|| self.inbound_user.clone()),
+                inbound_name: (!self.inbound_name.is_empty()).then(|| self.inbound_name.clone()),
+                uid: self.uid,
+                dscp: self.dscp,
                 process_path: self.process_path.clone(),
                 package_names: self.package_names.clone(),
                 ..FlowRulesetMetadata::default()
@@ -331,7 +337,7 @@ impl ListenerHandler {
         // 不进 ConnectionTable，避免污染 dashboard `/connections` —— 这些
         // 是核心运行时内务流量，不属于用户业务连接。counter/cancel token 仍
         // 正常工作，只是 entry 旁路。
-        let guard = if metadata.is_inner {
+        let guard = if metadata.is_inner || result.no_track {
             self.runtime.connections.open_detached()
         } else {
             self.open_tcp(&metadata, &result)
@@ -346,7 +352,7 @@ impl ListenerHandler {
         let target_host = metadata.target_host();
         let target_port = metadata.destination_port;
         let result = self.dial_udp(&metadata).await?;
-        if metadata.kind == "Tun" {
+        if metadata.kind == "Tun" && !result.no_log {
             let src_label = if metadata.is_inner {
                 "WutherCore".to_string()
             } else {
@@ -358,16 +364,16 @@ impl ListenerHandler {
                 result.outbound.clone()
             };
             if result.rule.is_empty() {
-                info!(target: "capture::traffic", "[UDP] {} --> {}:{} using {}", src_label, target_host, target_port, proxy);
+                trace!(target: "capture::traffic", "[UDP] {} --> {}:{} using {}", src_label, target_host, target_port, proxy);
             } else if result.rule_payload.is_empty() {
-                info!(target: "capture::traffic", "[UDP] {} --> {}:{} match {} using {}", src_label, target_host, target_port, result.rule, proxy);
+                trace!(target: "capture::traffic", "[UDP] {} --> {}:{} match {} using {}", src_label, target_host, target_port, result.rule, proxy);
             } else {
-                info!(target: "capture::traffic", "[UDP] {} --> {}:{} match {}({}) using {}", src_label, target_host, target_port, result.rule, result.rule_payload, proxy);
+                trace!(target: "capture::traffic", "[UDP] {} --> {}:{} match {}({}) using {}", src_label, target_host, target_port, result.rule, result.rule_payload, proxy);
             }
         }
         // 内部组件 UDP 出站（DNS upstream、ruleset 自动刷新等）也旁路 entry，
         // 与 TCP 路径保持一致。
-        let guard = if metadata.is_inner {
+        let guard = if metadata.is_inner || result.no_track {
             self.runtime.connections.open_detached()
         } else {
             let meta = udp_connection_meta(&metadata, &result);
@@ -555,13 +561,19 @@ impl ListenerHandler {
             return metadata;
         };
         metadata.host = host;
+        let is_fake_ip = self
+            .runtime
+            .resolver
+            .fake_pool()
+            .is_some_and(|pool| pool.contains(ip));
+        // A fake address is only a capture token. Keeping it as route_ip makes
+        // every IP-CIDR/GEOIP/MRS rule test the synthetic pool instead of the
+        // domain's real address.
+        if is_fake_ip {
+            metadata.route_ip = None;
+        }
         if metadata.dns_mode == "normal" {
-            metadata.dns_mode = if self
-                .runtime
-                .resolver
-                .fake_pool()
-                .is_some_and(|pool| pool.contains(ip))
-            {
+            metadata.dns_mode = if is_fake_ip {
                 "fake-ip".into()
             } else {
                 "redir-host".into()
@@ -597,7 +609,7 @@ impl ListenerHandler {
         // 用 connection table 反查 process+host 标签 —— meta 在 prepare_tcp 阶段
         // 已经填到 table 里，不必让 PreparedTcp 多带 String 字段。
         let label = self.runtime.connections.label_for(id);
-        info!(
+        trace!(
             target: "relay",
             "[Relay] #{id} {label} via {outbound} (dial {dial_ms}ms)"
         );
@@ -621,7 +633,7 @@ impl ListenerHandler {
         // 清掉（在 list 路径里）；那种场景下 label_for 返回 `#id` 兜底。
         let label = self.runtime.connections.label_for(id);
         match &result {
-            Ok(_) => info!(
+            Ok(_) => trace!(
                 target: "relay",
                 "[Relay] #{id} {label} closed | up {up_s} down {down_s} | {total_ms}ms"
             ),
@@ -641,7 +653,7 @@ fn tcp_connection_meta(metadata: &InboundMetadata, result: &DialResult) -> Conne
         kind: metadata.kind.as_str().into(),
         source_ip: metadata.source.ip().to_compact_string(),
         source_port: metadata.source.port().to_compact_string(),
-        destination_ip: destination_ip(metadata),
+        destination_ip: destination_ip(metadata, result.route_ip),
         destination_port: metadata.destination_port.to_compact_string(),
         inbound_ip,
         inbound_port,
@@ -667,6 +679,9 @@ fn tcp_connection_meta(metadata: &InboundMetadata, result: &DialResult) -> Conne
         provider_chains: core_observe::string_list_from(&result.provider_chains),
         rule: result.rule.as_str().into(),
         rule_payload: result.rule_payload.as_str().into(),
+        rule_index: result.rule_index,
+        rule_source: result.rule_source.as_str().into(),
+        rule_action: result.rule_action.as_str().into(),
         ..ConnectionMeta::default()
     }
 }
@@ -678,7 +693,7 @@ fn udp_connection_meta(metadata: &InboundMetadata, result: &UdpDialResult) -> Co
         kind: metadata.kind.as_str().into(),
         source_ip: metadata.source.ip().to_compact_string(),
         source_port: metadata.source.port().to_compact_string(),
-        destination_ip: destination_ip(metadata),
+        destination_ip: destination_ip(metadata, result.route_ip),
         destination_port: metadata.destination_port.to_compact_string(),
         inbound_ip,
         inbound_port,
@@ -704,6 +719,9 @@ fn udp_connection_meta(metadata: &InboundMetadata, result: &UdpDialResult) -> Co
         provider_chains: core_observe::string_list_from(&result.provider_chains),
         rule: result.rule.as_str().into(),
         rule_payload: result.rule_payload.as_str().into(),
+        rule_index: result.rule_index,
+        rule_source: result.rule_source.as_str().into(),
+        rule_action: result.rule_action.as_str().into(),
         ..ConnectionMeta::default()
     }
 }
@@ -723,10 +741,14 @@ fn inbound_parts(
     }
 }
 
-fn destination_ip(metadata: &InboundMetadata) -> compact_str::CompactString {
-    metadata
-        .destination_ip
-        .or_else(|| metadata.host.parse::<IpAddr>().ok())
+fn destination_ip(
+    metadata: &InboundMetadata,
+    route_ip: Option<IpAddr>,
+) -> compact_str::CompactString {
+    route_ip
+        .or(metadata
+            .destination_ip
+            .or_else(|| metadata.host.parse::<IpAddr>().ok()))
         .map(|ip| ip.to_compact_string())
         .unwrap_or_default()
 }

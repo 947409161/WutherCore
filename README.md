@@ -51,7 +51,9 @@ WutherCore 负责节点接入、订阅更新、DNS、规则分流、透明代理
 
 ### 路由与进程识别
 
-* 规则可匹配域名、域名后缀、IP、CIDR、源端口、目标端口、网络类型、进程名、进程路径、入站来源和规则集。
+* 完整支持 Mihomo 官方路由规则，包括域名精确，后缀，关键字，通配符，正则，GeoSite，GeoIP，ASN，源/目的 IP，端口，入站，进程，UID，DSCP，逻辑规则，规则集与子规则。
+* 域名统一执行大小写，尾点和 IDNA 规范化，同时保留 Unicode 路径供正则，关键字和 MRS 匹配。
+* 目标 IP 规则按规则顺序延迟解析域名，`no-resolve` 在顶层和逻辑子规则中均生效。
 * Linux、Windows、macOS 和 Android 均有进程识别实现。
 * Android root 模式可通过 Binder 查询 UID 对应的包名。
 * `find-process-mode` 支持关闭、按需查询和始终查询。
@@ -67,8 +69,8 @@ WutherCore 负责节点接入、订阅更新、DNS、规则分流、透明代理
 
 ### 规则集
 
-* 支持 Mihomo YAML、文本规则、MRS v1、sing-box JSON、SRS v1 至 v5、内联 Payload 和 WutherCore RRS v2。
-* Classical provider 完整支持 `SRC-IP-CIDR`、`SRC-PORT`、`DOMAIN-REGEX` 和 `PROCESS-PATH`；MRS v1 严格遵循 Mihomo 的 domain/ipcidr behavior。
+* 支持 Mihomo YAML，文本规则，MRS v1，sing-box JSON，SRS v1 至 v5，内联 Payload 和 WutherCore RRS v3，并兼容读取 RRS v1/v2。
+* Classical provider 支持除 `RULE-SET`，`SUB-RULE` 外的全部 Mihomo 官方规则；MRS v1 严格遵循 Mihomo 的 domain/ipcidr behavior。
 * 二进制输入会经过有界解压、结构校验和统一 matcher 编译。
 * 规则集支持运行时热更新、版本化 IP 前缀快照和变更通知。
 * `ruleset convert` 可在常用文本、YAML、JSON 和 RRS 格式之间转换。
@@ -78,6 +80,8 @@ WutherCore 负责节点接入、订阅更新、DNS、规则分流、透明代理
 * 提供原生 `/v1` HTTP API 和 Clash/Mihomo 兼容 API。
 * 支持节点、策略组、规则、规则提供者、DNS、连接、流量、日志、版本和运行能力查询。
 * WebSocket 和普通 HTTP 接口均可用于连接与流量面板。
+* 高吞吐统计使用分片计数、连接级批量归并和增量持久化；连接面板共享快照，
+  不会因 dashboard 数量重复扫描全部连接。
 * 管理端支持密钥认证、CORS 限制、连接上限和非本机监听安全检查。
 
 ## 协议支持

@@ -42,7 +42,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::Notify,
 };
-use tracing::{info, warn};
+use tracing::{trace, warn};
 
 /* ============================================================
 VirtualTunDevice：smoltcp::phy::Device 实现
@@ -510,7 +510,7 @@ impl SpliceManager {
                 let up_s = crate::tun_pump::format_bytes(up);
                 let down_s = crate::tun_pump::format_bytes(down);
                 match &result {
-                    Ok(_) => info!(
+                    Ok(_) => trace!(
                         target: "capture::traffic",
                         "[TCP] #{conn_id} closed | up {up_s} down {down_s}"
                     ),

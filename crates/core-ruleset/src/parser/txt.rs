@@ -142,7 +142,7 @@ pub fn parse_line(line: &str) -> Option<ClassicalEntry> {
     None
 }
 
-fn parse_domain_pattern(value: &str) -> Result<ClassicalEntry, String> {
+pub(crate) fn parse_domain_pattern(value: &str) -> Result<ClassicalEntry, String> {
     if value.contains(',') {
         return Err("domain behavior does not accept classical `KIND,VALUE` rules".into());
     }
@@ -154,24 +154,24 @@ fn parse_domain_pattern(value: &str) -> Result<ClassicalEntry, String> {
     if value.is_empty() {
         return Err("domain pattern is empty".into());
     }
-    let normalized = value.to_ascii_lowercase();
+    let normalized = value.to_lowercase();
 
     // `+.` includes the suffix root itself and all descendant levels.
     if let Some(suffix) = normalized.strip_prefix("+.") {
-        validate_literal_domain(suffix)?;
+        let suffix = normalize_literal_domain(suffix)?;
         return Ok(ClassicalEntry {
             kind: ClassicalKind::DomainSuffix,
-            value: suffix.into(),
+            value: suffix,
             policy: None,
         });
     }
 
     // A leading `.` requires at least one label before the suffix, unlike `+.`.
     if let Some(suffix) = normalized.strip_prefix('.') {
-        validate_literal_domain(suffix)?;
+        let suffix = normalize_literal_domain(suffix)?;
         return Ok(ClassicalEntry {
             kind: ClassicalKind::DomainRegex,
-            value: format!(r"^(?:[^.]+\.)+{}$", regex::escape(suffix)),
+            value: format!(r"^(?:[^.]+\.)+{}$", regex::escape(&suffix)),
             policy: None,
         });
     }
@@ -190,8 +190,8 @@ fn parse_domain_pattern(value: &str) -> Result<ClassicalEntry, String> {
                 if label.contains('*') {
                     return Err("`*` wildcard must occupy a complete domain label".into());
                 }
-                validate_literal_label(label)?;
-                regex_labels.push(regex::escape(label));
+                let label = normalize_literal_label(label)?;
+                regex_labels.push(regex::escape(&label));
             }
         }
         return Ok(ClassicalEntry {
@@ -201,7 +201,7 @@ fn parse_domain_pattern(value: &str) -> Result<ClassicalEntry, String> {
         });
     }
 
-    validate_literal_domain(&normalized)?;
+    let normalized = normalize_literal_domain(&normalized)?;
     Ok(ClassicalEntry {
         kind: ClassicalKind::Domain,
         value: normalized,
@@ -231,59 +231,80 @@ fn parse_mixed_line_strict(value: &str) -> Result<ClassicalEntry, String> {
     parse_domain_pattern(value)
 }
 
-fn parse_classical_line_strict(value: &str) -> Result<ClassicalEntry, String> {
-    let mut fields = value.split(',').map(str::trim);
+pub(crate) fn parse_classical_line_strict(value: &str) -> Result<ClassicalEntry, String> {
+    let fields = split_top_level_commas(value);
     let kind_name = fields
-        .next()
+        .first()
+        .copied()
         .filter(|field| !field.is_empty())
         .ok_or_else(|| "classical rule is missing its kind".to_string())?;
-    let raw_value = fields
-        .next()
-        .filter(|field| !field.is_empty())
-        .ok_or_else(|| "classical rule is missing its value".to_string())?;
     let kind = ClassicalKind::parse(kind_name)
         .ok_or_else(|| format!("unsupported classical rule kind `{kind_name}`"))?;
+    if kind == ClassicalKind::Match {
+        if fields.len() != 1 {
+            return Err("MATCH does not accept a payload".into());
+        }
+        return Ok(ClassicalEntry {
+            kind,
+            value: String::new(),
+            policy: None,
+        });
+    }
+    if fields.len() < 2 {
+        return Err("classical rule is missing its value".into());
+    }
 
     let mut source_modifier = false;
     let mut no_resolve_modifier = false;
-    for option in fields {
+    let mut value_end = fields.len();
+    while value_end > 2 {
+        let option = fields[value_end - 1];
+        if !option.eq_ignore_ascii_case("no-resolve") && !option.eq_ignore_ascii_case("src") {
+            break;
+        }
         if option.is_empty() {
             return Err("classical rule contains an empty trailing field".into());
         }
         if option.eq_ignore_ascii_case("no-resolve") {
-            if kind != ClassicalKind::IpCidr {
+            if !matches!(
+                kind,
+                ClassicalKind::IpCidr
+                    | ClassicalKind::IpSuffix
+                    | ClassicalKind::GeoIp
+                    | ClassicalKind::IpAsn
+            ) {
                 return Err(format!("`no-resolve` is not valid for `{kind_name}`"));
             }
             if no_resolve_modifier {
                 return Err("classical rule contains duplicate `no-resolve` options".into());
             }
             no_resolve_modifier = true;
-            continue;
-        }
-        if option.eq_ignore_ascii_case("src") {
-            if kind != ClassicalKind::IpCidr {
+        } else if option.eq_ignore_ascii_case("src") {
+            if !matches!(
+                kind,
+                ClassicalKind::IpCidr
+                    | ClassicalKind::IpSuffix
+                    | ClassicalKind::GeoIp
+                    | ClassicalKind::IpAsn
+            ) {
                 return Err(format!("`src` is not valid for `{kind_name}`"));
             }
             if source_modifier {
                 return Err("classical rule contains duplicate `src` options".into());
             }
             source_modifier = true;
-            continue;
         }
-        return Err(format!(
-            "classical provider action/policy field `{option}` is unsupported"
-        ));
+        value_end -= 1;
     }
+    let raw_value = fields[1..value_end].join(",");
+    if raw_value.trim().is_empty() {
+        return Err("classical rule is missing its value".into());
+    }
+    let raw_value = raw_value.trim();
 
     let normalized_value = match kind {
-        ClassicalKind::Domain => {
-            validate_literal_domain(raw_value)?;
-            raw_value.trim_end_matches('.').to_ascii_lowercase()
-        }
-        ClassicalKind::DomainSuffix => {
-            validate_literal_domain(raw_value)?;
-            raw_value.trim_matches('.').to_ascii_lowercase()
-        }
+        ClassicalKind::Domain => normalize_literal_domain(raw_value)?,
+        ClassicalKind::DomainSuffix => normalize_literal_domain(raw_value.trim_matches('.'))?,
         ClassicalKind::DomainKeyword => {
             if raw_value.is_empty() {
                 return Err("DOMAIN-KEYWORD value cannot be empty".into());
@@ -295,27 +316,168 @@ fn parse_classical_line_strict(value: &str) -> Result<ClassicalEntry, String> {
                 .map_err(|error| format!("invalid DOMAIN-REGEX: {error}"))?;
             raw_value.into()
         }
+        ClassicalKind::DomainWildcard => {
+            validate_mihomo_wildcard(raw_value)?;
+            normalize_wildcard_domain(raw_value)?
+        }
+        ClassicalKind::GeoSite
+        | ClassicalKind::GeoIp
+        | ClassicalKind::SrcGeoIp
+        | ClassicalKind::InType
+        | ClassicalKind::InUser
+        | ClassicalKind::InName
+        | ClassicalKind::RematchName => {
+            if raw_value.is_empty() {
+                return Err(format!("{kind_name} value cannot be empty"));
+            }
+            raw_value.to_ascii_lowercase()
+        }
         ClassicalKind::IpCidr | ClassicalKind::SrcIpCidr => {
             // Mihomo treats IP-CIDR6 as an alias of IP-CIDR; both accept either family.
             normalize_ip_or_cidr(raw_value)?
         }
-        ClassicalKind::DstPort | ClassicalKind::SrcPort => {
+        ClassicalKind::IpSuffix | ClassicalKind::SrcIpSuffix => normalize_ip_suffix(raw_value)?,
+        ClassicalKind::IpAsn | ClassicalKind::SrcIpAsn => parse_asn(raw_value)?.to_string(),
+        ClassicalKind::DstPort | ClassicalKind::SrcPort | ClassicalKind::InPort => {
             validate_port_range(raw_value)?;
             raw_value.into()
         }
         ClassicalKind::ProcessName | ClassicalKind::ProcessPath => raw_value.into(),
+        ClassicalKind::ProcessNameRegex | ClassicalKind::ProcessPathRegex => {
+            regex::Regex::new(raw_value)
+                .map_err(|error| format!("invalid {kind_name}: {error}"))?;
+            raw_value.into()
+        }
+        ClassicalKind::ProcessNameWildcard | ClassicalKind::ProcessPathWildcard => {
+            validate_mihomo_wildcard(raw_value)?;
+            raw_value.into()
+        }
+        ClassicalKind::Network => match raw_value.to_ascii_lowercase().as_str() {
+            "tcp" | "udp" => raw_value.to_ascii_lowercase(),
+            _ => return Err(format!("NETWORK must be tcp or udp, got `{raw_value}`")),
+        },
+        ClassicalKind::Dscp => raw_value
+            .parse::<u8>()
+            .map_err(|_| format!("invalid DSCP `{raw_value}`"))?
+            .to_string(),
+        ClassicalKind::Uid => raw_value
+            .parse::<u32>()
+            .map_err(|_| format!("invalid UID `{raw_value}`"))?
+            .to_string(),
+        ClassicalKind::And | ClassicalKind::Or | ClassicalKind::Not => {
+            parse_logical_payload(kind, raw_value)?;
+            raw_value.into()
+        }
+        ClassicalKind::Match => unreachable!(),
     };
-    let normalized_kind = if kind == ClassicalKind::IpCidr && source_modifier {
-        ClassicalKind::SrcIpCidr
-    } else {
-        kind
+    let normalized_kind = match (kind, source_modifier) {
+        (ClassicalKind::IpCidr, true) => ClassicalKind::SrcIpCidr,
+        (ClassicalKind::IpSuffix, true) => ClassicalKind::SrcIpSuffix,
+        (ClassicalKind::GeoIp, true) => ClassicalKind::SrcGeoIp,
+        (ClassicalKind::IpAsn, true) => ClassicalKind::SrcIpAsn,
+        _ => kind,
     };
 
     Ok(ClassicalEntry {
         kind: normalized_kind,
         value: normalized_value,
-        policy: None,
+        policy: no_resolve_modifier.then(|| "no-resolve".into()),
     })
+}
+
+pub(crate) fn parse_logical_payload(
+    kind: ClassicalKind,
+    payload: &str,
+) -> Result<Vec<ClassicalEntry>, String> {
+    let inner = strip_parentheses(payload)
+        .ok_or_else(|| format!("{kind:?} payload requires outer parentheses"))?;
+    let mut children = Vec::new();
+    for child in split_top_level_commas(inner) {
+        let child = strip_parentheses(child)
+            .ok_or_else(|| format!("logical child `{child}` requires parentheses"))?;
+        children.push(parse_classical_line_strict(child)?);
+    }
+    match kind {
+        ClassicalKind::And | ClassicalKind::Or if children.len() >= 2 => Ok(children),
+        ClassicalKind::Not if children.len() == 1 => Ok(children),
+        ClassicalKind::Not => Err("NOT requires exactly one child".into()),
+        ClassicalKind::And | ClassicalKind::Or => {
+            Err("AND/OR require at least two children".into())
+        }
+        _ => Err("not a logical rule".into()),
+    }
+}
+
+fn split_top_level_commas(value: &str) -> Vec<&str> {
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut parts = Vec::new();
+    for (index, character) in value.char_indices() {
+        match character {
+            '(' => depth = depth.saturating_add(1),
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(value[start..index].trim());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(value[start..].trim());
+    parts
+}
+
+fn strip_parentheses(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if !value.starts_with('(') || !value.ends_with(')') {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (index, character) in value.char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 && index + character.len_utf8() != value.len() {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    (depth == 0).then(|| &value[1..value.len() - 1])
+}
+
+fn validate_mihomo_wildcard(pattern: &str) -> Result<(), String> {
+    if pattern.is_empty() {
+        return Err("DOMAIN-WILDCARD value cannot be empty".into());
+    }
+    if pattern.contains(['[', ']', '{', '}']) {
+        return Err("DOMAIN-WILDCARD only supports `*` and `?` wildcards".into());
+    }
+    let mut builder = globset::GlobBuilder::new(pattern);
+    builder
+        .case_insensitive(true)
+        .literal_separator(false)
+        .backslash_escape(true);
+    builder
+        .build()
+        .map(|_| ())
+        .map_err(|error| format!("invalid DOMAIN-WILDCARD: {error}"))
+}
+
+fn normalize_wildcard_domain(pattern: &str) -> Result<String, String> {
+    pattern
+        .split('.')
+        .map(|label| {
+            if label.contains('*') || label.contains('?') {
+                Ok(label.to_lowercase())
+            } else {
+                normalize_literal_label(label)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|labels| labels.join("."))
 }
 
 fn normalize_ip_or_cidr(value: &str) -> Result<String, String> {
@@ -329,6 +491,34 @@ fn normalize_ip_or_cidr(value: &str) -> Result<String, String> {
             "`{value}` is not a valid IP address or CIDR prefix"
         )),
     }
+}
+
+fn normalize_ip_suffix(value: &str) -> Result<String, String> {
+    let (address, bits) = value
+        .split_once('/')
+        .ok_or_else(|| format!("IP-SUFFIX `{value}` is missing its bit count"))?;
+    let address = address
+        .parse::<IpAddr>()
+        .map_err(|_| format!("invalid IP-SUFFIX address `{address}`"))?;
+    let bits = bits
+        .parse::<u8>()
+        .map_err(|_| format!("invalid IP-SUFFIX bit count `{bits}`"))?;
+    let maximum = if address.is_ipv4() { 32 } else { 128 };
+    if bits > maximum {
+        return Err(format!(
+            "IP-SUFFIX bit count {bits} exceeds IPv{} width",
+            if address.is_ipv4() { 4 } else { 6 }
+        ));
+    }
+    Ok(format!("{address}/{bits}"))
+}
+
+fn parse_asn(value: &str) -> Result<u32, String> {
+    value
+        .trim()
+        .trim_start_matches(|character: char| matches!(character, 'A' | 'a' | 'S' | 's'))
+        .parse()
+        .map_err(|_| format!("invalid ASN `{value}`"))
 }
 
 fn host_prefix_v4(address: Ipv4Addr) -> String {
@@ -372,6 +562,22 @@ fn validate_literal_domain(value: &str) -> Result<(), String> {
         validate_literal_label(label)?;
     }
     Ok(())
+}
+
+fn normalize_literal_domain(value: &str) -> Result<String, String> {
+    let normalized = idna::domain_to_ascii(value.trim_end_matches('.'))
+        .map_err(|error| format!("invalid internationalized domain `{value}`: {error}"))?
+        .to_lowercase();
+    validate_literal_domain(&normalized)?;
+    Ok(normalized)
+}
+
+fn normalize_literal_label(label: &str) -> Result<String, String> {
+    let normalized = idna::domain_to_ascii(label)
+        .map_err(|error| format!("invalid internationalized domain label `{label}`: {error}"))?
+        .to_lowercase();
+    validate_literal_label(&normalized)?;
+    Ok(normalized)
 }
 
 fn validate_literal_label(label: &str) -> Result<(), String> {
@@ -509,9 +715,9 @@ mod tests {
     }
 
     #[test]
-    fn classical_behavior_accepts_supported_kinds_and_rejects_every_other_line() {
+    fn classical_behavior_accepts_all_mihomo_kinds_except_nested_provider_references() {
         let entries = parse_for_type(
-            b"DOMAIN-SUFFIX,google.com\nDOMAIN-KEYWORD,google\nDOMAIN,ad.com\nSRC-IP-CIDR,192.168.1.201/32\nIP-CIDR,127.0.0.0/8,no-resolve\nIP-CIDR,198.51.100.0/24,src\nIP-CIDR,2001:db8::/32\nIP-CIDR6,192.0.2.0/24\nDST-PORT,80\nSRC-PORT,7777\nPROCESS-NAME,browser.exe\nPROCESS-PATH,C:\\Program Files\\Browser\\browser.exe\nDOMAIN-REGEX,^(?!api0\\.)api[0-9]+\\.example\\.com$\n",
+            b"DOMAIN-SUFFIX,google.com\nDOMAIN-KEYWORD,google\nDOMAIN,ad.com\nSRC-IP-CIDR,192.168.1.201/32\nIP-CIDR,127.0.0.0/8,no-resolve\nIP-CIDR,198.51.100.0/24,src\nIP-CIDR,2001:db8::/32\nIP-CIDR6,192.0.2.0/24\nDST-PORT,80\nSRC-PORT,7777\nPROCESS-NAME,browser.exe\nPROCESS-PATH,C:\\Program Files\\Browser\\browser.exe\nDOMAIN-REGEX,^(?!api0\\.)api[0-9]+\\.example\\.com$\nGEOIP,CN\n",
             RulesetType::Classical,
         )
         .unwrap();
@@ -527,7 +733,8 @@ mod tests {
         assert!(matcher.matches("", Some("192.0.2.1".parse().unwrap()), None, None));
 
         for invalid in [
-            "GEOIP,CN",
+            "RULE-SET,nested",
+            "SUB-RULE,(MATCH)",
             "NOT-A-RULE",
             "IP-CIDR,10.0.0.0/99",
             "DST-PORT,9000-8000",

@@ -19,7 +19,7 @@ use std::{
 use core_resolver::DnsService;
 use core_runtime::ListenerHandler;
 use tokio::sync::{mpsc, mpsc::error::TrySendError};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace, warn};
 
 use crate::{
     frame_cache::{TunFrameFormatCache, write_ip_packet_to_tun},
@@ -66,7 +66,7 @@ pub async fn handle_udp_packet(
     // [1] 53 + hijack_dns → 内联应答，不出网。
     if ctx.inbound.should_hijack_dns(outer_dst) {
         let resp = crate::fakeip_dns::synthesize(&payload, &ctx.dns_service).await;
-        debug!(
+        trace!(
             target: "capture::traffic",
             network = "udp",
             src = %inner_src,
@@ -118,7 +118,7 @@ pub async fn handle_udp_packet(
                     );
                 }
                 Err(TrySendError::Closed(_)) => {
-                    debug!(
+                    trace!(
                         target: "capture::udp",
                         network = "udp",
                         src = %inner_src,
@@ -149,7 +149,7 @@ pub async fn handle_udp_packet(
                     return;
                 }
             };
-            debug!(
+            trace!(
                 target: "capture::traffic",
                 network = "udp",
                 src = %inner_src,
@@ -202,7 +202,7 @@ fn resolve_udp_session(
             None
         }
         Err(reason) => {
-            debug!(target: "capture::udp", ?reason, %outer_dst, "udp session rejected");
+            trace!(target: "capture::udp", ?reason, %outer_dst, "udp session rejected");
             None
         }
     }
@@ -257,7 +257,7 @@ async fn transmit_datagram(
         };
     let length = payload.len();
     if is_new_destination && !session.socket.supports_multi_target() {
-        debug!(
+        trace!(
             target: "capture::udp",
             src = %inner_src,
             dst = %outer_dst,
@@ -318,7 +318,7 @@ async fn run_udp_dial_worker(
     inner_src: SocketAddr,
     outer_dst: SocketAddr,
 ) {
-    debug!(
+    trace!(
         target: "capture::udp",
         network = "udp",
         src = %inner_src,
@@ -365,9 +365,9 @@ async fn run_udp_dial_worker(
             .destination(outer_dst)
             .expect("initial UDP destination must be registered");
         if let Some(b) = session_meta.bypass {
-            info!(target: "capture::traffic", "[UDP] #{id} {src} --> {host}:{port} (bypass: {b:?})");
+            trace!(target: "capture::traffic", "[UDP] #{id} {src} --> {host}:{port} (bypass: {b:?})");
         } else {
-            info!(target: "capture::traffic", "[UDP] #{id} {src} --> {host}:{port}");
+            trace!(target: "capture::traffic", "[UDP] #{id} {src} --> {host}:{port}");
         }
     }
 
@@ -465,7 +465,7 @@ fn spawn_udp_reverse_loop(
                     let Some(logical_source) =
                         session_for_loop.logical_response_source(transport_source)
                     else {
-                        debug!(
+                        trace!(
                             target: "capture::udp",
                             ?transport_source,
                             destinations = session_for_loop.destination_count(),
@@ -505,7 +505,7 @@ fn spawn_udp_reverse_loop(
         metrics.dec_connection();
         let up_s = crate::tun_pump::format_bytes(up);
         let down_s = crate::tun_pump::format_bytes(down);
-        info!(
+        trace!(
             target: "capture::traffic",
             "[UDP] #{id} {inner_src} closed | up {up_s} down {down_s}"
         );

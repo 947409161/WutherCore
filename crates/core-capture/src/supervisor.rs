@@ -766,7 +766,7 @@ impl CaptureSupervisor {
                         event = rx.recv() => {
                             let Some(evt) = event else { break };
                             if !sup.allow_ip(evt.original_dst.ip()) {
-                                tracing::debug!(
+                                tracing::trace!(
                                     target: "capture::dispatch",
                                     ip = %evt.original_dst.ip(),
                                     "skipped by route rules / loopback / ipset"
@@ -796,7 +796,7 @@ impl CaptureSupervisor {
                                 continue;
                             }
                             let host = target.host;
-                            debug!(
+                            tracing::trace!(
                                 target: "capture::dispatch",
                                 host = %host,
                                 port = evt.original_dst.port(),

@@ -829,7 +829,7 @@ impl TlsTransport {
                     return Err(error);
                 }
             };
-        tracing::info!(
+        tracing::debug!(
             target: "dial::tls",
             %host, port,
             sni = %sni_str,

@@ -518,7 +518,9 @@ async fn cmd_ruleset(action: RulesetCmd) -> anyhow::Result<()> {
                 "yaml" | "yml" => core_ruleset::rrs::entries_to_yaml(&entries).into_bytes(),
                 "txt" | "list" | "text" => core_ruleset::rrs::entries_to_txt(&entries).into_bytes(),
                 "json" | "singbox" | "sing-box" => {
-                    core_ruleset::rrs::entries_to_singbox_json(&entries).into_bytes()
+                    core_ruleset::rrs::entries_to_singbox_json(&entries)
+                        .map_err(anyhow::Error::msg)?
+                        .into_bytes()
                 }
                 other => {
                     anyhow::bail!("不支持的输出格式 \"{other}\"；支持：yaml / txt / json / rrs")
@@ -1736,15 +1738,6 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
             .await
             .context("运行时出站配置构建失败")?,
     );
-    // XHTTP 的证书/ALPN 与 TCP/UDP socket 必须在宣告进程启动前全部准备完成。
-    // 任何一项失败都会关闭已启动的同类监听并直接返回 cmd_run。
-    #[cfg(feature = "with_xhttp")]
-    let mut xhttp_listener_handles =
-        start_configured_xhttp_inbounds(&plan, runtime.clone()).await?;
-    #[cfg(feature = "with_shadowsocks")]
-    let mut shadowsocks_listener_handles =
-        start_configured_shadowsocks_inbounds(&plan, runtime.clone()).await?;
-
     // 把运行期 LogBus 挂到 tracing 桥上 —— 让 /v1/logs 与 Clash 兼容 /logs WS
     // 流式输出。tracing 可能已被早期初始化占用，所以 observe 层使用可后挂载的
     // bus sink，而不是依赖第二次 try_init。
@@ -1760,19 +1753,40 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
         let cache_dir = std::path::PathBuf::from("data/ruleset");
         let mgr = RulesetManager::new(specs, Some(cache_dir.clone()), ruleset_index.clone());
         runtime.set_ruleset_manager(mgr.clone());
-        mgr.clone().start();
         if count == 0 {
             info!(target: "ruleset", "no route.sets configured; manager idle");
         } else {
+            let report = mgr.refresh_all().await;
+            if !report.failed.is_empty() {
+                warn!(
+                    target: "ruleset",
+                    failed = report.failed.len(),
+                    errors = ?report.failed,
+                    "ruleset bootstrap completed with unavailable providers"
+                );
+            }
+            mgr.clone().start_periodic();
             info!(
                 target: "ruleset",
                 count,
                 cache_dir = %cache_dir.display(),
-                "ruleset manager started (initial fetch + periodic refresh in background)"
+                ready = report.updated.len(),
+                failed = report.failed.len(),
+                "ruleset manager bootstrap completed; periodic refresh started"
             );
         }
         mgr
     };
+
+    // Start traffic-facing sockets only after route providers have reached a
+    // terminal initial state, so the first accepted flow cannot bypass a
+    // still-pending MRS/RULE-SET.
+    #[cfg(feature = "with_xhttp")]
+    let mut xhttp_listener_handles =
+        start_configured_xhttp_inbounds(&plan, runtime.clone()).await?;
+    #[cfg(feature = "with_shadowsocks")]
+    let mut shadowsocks_listener_handles =
+        start_configured_shadowsocks_inbounds(&plan, runtime.clone()).await?;
 
     // URLTest：默认每分钟周期探测全部出站（DIRECT/BLOCK 跳过）。
     let urltest = UrlTester::new(UrlTestConfig::default());

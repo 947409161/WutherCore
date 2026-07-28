@@ -344,6 +344,9 @@ pub struct RoutePlan {
     pub r#final: String,
     /// 编译后的规则；preset 已经展开为 steps。
     pub steps: Vec<RouteStep>,
+    /// Compiled Mihomo `sub-rules`, evaluated as ordered branches.
+    #[serde(default)]
+    pub sub_rules: BTreeMap<String, Vec<RouteStep>>,
     /// route.sets 原样保留，由 core-ruleset 接管。
     #[serde(default)]
     pub sets: BTreeMap<String, RuleSetSpec>,
@@ -355,6 +358,15 @@ pub struct RouteStep {
     pub action: RouteAction,
     /// 原始用户行，便于 explain 输出。
     pub source: String,
+    #[serde(default)]
+    pub options: RouteRuleOptions,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RouteRuleOptions {
+    pub no_resolve: bool,
+    pub no_log: bool,
+    pub no_track: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -376,21 +388,47 @@ pub enum RouteMatcher {
     Keyword(String),
     /// mihomo `DOMAIN-REGEX` —— regexp2 风格、大小写不敏感。
     DomainRegex(String),
+    /// mihomo `DOMAIN-WILDCARD` —— `*`/`?` 可跨标签匹配。
+    DomainWildcard(String),
+    /// GeoSite 数据通过同名外部 domain/MRS 规则集提供。
+    GeoSite(String),
     Cidr(String),
     /// mihomo `SRC-IP-CIDR`，只匹配连接源地址。
     SrcCidr(String),
+    /// 从 IP 地址末端开始比较前缀位数（mihomo `IP-SUFFIX`）。
+    IpSuffix(String),
+    SrcIpSuffix(String),
+    /// GeoIP / ASN 数据通过外部 ipcidr/MRS 规则集或已注入元数据匹配。
+    GeoIp(String),
+    SrcGeoIp(String),
+    IpAsn(u32),
+    SrcIpAsn(u32),
     Port(u16),
     /// `DST-PORT,LOW-HIGH` —— 闭区间端口范围。
     PortRange(u16, u16),
     /// mihomo `SRC-PORT`，只匹配连接源端口。
     SrcPort(u16),
     SrcPortRange(u16, u16),
+    InPort(u16),
+    InPortRange(u16, u16),
     Network(String),
+    Dscp(u8),
+    InUser(String),
+    InName(String),
+    InType(String),
+    Uid(u32),
+    RematchName(String),
     Process(String),
     /// mihomo `PROCESS-PATH`，完整路径精确匹配。
     ProcessPath(String),
+    ProcessRegex(String),
+    ProcessPathRegex(String),
+    ProcessWildcard(String),
+    ProcessPathWildcard(String),
     /// 外部规则集（`route.sets.<name>`）。
     Set(String),
+    /// mihomo `RULE-SET,...,src`：将 provider 的目标 IP 语义应用到源 IP。
+    SrcSet(String),
     /// L7 协议指纹（stun/dtls/quic/tls/sni/http/webrtc）。
     Proto(String),
     /// AND 组合 —— 所有子 matcher 都命中才算命中（短路求值）。
@@ -399,6 +437,11 @@ pub enum RouteMatcher {
     /// OR 组合 —— 任一子 matcher 命中即算命中（短路求值）。
     /// 由具名字段的列表值产生（如 `port: [53, 5353]`）。
     Or(Vec<RouteMatcher>),
+    /// NOT 组合 —— 子 matcher 的三态结果取反，延迟依赖保持不变。
+    Not(Box<RouteMatcher>),
+    /// 逻辑规则内部的 mihomo `no-resolve`。顶层规则仍同时保留在
+    /// [`RouteRuleOptions`]，以便 Clash API 展示该标志。
+    NoResolve(Box<RouteMatcher>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -407,6 +450,10 @@ pub enum RouteAction {
     Direct,
     Block,
     Group(String),
+    Pass,
+    PassRule,
+    /// Internal control-flow action used by Mihomo `SUB-RULE`.
+    SubRule(String),
 }
 
 /* ---------------- compile ---------------- */
@@ -3189,6 +3236,7 @@ fn compile_route(
         route.preset
     };
     let mut steps = Vec::new();
+    let sub_rule_names = route.sub_rules.keys().cloned().collect::<HashSet<_>>();
 
     let final_target = route.r#final.clone();
     if !groups.contains_key(&final_target) && final_target != "direct" && final_target != "block" {
@@ -3254,11 +3302,32 @@ fn compile_route(
 
     for entry in &route.steps {
         let entry_steps = match entry {
-            RouteStepEntry::Line(s) => parse_step_line(s, groups, &final_target)?,
+            RouteStepEntry::Line(s) => parse_step_line(s, groups, &sub_rule_names, &final_target)?,
             RouteStepEntry::Object(obj) => compile_object(obj, groups, &final_target)?,
         };
         steps.extend(entry_steps);
     }
+
+    let mut sub_rules = BTreeMap::new();
+    for (name, entries) in &route.sub_rules {
+        if name.trim().is_empty() {
+            return Err(ConfigError::bad_route("sub-rules 名称不能为空"));
+        }
+        let mut compiled = Vec::new();
+        for entry in entries {
+            let entry_steps = match entry {
+                RouteStepEntry::Line(line) => {
+                    parse_step_line(line, groups, &sub_rule_names, &final_target)
+                        .map_err(|error| error.at(format!("sub-rules.{name}")))?
+                }
+                RouteStepEntry::Object(object) => compile_object(object, groups, &final_target)
+                    .map_err(|error| error.at(format!("sub-rules.{name}")))?,
+            };
+            compiled.extend(entry_steps);
+        }
+        sub_rules.insert(name.clone(), compiled);
+    }
+    validate_sub_rule_graph(&sub_rules)?;
 
     if !steps.iter().any(|s| matches!(s.matcher, RouteMatcher::Any)) {
         steps.push(fallback.unwrap_or_else(|| {
@@ -3274,6 +3343,7 @@ fn compile_route(
         preset,
         r#final: final_target,
         steps,
+        sub_rules,
         sets,
     })
 }
@@ -3283,12 +3353,14 @@ fn rs(matcher: RouteMatcher, action: RouteAction, src: &str) -> RouteStep {
         matcher,
         action,
         source: src.into(),
+        options: RouteRuleOptions::default(),
     }
 }
 
 fn parse_step_line(
     line: &str,
     groups: &BTreeMap<String, GroupPlan>,
+    sub_rules: &HashSet<String>,
     final_target: &str,
 ) -> ConfigResult<Vec<RouteStep>> {
     // mihomo classical 字符串：`TYPE,VALUE[,POLICY[,no-resolve]]`，policy 内嵌而非
@@ -3296,8 +3368,13 @@ fn parse_step_line(
     // `->` 且首段是已知的 classical TYPE，把它就地改写成 `TYPE,VALUE -> POLICY` 形式
     // 复用统一的左/右两段拆分逻辑。
     if !line.contains("->") {
-        if let Some(rewritten) = try_classical_to_dsl(line) {
-            return parse_step_line(&rewritten, groups, final_target);
+        if let Some((rewritten, options)) = try_classical_to_dsl(line) {
+            let mut steps = parse_step_line(&rewritten, groups, sub_rules, final_target)?;
+            for step in &mut steps {
+                step.options = options;
+                step.source = line.into();
+            }
+            return Ok(steps);
         }
         return Err(
             ConfigError::bad_route(format!("规则缺少 -> : {line}")).hint(
@@ -3311,13 +3388,27 @@ fn parse_step_line(
         .ok_or_else(|| ConfigError::bad_route(format!("规则缺少 -> : {line}")))?;
     let lhs = lhs.trim();
     let rhs = rhs.trim();
+    let options = classical_rule_options(lhs);
 
     // 共享 LHS 解析（DSL `port:53` / classical `DST-PORT,53` / 别名 `sni:foo`...）。
     // 与 `compile_object` 的 `match` 字段同源，避免两套语法漂移。
     let matchers = parse_match_lhs(lhs)?;
 
-    let action =
-        resolve_action(rhs, groups, final_target).map_err(|e| e.at(format!("steps: {line}")))?;
+    let is_sub_rule = lhs
+        .split(',')
+        .next()
+        .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("SUB-RULE"));
+    let action = if is_sub_rule {
+        if !sub_rules.contains(rhs) {
+            return Err(
+                ConfigError::bad_route(format!("SUB-RULE 引用了未定义的 sub-rules.{rhs}"))
+                    .at(format!("steps: {line}")),
+            );
+        }
+        RouteAction::SubRule(rhs.into())
+    } else {
+        resolve_action(rhs, groups, final_target).map_err(|e| e.at(format!("steps: {line}")))?
+    };
 
     Ok(matchers
         .into_iter()
@@ -3325,8 +3416,44 @@ fn parse_step_line(
             matcher,
             action: action.clone(),
             source: line.into(),
+            options,
         })
         .collect())
+}
+
+fn validate_sub_rule_graph(sub_rules: &BTreeMap<String, Vec<RouteStep>>) -> ConfigResult<()> {
+    fn visit(
+        name: &str,
+        sub_rules: &BTreeMap<String, Vec<RouteStep>>,
+        visiting: &mut HashSet<String>,
+        visited: &mut HashSet<String>,
+    ) -> ConfigResult<()> {
+        if visited.contains(name) {
+            return Ok(());
+        }
+        if !visiting.insert(name.to_owned()) {
+            return Err(ConfigError::bad_route(format!(
+                "sub-rules 存在循环引用，回到 `{name}`"
+            )));
+        }
+        if let Some(steps) = sub_rules.get(name) {
+            for step in steps {
+                if let RouteAction::SubRule(target) = &step.action {
+                    visit(target, sub_rules, visiting, visited)?;
+                }
+            }
+        }
+        visiting.remove(name);
+        visited.insert(name.to_owned());
+        Ok(())
+    }
+
+    let mut visiting = HashSet::new();
+    let mut visited = HashSet::new();
+    for name in sub_rules.keys() {
+        visit(name, sub_rules, &mut visiting, &mut visited)?;
+    }
+    Ok(())
 }
 
 fn split_values(raw: &str) -> Vec<&str> {
@@ -3344,8 +3471,16 @@ fn resolve_action(
     final_target: &str,
 ) -> ConfigResult<RouteAction> {
     match rhs {
-        "direct" => Ok(RouteAction::Direct),
-        "block" => Ok(RouteAction::Block),
+        value if value.eq_ignore_ascii_case("direct") => Ok(RouteAction::Direct),
+        value
+            if value.eq_ignore_ascii_case("block")
+                || value.eq_ignore_ascii_case("reject")
+                || value.eq_ignore_ascii_case("reject-drop") =>
+        {
+            Ok(RouteAction::Block)
+        }
+        value if value.eq_ignore_ascii_case("pass") => Ok(RouteAction::Pass),
+        value if value.eq_ignore_ascii_case("pass-rule") => Ok(RouteAction::PassRule),
         // 兜底 final 时允许引用 `main` 作为分组名占位（preset 会自动注入）
         "main" if !groups.contains_key("main") && final_target == "main" => {
             Ok(RouteAction::Group("main".into()))
@@ -3379,10 +3514,12 @@ fn compile_object(
 
     let source = format_object_source(obj);
     let mut clauses: Vec<RouteMatcher> = Vec::new();
+    let mut inline_options = RouteRuleOptions::default();
 
     if let Some(m_str) = &obj.r#match {
         // 复用已有的 classical / DSL 解析路径；`match` 字段允许写 `DST-PORT,53`
         // 也可以是 `port:53`、`domain:foo.com` 等 WutherCore DSL（此处不带箭头）。
+        inline_options = classical_rule_options(m_str);
         clauses.extend(parse_match_lhs(m_str.trim())?);
     }
     if let Some(v) = &obj.domain {
@@ -3461,6 +3598,11 @@ fn compile_object(
         matcher: final_matcher,
         action,
         source,
+        options: RouteRuleOptions {
+            no_resolve: obj.no_resolve || inline_options.no_resolve,
+            no_log: obj.no_log || inline_options.no_log,
+            no_track: obj.no_track || inline_options.no_track,
+        },
     }])
 }
 
@@ -3506,6 +3648,21 @@ fn parse_match_lhs(lhs: &str) -> ConfigResult<Vec<RouteMatcher>> {
             .map(|v| {
                 validate_mihomo_domain_regex(v)?;
                 Ok(RouteMatcher::DomainRegex(v.into()))
+            })
+            .collect::<ConfigResult<Vec<_>>>()?,
+        s if s.starts_with("domain-keyword:") => split_values(&s[15..])
+            .into_iter()
+            .map(|v| RouteMatcher::Keyword(v.into()))
+            .collect(),
+        s if s.starts_with("keyword:") => split_values(&s[8..])
+            .into_iter()
+            .map(|v| RouteMatcher::Keyword(v.into()))
+            .collect(),
+        s if s.starts_with("domain-wildcard:") => split_values(&s[16..])
+            .into_iter()
+            .map(|v| {
+                validate_wildcard(v, "DOMAIN-WILDCARD")?;
+                Ok(RouteMatcher::DomainWildcard(v.into()))
             })
             .collect::<ConfigResult<Vec<_>>>()?,
         s if s.starts_with("suffix:") => split_values(&s[7..])
@@ -3624,15 +3781,38 @@ const CLASSICAL_TYPES: &[&str] = &[
     "DOMAIN-SUFFIX",
     "DOMAIN-KEYWORD",
     "DOMAIN-REGEX",
+    "DOMAIN-WILDCARD",
+    "GEOSITE",
+    "GEOIP",
+    "SRC-GEOIP",
+    "IP-ASN",
+    "SRC-IP-ASN",
     "IP-CIDR",
     "IP-CIDR6",
     "SRC-IP-CIDR",
+    "IP-SUFFIX",
+    "SRC-IP-SUFFIX",
     "SRC-PORT",
     "DST-PORT",
+    "IN-PORT",
+    "IN-TYPE",
+    "IN-USER",
+    "IN-NAME",
+    "DSCP",
+    "UID",
     "PROCESS-NAME",
     "PROCESS-PATH",
+    "PROCESS-NAME-REGEX",
+    "PROCESS-PATH-REGEX",
+    "PROCESS-NAME-WILDCARD",
+    "PROCESS-PATH-WILDCARD",
+    "REMATCH-NAME",
     "NETWORK",
     "RULE-SET",
+    "AND",
+    "OR",
+    "NOT",
+    "SUB-RULE",
     "MATCH",
 ];
 
@@ -3649,55 +3829,184 @@ fn is_classical_lhs(s: &str) -> bool {
 /// 解析 mihomo classical LHS（不含 `->` 与 policy）为 [`RouteMatcher`] 列表。
 /// 失败返回带 hint 的 [`ConfigError`]。
 fn parse_classical_lhs(lhs: &str) -> ConfigResult<Vec<RouteMatcher>> {
+    parse_classical_lhs_inner(lhs, false)
+}
+
+fn parse_classical_lhs_inner(
+    lhs: &str,
+    preserve_no_resolve: bool,
+) -> ConfigResult<Vec<RouteMatcher>> {
     if lhs.eq_ignore_ascii_case("MATCH") {
         return Ok(vec![RouteMatcher::Any]);
     }
-    let mut parts = lhs.split(',').map(str::trim);
-    let kind = parts.next().unwrap_or("");
-    let value = parts.next().unwrap_or("");
+    let parts = split_top_level_commas(lhs);
+    let kind = parts.first().copied().unwrap_or("");
+    let kind_uc = kind.to_ascii_uppercase();
+    if kind_uc == "SUB-RULE" {
+        if parts.len() != 2 {
+            return Err(ConfigError::bad_route(format!(
+                "SUB-RULE 必须包含一条括号包裹的条件: `{lhs}`"
+            )));
+        }
+        let payload = strip_one_parenthesis_pair(parts[1]).ok_or_else(|| {
+            ConfigError::bad_route(format!("SUB-RULE 条件需要外层括号: `{}`", parts[1]))
+        })?;
+        let mut matchers = parse_classical_lhs(payload)?;
+        if matchers.len() != 1 {
+            return Err(ConfigError::bad_route(format!(
+                "SUB-RULE 条件必须编译为单个 matcher: `{payload}`"
+            )));
+        }
+        return Ok(matchers.drain(..).collect());
+    }
+    if matches!(kind_uc.as_str(), "AND" | "OR" | "NOT") {
+        let value = parts.get(1).copied().unwrap_or("");
+        if value.is_empty() {
+            return Err(ConfigError::bad_route(format!(
+                "逻辑规则 `{kind_uc}` 缺少子规则: `{lhs}`"
+            )));
+        }
+        if parts.len() != 2 {
+            return Err(ConfigError::bad_route(format!(
+                "逻辑规则 `{kind_uc}` 含有多余字段: `{lhs}`"
+            )));
+        }
+        let children = parse_classical_logical_children(value)?;
+        let matcher = match kind_uc.as_str() {
+            "AND" if children.len() >= 2 => RouteMatcher::And(children),
+            "OR" if children.len() >= 2 => RouteMatcher::Or(children),
+            "NOT" if children.len() == 1 => {
+                RouteMatcher::Not(Box::new(children.into_iter().next().unwrap()))
+            }
+            "NOT" => {
+                return Err(ConfigError::bad_route("NOT 必须且只能包含一条子规则"));
+            }
+            _ => {
+                return Err(ConfigError::bad_route(format!(
+                    "{kind_uc} 至少需要两条子规则"
+                )));
+            }
+        };
+        return Ok(vec![matcher]);
+    }
+    let mut value_end = parts.len();
+    let mut source_modifier = false;
+    let mut no_resolve_modifier = false;
+    while value_end > 2 {
+        let option = parts[value_end - 1];
+        if option.eq_ignore_ascii_case("no-resolve") {
+            no_resolve_modifier = true;
+            value_end -= 1;
+            continue;
+        }
+        if option.eq_ignore_ascii_case("no-log") || option.eq_ignore_ascii_case("no-track") {
+            value_end -= 1;
+            continue;
+        }
+        if option.eq_ignore_ascii_case("src")
+            && matches!(
+                kind_uc.as_str(),
+                "IP-CIDR" | "IP-CIDR6" | "IP-SUFFIX" | "GEOIP" | "IP-ASN" | "RULE-SET"
+            )
+        {
+            source_modifier = true;
+            value_end -= 1;
+            continue;
+        }
+        break;
+    }
+    let value = parts.get(1..value_end).unwrap_or_default().join(",");
     if value.is_empty() {
         return Err(
             ConfigError::bad_route(format!("classical 规则缺少 value: `{lhs}`"))
                 .hint("形如 `DOMAIN-SUFFIX,example.com` 或 `DST-PORT,53`"),
         );
     }
-
-    let kind_uc = kind.to_ascii_uppercase();
-    let mut source_modifier = false;
-    for option in parts {
+    for option in parts.iter().skip(value_end) {
         if option.eq_ignore_ascii_case("no-resolve")
-            && matches!(kind_uc.as_str(), "IP-CIDR" | "IP-CIDR6" | "SRC-IP-CIDR")
+            || option.eq_ignore_ascii_case("no-log")
+            || option.eq_ignore_ascii_case("no-track")
+            || (option.eq_ignore_ascii_case("src") && source_modifier)
         {
-            continue;
-        }
-        if option.eq_ignore_ascii_case("src") && matches!(kind_uc.as_str(), "IP-CIDR" | "IP-CIDR6")
-        {
-            source_modifier = true;
             continue;
         }
         return Err(ConfigError::bad_route(format!(
             "classical 规则 `{kind_uc}` 的附加字段 `{option}` 不受支持"
         )));
     }
+    if no_resolve_modifier
+        && !matches!(
+            kind_uc.as_str(),
+            "IP-CIDR" | "IP-CIDR6" | "IP-SUFFIX" | "GEOIP" | "IP-ASN" | "RULE-SET"
+        )
+    {
+        return Err(ConfigError::bad_route(format!(
+            "`no-resolve` 只能用于目标 IP 规则，不能用于 `{kind_uc}`"
+        )));
+    }
     let m = match kind_uc.as_str() {
-        "DOMAIN" => RouteMatcher::Domain(value.into()),
-        "DOMAIN-SUFFIX" => RouteMatcher::Suffix(value.into()),
-        "DOMAIN-KEYWORD" => RouteMatcher::Keyword(value.into()),
+        "DOMAIN" => RouteMatcher::Domain(value),
+        "DOMAIN-SUFFIX" => RouteMatcher::Suffix(value),
+        "DOMAIN-KEYWORD" => RouteMatcher::Keyword(value),
         "DOMAIN-REGEX" => {
-            validate_mihomo_domain_regex(value)?;
-            RouteMatcher::DomainRegex(value.into())
+            validate_mihomo_domain_regex(&value)?;
+            RouteMatcher::DomainRegex(value)
         }
+        "DOMAIN-WILDCARD" => {
+            validate_wildcard(&value, "DOMAIN-WILDCARD")?;
+            RouteMatcher::DomainWildcard(value)
+        }
+        "GEOSITE" => RouteMatcher::GeoSite(value),
+        "GEOIP" if source_modifier => RouteMatcher::SrcGeoIp(value),
+        "GEOIP" => RouteMatcher::GeoIp(value),
+        "SRC-GEOIP" => RouteMatcher::SrcGeoIp(value),
+        "IP-ASN" if source_modifier => RouteMatcher::SrcIpAsn(parse_asn(&value)?),
+        "IP-ASN" => RouteMatcher::IpAsn(parse_asn(&value)?),
+        "SRC-IP-ASN" => RouteMatcher::SrcIpAsn(parse_asn(&value)?),
         "IP-CIDR" | "IP-CIDR6" if source_modifier => {
-            RouteMatcher::SrcCidr(normalize_classical_cidr(value)?)
+            RouteMatcher::SrcCidr(normalize_classical_cidr(&value)?)
         }
-        "IP-CIDR" | "IP-CIDR6" => RouteMatcher::Cidr(normalize_classical_cidr(value)?),
-        "SRC-IP-CIDR" => RouteMatcher::SrcCidr(normalize_classical_cidr(value)?),
-        "SRC-PORT" => parse_classical_source_port(value)?,
-        "DST-PORT" => parse_classical_port(value)?,
-        "PROCESS-NAME" => RouteMatcher::Process(value.into()),
-        "PROCESS-PATH" => RouteMatcher::ProcessPath(value.into()),
-        "NETWORK" => RouteMatcher::Network(value.into()),
-        "RULE-SET" => RouteMatcher::Set(value.into()),
+        "IP-CIDR" | "IP-CIDR6" => RouteMatcher::Cidr(normalize_classical_cidr(&value)?),
+        "SRC-IP-CIDR" => RouteMatcher::SrcCidr(normalize_classical_cidr(&value)?),
+        "IP-SUFFIX" if source_modifier => {
+            RouteMatcher::SrcIpSuffix(normalize_classical_ip_suffix(&value)?)
+        }
+        "IP-SUFFIX" => RouteMatcher::IpSuffix(normalize_classical_ip_suffix(&value)?),
+        "SRC-IP-SUFFIX" => RouteMatcher::SrcIpSuffix(normalize_classical_ip_suffix(&value)?),
+        "SRC-PORT" => parse_classical_source_port(&value)?,
+        "DST-PORT" => parse_classical_port(&value)?,
+        "IN-PORT" => parse_classical_in_port(&value)?,
+        "IN-TYPE" => RouteMatcher::InType(value),
+        "IN-USER" => RouteMatcher::InUser(value),
+        "IN-NAME" => RouteMatcher::InName(value),
+        "DSCP" => RouteMatcher::Dscp(parse_u8_rule_value(&value, "DSCP")?),
+        "UID" => RouteMatcher::Uid(
+            value
+                .parse()
+                .map_err(|_| ConfigError::bad_route(format!("非法 UID: `{value}`")))?,
+        ),
+        "PROCESS-NAME" => RouteMatcher::Process(value),
+        "PROCESS-PATH" => RouteMatcher::ProcessPath(value),
+        "PROCESS-NAME-REGEX" => {
+            validate_regex(&value, "PROCESS-NAME-REGEX")?;
+            RouteMatcher::ProcessRegex(value)
+        }
+        "PROCESS-PATH-REGEX" => {
+            validate_regex(&value, "PROCESS-PATH-REGEX")?;
+            RouteMatcher::ProcessPathRegex(value)
+        }
+        "PROCESS-NAME-WILDCARD" => {
+            validate_wildcard(&value, "PROCESS-NAME-WILDCARD")?;
+            RouteMatcher::ProcessWildcard(value)
+        }
+        "PROCESS-PATH-WILDCARD" => {
+            validate_wildcard(&value, "PROCESS-PATH-WILDCARD")?;
+            RouteMatcher::ProcessPathWildcard(value)
+        }
+        "REMATCH-NAME" => RouteMatcher::RematchName(value),
+        "NETWORK" => RouteMatcher::Network(value),
+        "RULE-SET" if source_modifier => RouteMatcher::SrcSet(value),
+        "RULE-SET" => RouteMatcher::Set(value),
         other => {
             return Err(
                 ConfigError::bad_route(format!("未知 classical TYPE: `{other}`"))
@@ -3705,7 +4014,130 @@ fn parse_classical_lhs(lhs: &str) -> ConfigResult<Vec<RouteMatcher>> {
             );
         }
     };
-    Ok(vec![m])
+    if preserve_no_resolve && no_resolve_modifier {
+        Ok(vec![RouteMatcher::NoResolve(Box::new(m))])
+    } else {
+        Ok(vec![m])
+    }
+}
+
+fn split_top_level_commas(value: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut escaped = false;
+    for (index, ch) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        match ch {
+            '(' => depth = depth.saturating_add(1),
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                out.push(value[start..index].trim());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(value[start..].trim());
+    out
+}
+
+fn strip_one_parenthesis_pair(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if !value.starts_with('(') || !value.ends_with(')') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut escaped = false;
+    for (index, ch) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 && index + ch.len_utf8() != value.len() {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    (depth == 0).then(|| &value[1..value.len() - 1])
+}
+
+fn parse_classical_logical_children(value: &str) -> ConfigResult<Vec<RouteMatcher>> {
+    let inner = strip_one_parenthesis_pair(value).ok_or_else(|| {
+        ConfigError::bad_route(format!("逻辑规则需要外层括号: `{value}`"))
+            .hint("例如 AND,((DOMAIN,example.com),(NETWORK,TCP))")
+    })?;
+    let mut children = Vec::new();
+    for raw in split_top_level_commas(inner) {
+        let child = strip_one_parenthesis_pair(raw)
+            .ok_or_else(|| ConfigError::bad_route(format!("逻辑子规则需要括号: `{raw}`")))?;
+        let parsed = parse_classical_lhs_inner(child, true)?;
+        if parsed.len() != 1 {
+            return Err(ConfigError::bad_route(format!(
+                "逻辑子规则必须编译为单个 matcher: `{child}`"
+            )));
+        }
+        children.push(parsed.into_iter().next().unwrap());
+    }
+    Ok(children)
+}
+
+fn validate_wildcard(pattern: &str, kind: &str) -> ConfigResult<()> {
+    if pattern.is_empty() {
+        return Err(ConfigError::bad_route(format!("{kind} 不能为空")));
+    }
+    if pattern.contains(['[', ']', '{', '}']) {
+        return Err(ConfigError::bad_route(format!(
+            "{kind} 只支持 `*` 和 `?` 通配符: `{pattern}`"
+        )));
+    }
+    let mut builder = globset::GlobBuilder::new(pattern);
+    builder
+        .case_insensitive(true)
+        .literal_separator(false)
+        .backslash_escape(true);
+    builder
+        .build()
+        .map(|_| ())
+        .map_err(|error| ConfigError::bad_route(format!("非法 {kind} `{pattern}`: {error}")))
+}
+
+fn validate_regex(pattern: &str, kind: &str) -> ConfigResult<()> {
+    regex::Regex::new(pattern)
+        .map(|_| ())
+        .map_err(|error| ConfigError::bad_route(format!("非法 {kind} `{pattern}`: {error}")))
+}
+
+fn parse_asn(value: &str) -> ConfigResult<u32> {
+    value
+        .trim()
+        .trim_start_matches(|ch: char| ch == 'A' || ch == 'a')
+        .trim_start_matches(|ch: char| ch == 'S' || ch == 's')
+        .parse()
+        .map_err(|_| ConfigError::bad_route(format!("非法 ASN: `{value}`")))
+}
+
+fn parse_u8_rule_value(value: &str, kind: &str) -> ConfigResult<u8> {
+    value
+        .parse()
+        .map_err(|_| ConfigError::bad_route(format!("非法 {kind}: `{value}`")))
 }
 
 fn normalize_classical_cidr(value: &str) -> ConfigResult<String> {
@@ -3720,6 +4152,27 @@ fn normalize_classical_cidr(value: &str) -> ConfigResult<String> {
         });
     }
     Err(ConfigError::bad_route(format!("非法 IP/CIDR: `{value}`")))
+}
+
+fn normalize_classical_ip_suffix(value: &str) -> ConfigResult<String> {
+    let (address, bits) = value
+        .trim()
+        .split_once('/')
+        .ok_or_else(|| ConfigError::bad_route(format!("IP-SUFFIX 缺少位数: `{value}`")))?;
+    let address: IpAddr = address
+        .parse()
+        .map_err(|_| ConfigError::bad_route(format!("非法 IP-SUFFIX 地址: `{value}`")))?;
+    let bits: u8 = bits
+        .parse()
+        .map_err(|_| ConfigError::bad_route(format!("非法 IP-SUFFIX 位数: `{value}`")))?;
+    let maximum = if address.is_ipv4() { 32 } else { 128 };
+    if bits > maximum {
+        return Err(ConfigError::bad_route(format!(
+            "IP-SUFFIX 位数超过 IPv{} 上限: `{value}`",
+            if address.is_ipv4() { 4 } else { 6 }
+        )));
+    }
+    Ok(format!("{address}/{bits}"))
 }
 
 fn validate_mihomo_domain_regex(pattern: &str) -> ConfigResult<()> {
@@ -3737,6 +4190,18 @@ fn validate_mihomo_domain_regex(pattern: &str) -> ConfigResult<()> {
 
 /// 解析 `DST-PORT,53` 中的 value：单端口或 `LOW-HIGH` 闭区间。
 fn parse_classical_port(value: &str) -> ConfigResult<RouteMatcher> {
+    let parts = value
+        .split(['/', ','])
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() > 1 {
+        return parts
+            .into_iter()
+            .map(parse_classical_port)
+            .collect::<ConfigResult<Vec<_>>>()
+            .map(RouteMatcher::Or);
+    }
     if let Some((lo, hi)) = value.split_once('-') {
         let lo: u16 = lo
             .trim()
@@ -3761,19 +4226,58 @@ fn parse_classical_port(value: &str) -> ConfigResult<RouteMatcher> {
 }
 
 fn parse_classical_source_port(value: &str) -> ConfigResult<RouteMatcher> {
-    Ok(match parse_classical_port(value)? {
-        RouteMatcher::Port(port) => RouteMatcher::SrcPort(port),
-        RouteMatcher::PortRange(lo, hi) => RouteMatcher::SrcPortRange(lo, hi),
-        _ => unreachable!("parse_classical_port only returns destination port matchers"),
-    })
+    Ok(map_port_matcher(parse_classical_port(value)?, true))
+}
+
+fn parse_classical_in_port(value: &str) -> ConfigResult<RouteMatcher> {
+    Ok(map_in_port_matcher(parse_classical_port(value)?))
+}
+
+fn map_port_matcher(matcher: RouteMatcher, source: bool) -> RouteMatcher {
+    match matcher {
+        RouteMatcher::Port(port) if source => RouteMatcher::SrcPort(port),
+        RouteMatcher::PortRange(lo, hi) if source => RouteMatcher::SrcPortRange(lo, hi),
+        RouteMatcher::Or(parts) => RouteMatcher::Or(
+            parts
+                .into_iter()
+                .map(|part| map_port_matcher(part, source))
+                .collect(),
+        ),
+        matcher => matcher,
+    }
+}
+
+fn map_in_port_matcher(matcher: RouteMatcher) -> RouteMatcher {
+    match matcher {
+        RouteMatcher::Port(port) => RouteMatcher::InPort(port),
+        RouteMatcher::PortRange(lo, hi) => RouteMatcher::InPortRange(lo, hi),
+        RouteMatcher::Or(parts) => {
+            RouteMatcher::Or(parts.into_iter().map(map_in_port_matcher).collect())
+        }
+        matcher => matcher,
+    }
 }
 
 /// 把 mihomo classical 三段式 `TYPE,VALUE,POLICY[,FLAG]` 改写为 WutherCore 的统一
 /// 箭头形式 `TYPE,VALUE -> POLICY`。`MATCH,POLICY` 也走这条路。
 ///
-/// 已知 flag（如 `no-resolve`）在 WutherCore 不需要——本项目所有 IP 规则解析后再匹配，
-/// 在此默默丢弃，不报错（mihomo 也仅把它当作不强制 DNS 解析的提示）。
-fn try_classical_to_dsl(line: &str) -> Option<String> {
+/// 已知 flag 会写入 [`RouteRuleOptions`]。其中 `no-resolve` 会直接改变按序路由的
+/// DNS 延迟解析行为；如果它出现在逻辑子规则中，还会保留为 matcher 修饰节点。
+fn classical_rule_options(lhs: &str) -> RouteRuleOptions {
+    let mut options = RouteRuleOptions::default();
+    for option in split_top_level_commas(lhs).into_iter().skip(2) {
+        if option.eq_ignore_ascii_case("no-resolve") {
+            options.no_resolve = true;
+        } else if option.eq_ignore_ascii_case("no-log") {
+            options.no_log = true;
+        } else if option.eq_ignore_ascii_case("no-track") {
+            options.no_track = true;
+        }
+    }
+    options
+}
+
+fn try_classical_to_dsl(line: &str) -> Option<(String, RouteRuleOptions)> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return None;
@@ -3786,11 +4290,21 @@ fn try_classical_to_dsl(line: &str) -> Option<String> {
     }
 
     // 拆出 policy（最后一段或倒数第二段，取决于有无 no-resolve flag）
-    let parts: Vec<&str> = trimmed.split(',').map(str::trim).collect();
+    let parts = split_top_level_commas(trimmed);
+    let mut options = RouteRuleOptions::default();
     let (lhs_parts, policy) = if head.eq_ignore_ascii_case("MATCH") {
         // MATCH,POLICY  →  lhs=MATCH, policy=parts[1]
         if parts.len() < 2 {
             return None;
+        }
+        for option in parts.iter().skip(2) {
+            if option.eq_ignore_ascii_case("no-log") {
+                options.no_log = true;
+            } else if option.eq_ignore_ascii_case("no-track") {
+                options.no_track = true;
+            } else {
+                return None;
+            }
         }
         (vec!["MATCH"], parts[1])
     } else {
@@ -3801,24 +4315,31 @@ fn try_classical_to_dsl(line: &str) -> Option<String> {
             return None;
         }
         // 末段若是 no-resolve / src 之类的 flag，往前挪一段当 policy
-        let policy_idx = if matches!(
-            parts
-                .last()
-                .copied()
-                .unwrap_or("")
-                .to_ascii_lowercase()
-                .as_str(),
-            "no-resolve" | "src"
-        ) {
-            parts.len() - 2
-        } else {
-            parts.len() - 1
-        };
-        let lhs_slice = &parts[..policy_idx];
-        (lhs_slice.to_vec(), parts[policy_idx])
+        let mut policy_idx = parts.len() - 1;
+        let mut source_modifier = false;
+        while policy_idx > 1 {
+            let option = parts[policy_idx];
+            if option.eq_ignore_ascii_case("no-resolve") {
+                options.no_resolve = true;
+            } else if option.eq_ignore_ascii_case("no-log") {
+                options.no_log = true;
+            } else if option.eq_ignore_ascii_case("no-track") {
+                options.no_track = true;
+            } else if option.eq_ignore_ascii_case("src") {
+                source_modifier = true;
+            } else {
+                break;
+            }
+            policy_idx -= 1;
+        }
+        let mut lhs = parts[..policy_idx].to_vec();
+        if source_modifier {
+            lhs.push("src");
+        }
+        (lhs, parts[policy_idx])
     };
 
-    Some(format!("{} -> {}", lhs_parts.join(","), policy))
+    Some((format!("{} -> {}", lhs_parts.join(","), policy), options))
 }
 
 /// 非本机 API 面板暴露时必须配置 `ui.secret`，避免空 secret 的全开控制面。
@@ -5801,8 +6322,7 @@ route:
                 .iter()
                 .any(|m| matches!(m, RouteMatcher::Keyword(k) if k == "google"))
         );
-        // 两条 IP-CIDR：第二条尾部 `no-resolve` 在 mapping 形式下不会触发解析路径
-        // （outbound 已显式给出），但写出来不应该出错。
+        // 两条 IP-CIDR：第二条尾部 `no-resolve` 必须保留到规则选项。
         assert_eq!(
             kinds
                 .iter()
@@ -5810,11 +6330,15 @@ route:
                 .count(),
             2
         );
+        assert!(plan.route.steps.iter().any(|step| {
+            matches!(&step.matcher, RouteMatcher::Cidr(c) if c == "4.4.4.0/24")
+                && step.options.no_resolve
+        }));
     }
 
-    /// `no-resolve` flag 在内嵌 policy 的 string 形式里要被识别并丢弃。
+    /// `no-resolve` flag 在内嵌 policy 的 string 形式里要被识别并保留。
     #[test]
-    fn route_step_classical_string_form_strips_no_resolve_flag() {
+    fn route_step_classical_string_form_preserves_no_resolve_flag() {
         let plan = compile_cfg(
             r#"
 version: 1
@@ -5839,6 +6363,27 @@ route:
             .find(|s| matches!(s.matcher, RouteMatcher::Cidr(ref c) if c == "5.5.5.0/24"))
             .expect("IP-CIDR with no-resolve flag 应被解析");
         assert!(matches!(cidr.action, RouteAction::Direct));
+        assert!(cidr.options.no_resolve);
+    }
+
+    #[test]
+    fn logical_child_preserves_no_resolve_modifier() {
+        let matcher = parse_classical_lhs("AND,((IP-CIDR,1.1.1.0/24,no-resolve),(NETWORK,tcp))")
+            .unwrap()
+            .pop()
+            .unwrap();
+        let RouteMatcher::And(children) = matcher else {
+            panic!("expected AND matcher");
+        };
+        assert!(matches!(
+            &children[0],
+            RouteMatcher::NoResolve(child)
+                if matches!(child.as_ref(), RouteMatcher::Cidr(cidr) if cidr == "1.1.1.0/24")
+        ));
+        assert!(
+            parse_classical_lhs("DOMAIN,example.com,no-resolve").is_err(),
+            "no-resolve must be rejected for non target-IP rules"
+        );
     }
 
     /// 用户报的最直接形式：typed-key shorthand `{port: 53, outbound: ...}`
@@ -5953,6 +6498,92 @@ route:
             m.iter()
                 .any(|x| matches!(x, RouteMatcher::Proto(p) if p == "quic"))
         );
+    }
+
+    #[test]
+    fn mihomo_complete_rule_surface_and_sub_rules_compile() {
+        let plan = compile_cfg(
+            r#"
+version: 1
+profile: desktop
+nodes: ["ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@1.2.3.4:8388#HK"]
+groups:
+  main: {choose: smart, use: [nodes]}
+route:
+  preset: custom
+  final: main
+  sets:
+    provider: {payload: ["DOMAIN-SUFFIX,provider.example"]}
+  sub-rules:
+    tcp-branch:
+      - "DOMAIN-SUFFIX,sub.example,DIRECT"
+  steps:
+    - "DOMAIN,exact.example,DIRECT"
+    - "DOMAIN-SUFFIX,suffix.example,DIRECT"
+    - "DOMAIN-KEYWORD,keyword,DIRECT"
+    - "DOMAIN-WILDCARD,*.wild.example,DIRECT"
+    - "DOMAIN-REGEX,^api[0-9]+\\.example$,DIRECT"
+    - "GEOSITE,cn,DIRECT"
+    - "GEOIP,CN,DIRECT"
+    - "SRC-GEOIP,CN,DIRECT"
+    - "IP-CIDR,10.0.0.0/8,DIRECT"
+    - "SRC-IP-CIDR,192.168.0.0/16,DIRECT"
+    - "IP-SUFFIX,8.8.8.8/24,DIRECT"
+    - "SRC-IP-SUFFIX,192.168.1.1/16,DIRECT"
+    - "IP-ASN,13335,DIRECT"
+    - "SRC-IP-ASN,9808,DIRECT"
+    - "DST-PORT,80/443,DIRECT"
+    - "SRC-PORT,1000-2000,DIRECT"
+    - "IN-PORT,7890,DIRECT"
+    - "IN-TYPE,SOCKS/HTTP,DIRECT"
+    - "IN-USER,user,DIRECT"
+    - "IN-NAME,mixed-in,DIRECT"
+    - "PROCESS-NAME,curl,DIRECT"
+    - "PROCESS-PATH,/usr/bin/curl,DIRECT"
+    - "PROCESS-NAME-WILDCARD,*curl*,DIRECT"
+    - "PROCESS-PATH-WILDCARD,/usr/*/curl,DIRECT"
+    - "PROCESS-NAME-REGEX,curl$,DIRECT"
+    - "PROCESS-PATH-REGEX,.*bin/curl,DIRECT"
+    - "UID,1000,DIRECT"
+    - "NETWORK,udp,DIRECT"
+    - "DSCP,4,DIRECT"
+    - "REMATCH-NAME,dns,DIRECT"
+    - "RULE-SET,provider,DIRECT"
+    - "AND,((DOMAIN,logic.example),(NETWORK,TCP)),DIRECT"
+    - "OR,((DST-PORT,53),(DST-PORT,853)),DIRECT"
+    - "NOT,((DOMAIN,blocked.example)),DIRECT"
+    - "SUB-RULE,(NETWORK,tcp),tcp-branch"
+    - "MATCH,main"
+"#,
+        );
+        assert!(plan.route.steps.len() >= 35);
+        assert!(plan.route.steps.iter().any(
+            |step| matches!(&step.action, RouteAction::SubRule(name) if name == "tcp-branch")
+        ));
+        assert_eq!(plan.route.sub_rules["tcp-branch"].len(), 1);
+    }
+
+    #[test]
+    fn sub_rule_cycle_is_rejected() {
+        let error = crate::loader::load_from_str(
+            r#"
+version: 1
+profile: desktop
+nodes: ["ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@1.2.3.4:8388#HK"]
+groups:
+  main: {choose: smart, use: [nodes]}
+route:
+  preset: custom
+  final: main
+  sub-rules:
+    a: ["SUB-RULE,(MATCH),b"]
+    b: ["SUB-RULE,(MATCH),a"]
+  steps:
+    - "SUB-RULE,(MATCH),a"
+"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("循环引用"));
     }
 
     /// mihomo 友好别名（hyphen 形式）应与 canonical 等价。

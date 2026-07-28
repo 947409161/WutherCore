@@ -4392,6 +4392,15 @@ pub struct Route {
     pub r#final: String,
     #[serde(default)]
     pub steps: Vec<RouteStepEntry>,
+    /// Mihomo `sub-rules` compatible named rule branches. A top-level
+    /// `SUB-RULE,(<condition>),<name>` jumps into one of these ordered lists.
+    #[serde(
+        default,
+        rename = "sub-rules",
+        alias = "sub_rules",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub sub_rules: BTreeMap<String, Vec<RouteStepEntry>>,
     /// 外部规则集 —— mihomo / sing-box / 自定义 payload。
     /// 在 `steps` 中通过 `set:<name> -> <action>` 引用。
     #[serde(default)]
@@ -4496,6 +4505,16 @@ pub struct RouteStepObject {
     /// L7 协议指纹（`tls` / `quic` / `stun` / `http` / `webrtc`...）。
     #[serde(default)]
     pub proto: Option<String>,
+
+    /// Do not resolve a domain solely to evaluate IP-based matchers.
+    #[serde(default, rename = "no-resolve", alias = "no_resolve")]
+    pub no_resolve: bool,
+    /// Suppress the routine rule-hit log.
+    #[serde(default, rename = "no-log", alias = "no_log")]
+    pub no_log: bool,
+    /// Keep matching flows out of the active connection table.
+    #[serde(default, rename = "no-track", alias = "no_track")]
+    pub no_track: bool,
 
     /// 出站 / 分组名 / `direct` / `block`。
     #[serde(alias = "proxy", alias = "target", alias = "action")]

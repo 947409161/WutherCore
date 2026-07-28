@@ -52,7 +52,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::oneshot,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::{
     tcp_nat::{NatSession, TcpNat},
@@ -1083,7 +1083,7 @@ async fn handle_accepted_conn(
     };
 
     if inbound.should_hijack_dns(original_dst) {
-        info!(
+        trace!(
             target: "capture::dns",
             family,
             nat_port,
@@ -1139,11 +1139,11 @@ async fn handle_accepted_conn(
         result.outbound.clone()
     };
     if result.rule.is_empty() {
-        info!(target: "capture::traffic", "[TCP] #{conn_id} {src_label} --> {host}:{port} using {proxy}");
+        trace!(target: "capture::traffic", "[TCP] #{conn_id} {src_label} --> {host}:{port} using {proxy}");
     } else if result.rule_payload.is_empty() {
-        info!(target: "capture::traffic", "[TCP] #{conn_id} {src_label} --> {host}:{port} match {} using {proxy}", result.rule);
+        trace!(target: "capture::traffic", "[TCP] #{conn_id} {src_label} --> {host}:{port} match {} using {proxy}", result.rule);
     } else {
-        info!(target: "capture::traffic", "[TCP] #{conn_id} {src_label} --> {host}:{port} match {}({}) using {proxy}", result.rule, result.rule_payload);
+        trace!(target: "capture::traffic", "[TCP] #{conn_id} {src_label} --> {host}:{port} match {}({}) using {proxy}", result.rule, result.rule_payload);
     }
 
     if !initial_payload.is_empty() {
@@ -1177,7 +1177,7 @@ async fn handle_accepted_conn(
     let up_s = crate::tun_pump::format_bytes(up);
     let down_s = crate::tun_pump::format_bytes(down);
     match &outcome {
-        Ok(_) => info!(
+        Ok(_) => trace!(
             target: "capture::traffic",
             "[TCP] #{conn_id} {src_label} --> {host}:{port} closed | up {up_s} down {down_s} | {elapsed_ms}ms"
         ),

@@ -29,7 +29,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.3.5"
+version = "0.3.6"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -83,6 +83,21 @@ compact_str = { version = "0.10", features = ["serde"] }
 smallvec = { version = "1", features = ["serde", "union", "const_generics", "const_new"] }
 # Arc 原子换页，给"连接表写入低频、快照读取高频"的场景做无锁切换。
 arc-swap = "1"
+# DOMAIN-KEYWORD 多模式自动机：一次扫描域名即可得到全部关键字命中，
+# 避免按规则逐条重复执行子串搜索。
+aho-corasick = "1"
+# Mihomo DOMAIN-WILDCARD / PROCESS-*-WILDCARD are compiled once into a
+# multi-pattern automaton instead of running an ad-hoc wildcard loop per flow.
+globset = "0.4"
+# Patricia/tree-bitmap prefix table for large classical CIDR providers.
+ip_network_table = "0.2"
+ip_network = "0.4"
+# UTS #46/IDNA normalization keeps Unicode configuration and punycode DNS
+# answers in one canonical comparison space.
+idna = "1"
+# 无锁 MPMC 队列用于把活跃流量会话和脏统计行送入后台批量持久化，
+# 避免每个数据块写数据库状态，也避免定时任务扫描全部历史分类。
+crossbeam-queue = "0.3"
 # O(1) sticky-session 淘汰，避免旧实现容量满时每次 O(n) 扫描最老项。
 lru = "0.16"
 # Mozilla Public Suffix List 的无分配静态实现，用于真实 registrable domain。

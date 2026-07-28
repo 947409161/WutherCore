@@ -785,7 +785,7 @@ async fn resolve_host_internal(
                     ));
                 }
                 let ips_str: Vec<String> = ips.iter().map(|i| i.to_string()).collect();
-                tracing::info!(
+                tracing::debug!(
                     target: "dial::resolve",
                     %host, port, for_direct,
                     count = ips.len(),
@@ -813,7 +813,7 @@ async fn resolve_host_internal(
     tracing::debug!(target: "dial::resolve", %host, port, for_direct, source = "system-getaddrinfo", "begin");
     let addrs = tokio::net::lookup_host((host, port)).await?;
     let collected: Vec<_> = addrs.collect();
-    tracing::info!(
+    tracing::debug!(
         target: "dial::resolve",
         %host, port, for_direct,
         count = collected.len(),

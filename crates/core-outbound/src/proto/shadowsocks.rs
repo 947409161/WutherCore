@@ -172,7 +172,7 @@ impl OutboundAdapter for ShadowsocksOutbound {
             &server,
             target,
         );
-        tracing::info!(
+        tracing::debug!(
             target: "dial::shadowsocks",
             id = ctx.dial_id,
             proxy = %self.name,
@@ -207,7 +207,7 @@ impl OutboundAdapter for ShadowsocksOutbound {
             &server,
             socket,
         );
-        tracing::info!(
+        tracing::debug!(
             target: "dial::shadowsocks",
             id = ctx.dial_id,
             proxy = %self.name,

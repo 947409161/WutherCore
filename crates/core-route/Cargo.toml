@@ -9,6 +9,10 @@ core-config  = { workspace = true }
 core-ruleset = { workspace = true }
 ipnet        = { workspace = true }
 ahash        = { workspace = true }
+aho-corasick = { workspace = true }
+globset      = { workspace = true }
+idna         = { workspace = true }
+arc-swap     = { workspace = true }
 once_cell    = { workspace = true }
 regex        = { workspace = true }
 fancy-regex  = { workspace = true }

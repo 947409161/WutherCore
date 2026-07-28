@@ -8,7 +8,7 @@ use tokio::{
     net::UdpSocket,
     sync::Mutex as AsyncMutex,
 };
-use tracing::{debug, info};
+use tracing::debug;
 
 use crate::{
     adapter::{
@@ -81,7 +81,7 @@ impl OutboundAdapter for Socks5Outbound {
         socks5_authenticate(&mut s, self.auth.as_ref()).await?;
         write_socks5_request(&mut s, 0x01, &ctx.host, ctx.port).await?;
         let _ = read_socks5_reply(&mut s, "CONNECT").await?;
-        info!(
+        debug!(
             target: "dial::socks5",
             id = ctx.dial_id,
             proxy = %self.name,
@@ -137,7 +137,7 @@ impl OutboundAdapter for Socks5Outbound {
         if let Ok(local) = sock.local_addr() {
             loopback_guard.observe_local_addr(local);
         }
-        info!(
+        debug!(
             target: "dial::socks5",
             id = ctx.dial_id,
             proxy = %self.name,

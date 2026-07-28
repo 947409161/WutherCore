@@ -4,6 +4,40 @@
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-07-29
+
+### Added
+
+- 直接路由完整支持 Mihomo 官方规则面，逻辑规则，`SUB-RULE`，`PASS`，
+  `PASS-RULE` 和按序 `no-resolve`；Classical provider 支持除 `RULE-SET`，
+  `SUB-RULE` 外的全部官方规则类型。
+- 域名匹配统一支持 IDNA，Unicode，Clash domain wildcard，Mihomo
+  `DOMAIN-WILDCARD`，regexp2 风格正则与 MRS domain trie。
+- RRS 升级至 v3，新增扩展 classical section，在保留 v1/v2 读取兼容的同时
+  无损保存新增规则类型和修饰符。
+- 新增多线程分片流量计数器、连接级流量批量归并、无锁脏会话与脏行队列。
+- 新增高并发流量累计、二十万级分类更新和两万活跃连接回归测试。
+
+### Changed
+
+- 流量持久化按变化增量提交，不再每两秒扫描全部历史分类；普通数据块不再逐项
+  更新全部持久分类。
+- 连接最大速率改为面板快照时采样，数据转发路径不再读取系统时钟、获取速率锁
+  或扫描十个时间桶。
+- TCP relay 缓冲区从每方向固定 32 KiB 改为 8 KiB 至 64 KiB 自适应，降低海量
+  空闲连接内存占用，同时保留大流量吞吐。
+- Clash `/connections` 的所有 WebSocket 客户端共享一个快照生产器，自定义
+  interval 只限制单客户端发送节奏；连接快照取消无意义的全表排序并直接序列化。
+- 连接、路由、协议握手和逐包诊断日志降为 debug 或 trace，默认 info 不再为每条
+  成功连接同步格式化和输出多条日志。
+
+### Fixed
+
+- 修复高吞吐时每个数据块争用速率锁、持久分类原子和全局流量缓存行导致的 CPU
+  占用、耗电与发热异常。
+- 修复历史流量分类增长后，即使没有新流量也会周期性全表扫描并持续消耗 CPU 的问题。
+- 修复多个带 interval 参数的 dashboard 各自重复构建完整连接快照的问题。
+
 ## [0.3.5] - 2026-07-29
 
 ### Added
@@ -106,7 +140,8 @@
 - 高危依赖变更会阻止 Pull Request 合并；
 - CodeQL 初次扫描告警由 [Issue #9](https://github.com/MiChongs/WutherCore/issues/9) 跟踪，未批量忽略。
 
-[Unreleased]: https://github.com/MiChongs/WutherCore/compare/v0.3.5...HEAD
+[Unreleased]: https://github.com/MiChongs/WutherCore/compare/v0.3.6...HEAD
+[0.3.6]: https://github.com/MiChongs/WutherCore/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/MiChongs/WutherCore/compare/v0.3.4...v0.3.5
 [0.3.3]: https://github.com/MiChongs/WutherCore/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/MiChongs/WutherCore/compare/v0.3.1...v0.3.2

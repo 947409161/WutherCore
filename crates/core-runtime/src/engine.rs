@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    net::IpAddr,
     pin::Pin,
     sync::{
         Arc,
@@ -22,7 +23,9 @@ use core_outbound::{
     registry::{OutboundRegistry, register_nodes},
 };
 use core_resolver::Resolver;
-use core_route::{FlowContext, NetworkKind, RouteDecision, RouteEngine};
+use core_route::{
+    DetailedRouteDecision, FlowContext, NetworkKind, RouteDecision, RouteEngine, RouteRuleHit,
+};
 use core_smart::SmartSelector;
 use core_store::{
     GroupPinBlob, Store,
@@ -30,7 +33,7 @@ use core_store::{
     store::BatchOp,
 };
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{debug, trace, warn};
 
 use crate::group_selector::{GroupPin, GroupSelector, ManualProbeToken, PinSource};
 
@@ -759,29 +762,60 @@ impl Runtime {
         // Clash `/configs` mode：rule 走规则；global 强制 route.final 组；direct 强制 DIRECT。
         // 未接线前 dashboard 改 mode 是假热改；这里让 mode 真正影响选路。
         let mode = self.mutable.read().mode.clone();
-        let (decision, kind, source) = match mode.to_ascii_lowercase().as_str() {
-            "direct" => (RouteDecision::Direct, "MODE", "mode:direct".into()),
-            "global" => (
-                global_mode_decision(&self.plan.route.r#final),
-                "MODE",
-                "mode:global".into(),
-            ),
-            _ => {
-                let (decision, kind, source) = self.route.decide(&ctx);
-                (decision, kind, source)
+        let route = match mode.to_ascii_lowercase().as_str() {
+            "direct" => DetailedRouteDecision {
+                decision: RouteDecision::Direct,
+                matcher: "mode",
+                hit: RouteRuleHit {
+                    index: None,
+                    rule: "MODE".into(),
+                    payload: "direct".into(),
+                    source: "mode:direct".into(),
+                    action: "DIRECT".into(),
+                    no_resolve: false,
+                    no_log: false,
+                    no_track: false,
+                },
+            },
+            "global" => {
+                let decision = global_mode_decision(&self.plan.route.r#final);
+                DetailedRouteDecision {
+                    hit: RouteRuleHit {
+                        index: None,
+                        rule: "MODE".into(),
+                        payload: "global".into(),
+                        source: "mode:global".into(),
+                        action: decision_action(&decision),
+                        no_resolve: false,
+                        no_log: false,
+                        no_track: false,
+                    },
+                    decision,
+                    matcher: "mode",
+                }
             }
+            _ => self.route.decide_detailed(&ctx),
         };
-        debug!(
-            target: "route",
-            host = %ctx.host,
-            port = ctx.port,
-            network = ctx.network.as_str(),
-            mode = %mode,
-            ?decision,
-            kind,
-            source = %source,
-            "rule hit"
-        );
+        let DetailedRouteDecision {
+            decision,
+            matcher: kind,
+            hit,
+        } = route;
+        if !hit.no_log {
+            debug!(
+                target: "route",
+                host = %ctx.host,
+                port = ctx.port,
+                network = ctx.network.as_str(),
+                mode = %mode,
+                ?decision,
+                kind,
+                rule = %hit.rule,
+                payload = %hit.payload,
+                source = %hit.source,
+                "rule hit"
+            );
+        }
 
         let (label, outbound) = match &decision {
             RouteDecision::Direct => ("DIRECT".into(), self.must_get("DIRECT")),
@@ -792,8 +826,44 @@ impl Runtime {
             decision,
             label,
             outbound,
-            rule: route_rule_name(kind).into(),
-            rule_payload: source,
+            rule: hit.rule,
+            rule_payload: hit.payload,
+            rule_index: hit.index,
+            rule_source: hit.source,
+            rule_action: hit.action,
+            no_log: hit.no_log,
+            no_track: hit.no_track,
+        }
+    }
+
+    /// Resolve a domain only when ordered route evaluation reaches a
+    /// destination-IP matcher. Domain-only plans stay entirely on the hot
+    /// in-memory path, while IP-CIDR/GEOIP/ipcidr-MRS get the same deferred
+    /// resolution semantics as mihomo.
+    async fn resolve_route_destination(&self, ctx: &mut FlowContext) {
+        if !self.route.needs_destination_ip(ctx) {
+            return;
+        }
+        match self.resolver.resolve(&ctx.host).await {
+            Ok(addresses) => {
+                if let Some(ip) = addresses.first().copied() {
+                    ctx.ip = Some(ip);
+                    trace!(
+                        target: "route",
+                        host = %ctx.host,
+                        %ip,
+                        "resolved destination for IP route rules"
+                    );
+                }
+            }
+            Err(error) => {
+                debug!(
+                    target: "route",
+                    host = %ctx.host,
+                    %error,
+                    "destination resolution failed; unresolved IP rules do not match"
+                );
+            }
         }
     }
 
@@ -897,14 +967,15 @@ impl Runtime {
         self.dial_with_context(ctx).await
     }
 
-    pub async fn dial_with_context(&self, ctx: FlowContext) -> std::io::Result<DialResult> {
+    pub async fn dial_with_context(&self, mut ctx: FlowContext) -> std::io::Result<DialResult> {
+        self.resolve_route_destination(&mut ctx).await;
         let dial_id = core_outbound::next_dial_id();
         let host = ctx.host.clone();
         let port = ctx.port;
         let network = ctx.network;
         let net_str = network.as_str();
         let started = Instant::now();
-        info!(
+        trace!(
             target: "dial",
             id = dial_id,
             %host, port, network = net_str,
@@ -914,7 +985,7 @@ impl Runtime {
         let mut last_err: Option<std::io::Error> = None;
         for attempt in 1..=DIAL_MAX_RETRIES {
             let pick = self.pick_outbound_for_context(ctx.clone());
-            info!(
+            trace!(
                 target: "dial",
                 id = dial_id,
                 attempt,
@@ -925,7 +996,7 @@ impl Runtime {
                 "route picked",
             );
             if matches!(pick.decision, RouteDecision::Block) {
-                info!(target: "dial", id = dial_id, attempt, %host, port, outbound = %pick.label, "blocked by rule");
+                debug!(target: "dial", id = dial_id, attempt, %host, port, outbound = %pick.label, "blocked by rule");
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::ConnectionAborted,
                     "blocked",
@@ -961,7 +1032,7 @@ impl Runtime {
             };
             match res {
                 Ok(stream) => {
-                    info!(
+                    trace!(
                         target: "dial",
                         id = dial_id,
                         attempt,
@@ -995,20 +1066,41 @@ impl Runtime {
                         smart_target,
                         rule: pick.rule,
                         rule_payload: pick.rule_payload,
+                        rule_index: pick.rule_index,
+                        rule_source: pick.rule_source,
+                        rule_action: pick.rule_action,
+                        route_ip: ctx.ip,
+                        no_log: pick.no_log,
+                        no_track: pick.no_track,
                     });
                 }
                 Err(e) => {
-                    warn!(
-                        target: "dial",
-                        id = dial_id,
-                        attempt,
-                        %host, port,
-                        outbound = %pick.label,
-                        dial_ms,
-                        total_ms = elapsed.as_millis() as u64,
-                        error = %e,
-                        "failed",
-                    );
+                    let retry = should_retry_dial(&pick, &e, network, attempt);
+                    if retry {
+                        debug!(
+                            target: "dial",
+                            id = dial_id,
+                            attempt,
+                            %host, port,
+                            outbound = %pick.label,
+                            dial_ms,
+                            total_ms = elapsed.as_millis() as u64,
+                            error = %e,
+                            "attempt failed",
+                        );
+                    } else {
+                        warn!(
+                            target: "dial",
+                            id = dial_id,
+                            attempt,
+                            %host, port,
+                            outbound = %pick.label,
+                            dial_ms,
+                            total_ms = elapsed.as_millis() as u64,
+                            error = %e,
+                            "failed",
+                        );
+                    }
                     if pick.label != "DIRECT" && pick.label != "BLOCK" {
                         self.smart.record_failure(&pick.label, e.to_string());
                     }
@@ -1029,7 +1121,7 @@ impl Runtime {
                             });
                         }
                     }
-                    if !should_retry_dial(&pick, &e, network, attempt) {
+                    if !retry {
                         return Err(e);
                     }
                     debug!(
@@ -1069,7 +1161,7 @@ impl Runtime {
         let network = ctx.network;
         let net_str = network.as_str();
         let started = Instant::now();
-        info!(
+        trace!(
             target: "dial",
             id = dial_id,
             %host, port, network = net_str,
@@ -1089,7 +1181,7 @@ impl Runtime {
         let elapsed = started.elapsed();
         let dial_ms = dial_start.elapsed().as_millis() as u64;
         match &res {
-            Ok(_) => info!(
+            Ok(_) => trace!(
                 target: "dial",
                 id = dial_id,
                 %host, port,
@@ -1125,6 +1217,12 @@ impl Runtime {
             smart_target: String::new(),
             rule: "TUN-BYPASS".into(),
             rule_payload: reason,
+            rule_index: None,
+            rule_source: "TUN-BYPASS".into(),
+            rule_action: "DIRECT".into(),
+            route_ip: ctx.ip,
+            no_log: false,
+            no_track: false,
         })
     }
 
@@ -1149,7 +1247,11 @@ impl Runtime {
         self.dial_udp_with_context(ctx).await
     }
 
-    pub async fn dial_udp_with_context(&self, ctx: FlowContext) -> std::io::Result<UdpDialResult> {
+    pub async fn dial_udp_with_context(
+        &self,
+        mut ctx: FlowContext,
+    ) -> std::io::Result<UdpDialResult> {
+        self.resolve_route_destination(&mut ctx).await;
         let started = Instant::now();
         let dial_id = core_outbound::next_dial_id();
         let host = ctx.host.clone();
@@ -1252,6 +1354,12 @@ impl Runtime {
                         smart_target,
                         rule: pick.rule,
                         rule_payload: pick.rule_payload,
+                        rule_index: pick.rule_index,
+                        rule_source: pick.rule_source,
+                        rule_action: pick.rule_action,
+                        route_ip: ctx.ip,
+                        no_log: pick.no_log,
+                        no_track: pick.no_track,
                     });
                 }
                 Err(e) => {
@@ -1345,6 +1453,12 @@ impl Runtime {
             smart_target: String::new(),
             rule: "TUN-BYPASS".into(),
             rule_payload: reason,
+            rule_index: None,
+            rule_source: "TUN-BYPASS".into(),
+            rule_action: "DIRECT".into(),
+            route_ip: ctx.ip,
+            no_log: false,
+            no_track: false,
         })
     }
 
@@ -1462,28 +1576,20 @@ fn feed_member_name(member: &str) -> Option<&str> {
         .filter(|provider| !provider.trim().is_empty())
 }
 
-fn route_rule_name(kind: &str) -> &'static str {
-    match kind {
-        "any" | "fallback" => "MATCH",
-        "domain" => "DOMAIN",
-        "suffix" | "ads" | "service" => "DOMAIN-SUFFIX",
-        "home" | "ip" => "IP-CIDR",
-        "cn" => "GEOIP",
-        "port" => "DST-PORT",
-        "network" | "proto" => "NETWORK",
-        "process" => "PROCESS-NAME",
-        "set" => "RULE-SET",
-        "MODE" | "mode" => "MODE",
-        _ => "MATCH",
-    }
-}
-
 /// Clash `mode=global`：全部流量进 `route.final`（组 / DIRECT / BLOCK）。
 fn global_mode_decision(final_target: &str) -> RouteDecision {
     match final_target {
         "direct" | "DIRECT" => RouteDecision::Direct,
         "block" | "BLOCK" | "REJECT" | "reject" => RouteDecision::Block,
         other => RouteDecision::Group(other.to_string()),
+    }
+}
+
+fn decision_action(decision: &RouteDecision) -> String {
+    match decision {
+        RouteDecision::Direct => "DIRECT".into(),
+        RouteDecision::Block => "REJECT".into(),
+        RouteDecision::Group(group) => group.clone(),
     }
 }
 
@@ -1558,6 +1664,11 @@ pub struct RoutePick {
     pub outbound: SharedOutbound,
     pub rule: String,
     pub rule_payload: String,
+    pub rule_index: Option<usize>,
+    pub rule_source: String,
+    pub rule_action: String,
+    pub no_log: bool,
+    pub no_track: bool,
 }
 
 pub struct DialResult {
@@ -1574,6 +1685,12 @@ pub struct DialResult {
     pub smart_target: String,
     pub rule: String,
     pub rule_payload: String,
+    pub rule_index: Option<usize>,
+    pub rule_source: String,
+    pub rule_action: String,
+    pub route_ip: Option<IpAddr>,
+    pub no_log: bool,
+    pub no_track: bool,
 }
 
 pub struct UdpDialResult {
@@ -1587,6 +1704,12 @@ pub struct UdpDialResult {
     pub smart_target: String,
     pub rule: String,
     pub rule_payload: String,
+    pub rule_index: Option<usize>,
+    pub rule_source: String,
+    pub rule_action: String,
+    pub route_ip: Option<IpAddr>,
+    pub no_log: bool,
+    pub no_track: bool,
 }
 
 fn outbound_fwmark_for_plan(plan: &RuntimePlan) -> u32 {
@@ -2946,6 +3069,7 @@ route:
 
         assert!(matches!(pick.decision, RouteDecision::Group(ref group) if group == "ai"));
         assert_eq!(pick.rule, "RULE-SET");
-        assert_eq!(pick.rule_payload, "set:openai -> ai");
+        assert_eq!(pick.rule_payload, "openai");
+        assert_eq!(pick.rule_source, "set:openai -> ai");
     }
 }

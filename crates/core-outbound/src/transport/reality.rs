@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use core_reality::{
     RealityClient, RealityClientConfig, RealityClientError, RealityConnectionLifetime,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::adapter::{BoxedStream, resolve_host};
 use crate::transport::Transport;
@@ -99,7 +99,7 @@ impl Transport for RealityTransport {
                 .await
             {
                 Ok(stream) => {
-                    info!(
+                    debug!(
                         target: "dial::reality",
                         %host,
                         port,

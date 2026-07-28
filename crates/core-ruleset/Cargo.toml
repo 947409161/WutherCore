@@ -11,6 +11,12 @@ serde_json  = { workspace = true }
 serde_yaml  = { workspace = true }
 ipnet       = { workspace = true }
 ahash       = { workspace = true }
+aho-corasick = { workspace = true }
+globset     = { workspace = true }
+ip_network_table = { workspace = true }
+ip_network = { workspace = true }
+idna        = { workspace = true }
+arc-swap    = { workspace = true }
 regex       = { workspace = true }
 fancy-regex = { workspace = true }
 once_cell   = { workspace = true }

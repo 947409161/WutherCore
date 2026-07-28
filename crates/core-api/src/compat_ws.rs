@@ -242,8 +242,7 @@ impl Drop for WsHubs {
 }
 
 fn serialize_connections(runtime: &Arc<core_runtime::Runtime>) -> String {
-    serde_json::to_string(&crate::compat::build_connections_value(runtime))
-        .unwrap_or_else(|_| String::from("{}"))
+    crate::compat::build_connections_json(runtime).unwrap_or_else(|_| String::from("{}"))
 }
 
 #[cfg(test)]

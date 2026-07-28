@@ -6,9 +6,12 @@ use std::{
 };
 
 use ahash::{AHashMap, AHashSet};
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
+use arc_swap::ArcSwap;
 use fancy_regex::Regex as FancyRegex;
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
+use ip_network_table::IpNetworkTable;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
-use parking_lot::RwLock;
 use regex::RegexSet;
 use thiserror::Error;
 use tokio::sync::watch;
@@ -102,12 +105,36 @@ pub enum ClassicalKind {
     DomainSuffix,
     DomainKeyword,
     DomainRegex,
+    DomainWildcard,
+    GeoSite,
+    GeoIp,
+    SrcGeoIp,
     IpCidr,
     SrcIpCidr,
+    IpSuffix,
+    SrcIpSuffix,
+    IpAsn,
+    SrcIpAsn,
     DstPort,
     SrcPort,
+    InPort,
+    InType,
+    InUser,
+    InName,
+    Dscp,
+    Uid,
     ProcessName,
     ProcessPath,
+    ProcessNameRegex,
+    ProcessPathRegex,
+    ProcessNameWildcard,
+    ProcessPathWildcard,
+    RematchName,
+    Network,
+    And,
+    Or,
+    Not,
+    Match,
 }
 
 impl ClassicalKind {
@@ -117,14 +144,77 @@ impl ClassicalKind {
             "DOMAIN-SUFFIX" => Self::DomainSuffix,
             "DOMAIN-KEYWORD" => Self::DomainKeyword,
             "DOMAIN-REGEX" => Self::DomainRegex,
+            "DOMAIN-WILDCARD" => Self::DomainWildcard,
+            "GEOSITE" => Self::GeoSite,
+            "GEOIP" => Self::GeoIp,
+            "SRC-GEOIP" => Self::SrcGeoIp,
             "IP-CIDR" | "IP-CIDR6" => Self::IpCidr,
             "SRC-IP-CIDR" => Self::SrcIpCidr,
+            "IP-SUFFIX" => Self::IpSuffix,
+            "SRC-IP-SUFFIX" => Self::SrcIpSuffix,
+            "IP-ASN" => Self::IpAsn,
+            "SRC-IP-ASN" => Self::SrcIpAsn,
             "DST-PORT" => Self::DstPort,
             "SRC-PORT" => Self::SrcPort,
+            "IN-PORT" => Self::InPort,
+            "IN-TYPE" => Self::InType,
+            "IN-USER" => Self::InUser,
+            "IN-NAME" => Self::InName,
+            "DSCP" => Self::Dscp,
+            "UID" => Self::Uid,
             "PROCESS-NAME" => Self::ProcessName,
             "PROCESS-PATH" => Self::ProcessPath,
+            "PROCESS-NAME-REGEX" => Self::ProcessNameRegex,
+            "PROCESS-PATH-REGEX" => Self::ProcessPathRegex,
+            "PROCESS-NAME-WILDCARD" => Self::ProcessNameWildcard,
+            "PROCESS-PATH-WILDCARD" => Self::ProcessPathWildcard,
+            "REMATCH-NAME" => Self::RematchName,
+            "NETWORK" => Self::Network,
+            "AND" => Self::And,
+            "OR" => Self::Or,
+            "NOT" => Self::Not,
+            "MATCH" => Self::Match,
             _ => return None,
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IpSuffix {
+    address: IpAddr,
+    bits: u8,
+}
+
+#[derive(Debug)]
+enum LogicalRule {
+    Leaf(Box<RulesetMatcher>),
+    And(Vec<LogicalRule>),
+    Or(Vec<LogicalRule>),
+    Not(Box<LogicalRule>),
+}
+
+#[derive(Default)]
+struct PrefixTable(IpNetworkTable<()>);
+
+impl std::fmt::Debug for PrefixTable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PrefixTable")
+            .field("prefixes", &self.0.len())
+            .finish()
+    }
+}
+
+impl PrefixTable {
+    fn insert(&mut self, network: IpNet) {
+        if let Ok(network) = network.to_string().parse::<ip_network::IpNetwork>() {
+            self.0.insert(network, ());
+        }
+    }
+
+    #[inline]
+    fn contains(&self, address: IpAddr) -> bool {
+        self.0.longest_match(address).is_some()
     }
 }
 
@@ -138,6 +228,9 @@ pub struct RulesetMatcher {
     suffix_trie: SuffixTrie,
     /// 子串关键字
     keywords: Vec<String>,
+    keyword_automaton: Option<AhoCorasick>,
+    /// DOMAIN-WILDCARD patterns compiled as one globset.
+    wildcard_set: Option<GlobSet>,
     /// Rust `regex` 可以无损处理的快速正则集合。
     regex_set: Option<RegexSet>,
     /// 需要 look-around / backreference 等 regexp2 语义的正则。
@@ -145,17 +238,46 @@ pub struct RulesetMatcher {
     /// CIDR：v4 与 v6 分桶
     cidr_v4: Vec<ipnet::Ipv4Net>,
     cidr_v6: Vec<ipnet::Ipv6Net>,
+    destination_prefix_table: PrefixTable,
     /// source CIDR 与 destination CIDR 严格分桶。
     src_cidr_v4: Vec<ipnet::Ipv4Net>,
     src_cidr_v6: Vec<ipnet::Ipv6Net>,
+    source_prefix_table: PrefixTable,
+    destination_ip_suffixes: Vec<IpSuffix>,
+    source_ip_suffixes: Vec<IpSuffix>,
+    destination_geoip: AHashSet<String>,
+    source_geoip: AHashSet<String>,
+    destination_geosite: AHashSet<String>,
+    destination_asn: AHashSet<u32>,
+    source_asn: AHashSet<u32>,
+    destination_geoip_aliases: Vec<Vec<String>>,
+    source_geoip_aliases: Vec<Vec<String>>,
+    destination_geosite_aliases: Vec<Vec<String>>,
+    destination_asn_aliases: Vec<Vec<String>>,
+    source_asn_aliases: Vec<Vec<String>>,
+    destination_ip_requires_resolution: bool,
     /// 进程名（精确）
     processes: AHashSet<String>,
     /// 完整进程路径（精确，大小写不敏感）。
     process_paths: AHashSet<String>,
+    process_regex_set: Option<RegexSet>,
+    process_path_regex_set: Option<RegexSet>,
+    process_wildcard_set: Option<GlobSet>,
+    process_path_wildcard_set: Option<GlobSet>,
+    rematch_names: AHashSet<String>,
+    networks: AHashSet<String>,
     /// 端口（单值或区间，u16..=u16）
     ports: Vec<(u16, u16)>,
     /// source 端口，不能退化为 destination 端口。
     src_ports: Vec<(u16, u16)>,
+    inbound_ports: Vec<(u16, u16)>,
+    inbound_types: AHashSet<String>,
+    inbound_users: AHashSet<String>,
+    inbound_names: AHashSet<String>,
+    dscp_values: AHashSet<u8>,
+    uid_values: AHashSet<u32>,
+    logical_rules: Vec<LogicalRule>,
+    match_all: bool,
     /// 原始 classical 条目，便于 explain。
     pub classical_count: usize,
 
@@ -191,10 +313,19 @@ impl RulesetMatcher {
     pub fn compile(name: impl Into<String>, entries: Vec<ClassicalEntry>) -> Self {
         let mut m = RulesetMatcher::new(name);
         let mut regex_pats: Vec<String> = Vec::new();
+        let mut wildcard_pats: Vec<String> = Vec::new();
+        let mut process_regex_pats: Vec<String> = Vec::new();
+        let mut process_path_regex_pats: Vec<String> = Vec::new();
+        let mut process_wildcard_pats: Vec<String> = Vec::new();
+        let mut process_path_wildcard_pats: Vec<String> = Vec::new();
         let mut saw_destination_prefix = false;
         let mut saw_non_destination_rule = false;
         m.classical_count = entries.len();
         for e in entries {
+            let no_resolve = e
+                .policy
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("no-resolve"));
             match e.kind {
                 ClassicalKind::Domain => {
                     saw_non_destination_rule = true;
@@ -206,14 +337,44 @@ impl RulesetMatcher {
                 }
                 ClassicalKind::DomainKeyword => {
                     saw_non_destination_rule = true;
-                    m.keywords.push(e.value.to_ascii_lowercase());
+                    m.keywords.push(e.value.to_lowercase());
                 }
                 ClassicalKind::DomainRegex => {
                     saw_non_destination_rule = true;
                     regex_pats.push(e.value);
                 }
+                ClassicalKind::DomainWildcard => {
+                    saw_non_destination_rule = true;
+                    wildcard_pats.push(normalize_domain_pattern(&e.value));
+                }
+                ClassicalKind::GeoSite => {
+                    saw_non_destination_rule = true;
+                    let value = e.value.to_ascii_lowercase();
+                    if m.destination_geosite.insert(value.clone()) {
+                        m.destination_geosite_aliases
+                            .push(ruleset_alias_candidates("geosite", &value));
+                    }
+                }
+                ClassicalKind::GeoIp => {
+                    saw_non_destination_rule = true;
+                    m.destination_ip_requires_resolution |= !no_resolve;
+                    let value = e.value.to_ascii_lowercase();
+                    if m.destination_geoip.insert(value.clone()) {
+                        m.destination_geoip_aliases
+                            .push(ruleset_alias_candidates("geoip", &value));
+                    }
+                }
+                ClassicalKind::SrcGeoIp => {
+                    saw_non_destination_rule = true;
+                    let value = e.value.to_ascii_lowercase();
+                    if m.source_geoip.insert(value.clone()) {
+                        m.source_geoip_aliases
+                            .push(ruleset_alias_candidates("geoip", &value));
+                    }
+                }
                 ClassicalKind::IpCidr => {
                     if let Ok(net) = e.value.parse::<IpNet>() {
+                        m.destination_ip_requires_resolution |= !no_resolve;
                         saw_destination_prefix = true;
                         match net {
                             IpNet::V4(v4) => m.cidr_v4.push(v4),
@@ -235,6 +396,38 @@ impl RulesetMatcher {
                         }
                     }
                 }
+                ClassicalKind::IpSuffix => {
+                    saw_non_destination_rule = true;
+                    if let Some(suffix) = parse_ip_suffix(&e.value) {
+                        m.destination_ip_requires_resolution |= !no_resolve;
+                        m.destination_ip_suffixes.push(suffix);
+                    }
+                }
+                ClassicalKind::SrcIpSuffix => {
+                    saw_non_destination_rule = true;
+                    if let Some(suffix) = parse_ip_suffix(&e.value) {
+                        m.source_ip_suffixes.push(suffix);
+                    }
+                }
+                ClassicalKind::IpAsn => {
+                    saw_non_destination_rule = true;
+                    if let Some(asn) = parse_asn(&e.value) {
+                        m.destination_ip_requires_resolution |= !no_resolve;
+                        if m.destination_asn.insert(asn) {
+                            m.destination_asn_aliases
+                                .push(ruleset_alias_candidates("asn", &asn.to_string()));
+                        }
+                    }
+                }
+                ClassicalKind::SrcIpAsn => {
+                    saw_non_destination_rule = true;
+                    if let Some(asn) = parse_asn(&e.value) {
+                        if m.source_asn.insert(asn) {
+                            m.source_asn_aliases
+                                .push(ruleset_alias_candidates("asn", &asn.to_string()));
+                        }
+                    }
+                }
                 ClassicalKind::DstPort => {
                     saw_non_destination_rule = true;
                     if let Some(range) = parse_port_range(&e.value) {
@@ -247,6 +440,36 @@ impl RulesetMatcher {
                         m.src_ports.push(range);
                     }
                 }
+                ClassicalKind::InPort => {
+                    saw_non_destination_rule = true;
+                    if let Some(range) = parse_port_range(&e.value) {
+                        m.inbound_ports.push(range);
+                    }
+                }
+                ClassicalKind::InType => {
+                    saw_non_destination_rule = true;
+                    insert_slash_values(&mut m.inbound_types, &e.value);
+                }
+                ClassicalKind::InUser => {
+                    saw_non_destination_rule = true;
+                    insert_slash_values(&mut m.inbound_users, &e.value);
+                }
+                ClassicalKind::InName => {
+                    saw_non_destination_rule = true;
+                    insert_slash_values(&mut m.inbound_names, &e.value);
+                }
+                ClassicalKind::Dscp => {
+                    saw_non_destination_rule = true;
+                    if let Ok(value) = e.value.parse() {
+                        m.dscp_values.insert(value);
+                    }
+                }
+                ClassicalKind::Uid => {
+                    saw_non_destination_rule = true;
+                    if let Ok(value) = e.value.parse() {
+                        m.uid_values.insert(value);
+                    }
+                }
                 ClassicalKind::ProcessName => {
                     saw_non_destination_rule = true;
                     m.processes.insert(e.value.to_ascii_lowercase());
@@ -254,6 +477,40 @@ impl RulesetMatcher {
                 ClassicalKind::ProcessPath => {
                     saw_non_destination_rule = true;
                     m.process_paths.insert(e.value.to_lowercase());
+                }
+                ClassicalKind::ProcessNameRegex => {
+                    saw_non_destination_rule = true;
+                    process_regex_pats.push(e.value);
+                }
+                ClassicalKind::ProcessPathRegex => {
+                    saw_non_destination_rule = true;
+                    process_path_regex_pats.push(e.value);
+                }
+                ClassicalKind::ProcessNameWildcard => {
+                    saw_non_destination_rule = true;
+                    process_wildcard_pats.push(e.value);
+                }
+                ClassicalKind::ProcessPathWildcard => {
+                    saw_non_destination_rule = true;
+                    process_path_wildcard_pats.push(e.value);
+                }
+                ClassicalKind::RematchName => {
+                    saw_non_destination_rule = true;
+                    insert_slash_values(&mut m.rematch_names, &e.value);
+                }
+                ClassicalKind::Network => {
+                    saw_non_destination_rule = true;
+                    insert_slash_values(&mut m.networks, &e.value);
+                }
+                ClassicalKind::And | ClassicalKind::Or | ClassicalKind::Not => {
+                    saw_non_destination_rule = true;
+                    if let Some(rule) = compile_logical_rule(e.kind, &e.value) {
+                        m.logical_rules.push(rule);
+                    }
+                }
+                ClassicalKind::Match => {
+                    saw_non_destination_rule = true;
+                    m.match_all = true;
                 }
             }
         }
@@ -274,6 +531,30 @@ impl RulesetMatcher {
                 m.regex_set = Some(rs);
             }
         }
+        if !m.keywords.is_empty() {
+            m.keyword_automaton = AhoCorasickBuilder::new()
+                .ascii_case_insensitive(true)
+                .build(&m.keywords)
+                .ok();
+        }
+        if !wildcard_pats.is_empty() {
+            let mut set = GlobSetBuilder::new();
+            for pattern in wildcard_pats {
+                let mut builder = GlobBuilder::new(&pattern);
+                builder
+                    .case_insensitive(true)
+                    .literal_separator(false)
+                    .backslash_escape(true);
+                if let Ok(glob) = builder.build() {
+                    set.add(glob);
+                }
+            }
+            m.wildcard_set = set.build().ok();
+        }
+        m.process_regex_set = compile_regex_set(&process_regex_pats);
+        m.process_path_regex_set = compile_regex_set(&process_path_regex_pats);
+        m.process_wildcard_set = compile_glob_set(&process_wildcard_pats);
+        m.process_path_wildcard_set = compile_glob_set(&process_path_wildcard_pats);
         // 排序 CIDR 让长前缀优先（更精确）
         m.cidr_v4.sort_by_key(|n| std::cmp::Reverse(n.prefix_len()));
         m.cidr_v6.sort_by_key(|n| std::cmp::Reverse(n.prefix_len()));
@@ -281,6 +562,24 @@ impl RulesetMatcher {
             .sort_by_key(|n| std::cmp::Reverse(n.prefix_len()));
         m.src_cidr_v6
             .sort_by_key(|n| std::cmp::Reverse(n.prefix_len()));
+        for network in m
+            .cidr_v4
+            .iter()
+            .copied()
+            .map(IpNet::V4)
+            .chain(m.cidr_v6.iter().copied().map(IpNet::V6))
+        {
+            m.destination_prefix_table.insert(network);
+        }
+        for network in m
+            .src_cidr_v4
+            .iter()
+            .copied()
+            .map(IpNet::V4)
+            .chain(m.src_cidr_v6.iter().copied().map(IpNet::V6))
+        {
+            m.source_prefix_table.insert(network);
+        }
         let semantics = match (saw_destination_prefix, saw_non_destination_rule) {
             (true, false) => RulesetIpPrefixSemantics::Exact,
             (true, true) => RulesetIpPrefixSemantics::Extracted,
@@ -300,33 +599,7 @@ impl RulesetMatcher {
     ) -> Self {
         let entries = lines
             .into_iter()
-            .filter_map(|l| {
-                let l = l.trim();
-                if l.is_empty() {
-                    return None;
-                }
-                if let Some(rest) = l.strip_prefix("+.") {
-                    Some(ClassicalEntry {
-                        kind: ClassicalKind::DomainSuffix,
-                        value: rest.into(),
-                        policy: None,
-                    })
-                } else if l.starts_with('.') {
-                    Some(ClassicalEntry {
-                        kind: ClassicalKind::DomainSuffix,
-                        value: l[1..].into(),
-                        policy: None,
-                    })
-                } else if l.starts_with('*') {
-                    None // 简化：忽略复杂通配
-                } else {
-                    Some(ClassicalEntry {
-                        kind: ClassicalKind::Domain,
-                        value: l.into(),
-                        policy: None,
-                    })
-                }
-            })
+            .filter_map(|line| crate::parser::txt::parse_domain_pattern(line.trim()).ok())
             .collect();
         Self::compile(name, entries)
     }
@@ -397,6 +670,7 @@ impl RulesetMatcher {
                 );
             }
             crate::parser::mrs::MrsPayload::IpCidr { set, .. } => {
+                m.destination_ip_requires_resolution = true;
                 // Arc<MrsIpCidrSet> → 拷贝一份排序好的 Vec 进 matcher 字段
                 // （MrsIpCidrSet 内部已经排过序）。MrsIpCidrSet 不暴露所有权移动，
                 // 直接 clone 出 v4/v6 ranges 即可。
@@ -477,9 +751,13 @@ impl RulesetMatcher {
         if let Some(program) = &self.semantic_program {
             return program.matches(ctx);
         }
+        if self.match_all {
+            return true;
+        }
 
         // 域名相关
-        let host_lc = normalize_domain(ctx.dst_host);
+        let host_unicode = ctx.dst_host.trim().trim_end_matches('.').to_lowercase();
+        let host_lc = normalize_domain(&host_unicode);
         if !host_lc.is_empty() {
             if self.domains.contains(&host_lc) {
                 return true;
@@ -487,38 +765,57 @@ impl RulesetMatcher {
             if self.suffix_trie.matches(&host_lc) {
                 return true;
             }
-            for k in &self.keywords {
-                if host_lc.contains(k) {
-                    return true;
-                }
+            if self.keyword_automaton.as_ref().is_some_and(|automaton| {
+                automaton.is_match(&host_lc)
+                    || (host_lc != host_unicode && automaton.is_match(&host_unicode))
+            }) {
+                return true;
             }
             if let Some(rs) = &self.regex_set {
-                if rs.is_match(&host_lc) {
+                if rs.is_match(&host_lc) || (host_lc != host_unicode && rs.is_match(&host_unicode))
+                {
                     return true;
                 }
             }
-            if self
-                .fancy_regexes
-                .iter()
-                .any(|regex| regex.is_match(&host_lc).unwrap_or(false))
-            {
+            if self.fancy_regexes.iter().any(|regex| {
+                regex.is_match(&host_lc).unwrap_or(false)
+                    || (host_lc != host_unicode && regex.is_match(&host_unicode).unwrap_or(false))
+            }) {
+                return true;
+            }
+            if self.wildcard_set.as_ref().is_some_and(|set| {
+                set.is_match(&host_lc) || (host_lc != host_unicode && set.is_match(&host_unicode))
+            }) {
                 return true;
             }
             // mihomo MRS domain succinct trie（含 wildcard 语义）
             if let Some(set) = &self.mrs_domain_set {
-                if set.has(&host_lc) {
+                if set.has(&host_unicode) || (host_lc != host_unicode && set.has(&host_lc)) {
                     return true;
                 }
+            }
+            if ctx.destination_geosite.iter().any(|code| {
+                self.destination_geosite
+                    .contains(&code.to_ascii_lowercase())
+            }) {
+                return true;
             }
         }
         // IP / CIDR
         let resolved_ip = ctx.dst_ip.or_else(|| ctx.dst_host.parse::<IpAddr>().ok());
         if let Some(ip) = resolved_ip {
+            if self
+                .destination_ip_suffixes
+                .iter()
+                .any(|suffix| ip_suffix_matches(ip, *suffix))
+            {
+                return true;
+            }
+            if self.destination_prefix_table.contains(ip) {
+                return true;
+            }
             match ip {
                 IpAddr::V4(v) => {
-                    if self.cidr_v4.iter().any(|n| n.contains(&v)) {
-                        return true;
-                    }
                     if !self.mrs_v4_ranges.is_empty()
                         && contains_range_v4(&self.mrs_v4_ranges, u32::from(v))
                     {
@@ -526,9 +823,6 @@ impl RulesetMatcher {
                     }
                 }
                 IpAddr::V6(v) => {
-                    if self.cidr_v6.iter().any(|n| n.contains(&v)) {
-                        return true;
-                    }
                     if !self.mrs_v6_ranges.is_empty()
                         && contains_range_v6(&self.mrs_v6_ranges, u128::from(v))
                     {
@@ -538,18 +832,33 @@ impl RulesetMatcher {
             }
         }
         if let Some(ip) = ctx.src_ip {
-            match ip {
-                IpAddr::V4(v) => {
-                    if self.src_cidr_v4.iter().any(|n| n.contains(&v)) {
-                        return true;
-                    }
-                }
-                IpAddr::V6(v) => {
-                    if self.src_cidr_v6.iter().any(|n| n.contains(&v)) {
-                        return true;
-                    }
-                }
+            if self.source_prefix_table.contains(ip) {
+                return true;
             }
+            if self
+                .source_ip_suffixes
+                .iter()
+                .any(|suffix| ip_suffix_matches(ip, *suffix))
+            {
+                return true;
+            }
+        }
+        if ctx
+            .destination_geoip
+            .iter()
+            .any(|code| self.destination_geoip.contains(&code.to_ascii_lowercase()))
+            || ctx
+                .source_geoip
+                .iter()
+                .any(|code| self.source_geoip.contains(&code.to_ascii_lowercase()))
+            || ctx
+                .destination_asn
+                .is_some_and(|asn| self.destination_asn.contains(&asn))
+            || ctx
+                .source_asn
+                .is_some_and(|asn| self.source_asn.contains(&asn))
+        {
+            return true;
         }
         // port
         if let Some(p) = ctx.dst_port {
@@ -562,16 +871,83 @@ impl RulesetMatcher {
                 return true;
             }
         }
+        if let Some(p) = ctx.inbound_port {
+            if self
+                .inbound_ports
+                .iter()
+                .any(|(lo, hi)| p >= *lo && p <= *hi)
+            {
+                return true;
+            }
+        }
+        if option_in_set(ctx.inbound_type, &self.inbound_types)
+            || option_in_set(ctx.inbound_user, &self.inbound_users)
+            || option_in_set(ctx.inbound_name, &self.inbound_names)
+            || ctx.uid.is_some_and(|uid| self.uid_values.contains(&uid))
+            || ctx
+                .dscp
+                .is_some_and(|dscp| self.dscp_values.contains(&dscp))
+            || option_in_set(ctx.network, &self.networks)
+            || ctx
+                .rematch_names
+                .iter()
+                .any(|name| self.rematch_names.contains(&name.to_lowercase()))
+        {
+            return true;
+        }
         // process
         if let Some(name) = ctx.process_name {
             if self.processes.contains(&name.to_ascii_lowercase()) {
                 return true;
             }
+            if self
+                .process_regex_set
+                .as_ref()
+                .is_some_and(|set| set.is_match(name))
+                || self
+                    .process_wildcard_set
+                    .as_ref()
+                    .is_some_and(|set| set.is_match(name))
+            {
+                return true;
+            }
+        }
+        if ctx.package_names.iter().any(|name| {
+            self.processes.contains(&name.to_ascii_lowercase())
+                || self
+                    .process_regex_set
+                    .as_ref()
+                    .is_some_and(|set| set.is_match(name))
+                || self
+                    .process_wildcard_set
+                    .as_ref()
+                    .is_some_and(|set| set.is_match(name))
+        }) {
+            return true;
         }
         if let Some(path) = ctx.process_path {
             if self.process_paths.contains(&path.to_lowercase()) {
                 return true;
             }
+            if self
+                .process_path_regex_set
+                .as_ref()
+                .is_some_and(|set| set.is_match(path))
+                || self
+                    .process_path_wildcard_set
+                    .as_ref()
+                    .is_some_and(|set| set.is_match(path))
+            {
+                return true;
+            }
+        }
+        if self
+            .logical_rules
+            .iter()
+            .filter(|rule| !rule.has_external_refs())
+            .any(|rule| rule.matches(ctx))
+        {
+            return true;
         }
         false
     }
@@ -586,17 +962,49 @@ impl RulesetMatcher {
         ctx: &RulesetMatchContext<'_>,
         process_resolved: bool,
     ) -> RulesetMatchOutcome {
+        self.matches_context_deferred(ctx, process_resolved, true)
+    }
+
+    /// Evaluate while process metadata and destination DNS may still be pending.
+    ///
+    /// This is required for ordered routing: an IP-based MRS/RULE-SET must ask
+    /// the caller to resolve a domain unless its top-level rule carries
+    /// `no-resolve`; treating a missing destination IP as a hard miss silently
+    /// skips every IPCIDR provider.
+    pub fn matches_context_deferred(
+        &self,
+        ctx: &RulesetMatchContext<'_>,
+        process_resolved: bool,
+        destination_ip_resolved: bool,
+    ) -> RulesetMatchOutcome {
         if let Some(program) = &self.semantic_program {
-            return program.matches_lazy(ctx, process_resolved);
+            return program.matches_deferred(ctx, process_resolved, destination_ip_resolved);
         }
         if self.matches_context(ctx) {
             RulesetMatchOutcome::Matched
-        } else if !process_resolved
-            && (!self.processes.is_empty() || !self.process_paths.is_empty())
-        {
-            RulesetMatchOutcome::NeedsProcess
         } else {
-            RulesetMatchOutcome::NotMatched
+            let needs_process = !process_resolved
+                && (!self.processes.is_empty()
+                    || !self.process_paths.is_empty()
+                    || self.process_regex_set.is_some()
+                    || self.process_path_regex_set.is_some()
+                    || self.process_wildcard_set.is_some()
+                    || self.process_path_wildcard_set.is_some()
+                    || self.logical_rules.iter().any(LogicalRule::needs_process));
+            let needs_destination_ip = !destination_ip_resolved
+                && (self.destination_ip_requires_resolution
+                    || !self.mrs_v4_ranges.is_empty()
+                    || !self.mrs_v6_ranges.is_empty()
+                    || self
+                        .logical_rules
+                        .iter()
+                        .any(LogicalRule::needs_destination_ip));
+            match (needs_process, needs_destination_ip) {
+                (false, false) => RulesetMatchOutcome::NotMatched,
+                (true, false) => RulesetMatchOutcome::NeedsProcess,
+                (false, true) => RulesetMatchOutcome::NeedsDestinationIp,
+                (true, true) => RulesetMatchOutcome::NeedsProcessAndDestinationIp,
+            }
         }
     }
 
@@ -941,7 +1349,7 @@ enum RulesetAvailability {
     Unavailable,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct RulesetIndexState {
     revision: u64,
     matchers: AHashMap<String, Arc<RulesetMatcher>>,
@@ -951,7 +1359,8 @@ struct RulesetIndexState {
 /// 全局规则集索引；route 引擎查 `set:<name>` 时用它。
 #[derive(Debug)]
 pub struct RulesetIndex {
-    state: RwLock<RulesetIndexState>,
+    state: ArcSwap<RulesetIndexState>,
+    update: parking_lot::Mutex<()>,
     prefix_revisions: watch::Sender<u64>,
 }
 
@@ -959,7 +1368,8 @@ impl Default for RulesetIndex {
     fn default() -> Self {
         let (prefix_revisions, _receiver) = watch::channel(0);
         Self {
-            state: RwLock::new(RulesetIndexState::default()),
+            state: ArcSwap::from_pointee(RulesetIndexState::default()),
+            update: parking_lot::Mutex::new(()),
             prefix_revisions,
         }
     }
@@ -979,8 +1389,10 @@ impl RulesetIndex {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
+        let _update = self.update.lock();
         let revision = {
-            let mut state = self.state.write();
+            let current = self.state.load_full();
+            let mut state = (*current).clone();
             let mut changed = false;
             for name in names {
                 let name = name.into();
@@ -991,7 +1403,13 @@ impl RulesetIndex {
                     changed = true;
                 }
             }
-            changed.then(|| bump_prefix_revision(&mut state))
+            if changed {
+                let revision = bump_prefix_revision(&mut state);
+                self.state.store(Arc::new(state));
+                Some(revision)
+            } else {
+                None
+            }
         };
         if let Some(revision) = revision {
             self.publish_prefix_revision(revision);
@@ -1001,8 +1419,10 @@ impl RulesetIndex {
     /// Mark an initial load failure without discarding a last-known-good set.
     pub fn mark_unavailable(&self, name: impl Into<String>) {
         let name = name.into();
+        let _update = self.update.lock();
         let revision = {
-            let mut state = self.state.write();
+            let current = self.state.load_full();
+            let mut state = (*current).clone();
             if state.matchers.contains_key(&name)
                 || state.availability.get(&name) == Some(&RulesetAvailability::Unavailable)
             {
@@ -1011,7 +1431,9 @@ impl RulesetIndex {
                 state
                     .availability
                     .insert(name, RulesetAvailability::Unavailable);
-                Some(bump_prefix_revision(&mut state))
+                let revision = bump_prefix_revision(&mut state);
+                self.state.store(Arc::new(state));
+                Some(revision)
             }
         };
         if let Some(revision) = revision {
@@ -1020,8 +1442,10 @@ impl RulesetIndex {
     }
 
     pub fn insert(&self, m: Arc<RulesetMatcher>) {
+        let _update = self.update.lock();
         let revision = {
-            let mut state = self.state.write();
+            let current = self.state.load_full();
+            let mut state = (*current).clone();
             let name = m.name.clone();
             let prefix_changed = match state.matchers.get(&name) {
                 Some(previous) => !previous.has_same_destination_prefixes(&m),
@@ -1029,7 +1453,9 @@ impl RulesetIndex {
             } || state.availability.contains_key(&name);
             state.matchers.insert(name.clone(), m);
             state.availability.remove(&name);
-            prefix_changed.then(|| bump_prefix_revision(&mut state))
+            let revision = prefix_changed.then(|| bump_prefix_revision(&mut state));
+            self.state.store(Arc::new(state));
+            revision
         };
         if let Some(revision) = revision {
             self.publish_prefix_revision(revision);
@@ -1037,16 +1463,43 @@ impl RulesetIndex {
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<RulesetMatcher>> {
-        self.state.read().matchers.get(name).cloned()
+        self.state.load().matchers.get(name).cloned()
+    }
+
+    /// Evaluate a named set together with any GEOSITE/GEOIP/ASN references
+    /// embedded in a classical provider. The complete immutable index snapshot
+    /// is held for the evaluation, so a provider refresh cannot mix versions
+    /// midway through one route decision.
+    pub fn matches_context_deferred(
+        &self,
+        name: &str,
+        context: &RulesetMatchContext<'_>,
+        process_resolved: bool,
+        destination_ip_resolved: bool,
+    ) -> RulesetMatchOutcome {
+        let state = self.state.load();
+        let Some(matcher) = state.matchers.get(name) else {
+            return RulesetMatchOutcome::NotMatched;
+        };
+        let mut stack = Vec::with_capacity(4);
+        evaluate_indexed_matcher(
+            &state,
+            name,
+            matcher,
+            context,
+            process_resolved,
+            destination_ip_resolved,
+            &mut stack,
+        )
     }
 
     pub fn names(&self) -> Vec<String> {
-        self.state.read().matchers.keys().cloned().collect()
+        self.state.load().matchers.keys().cloned().collect()
     }
 
     pub fn stats(&self) -> Vec<(String, RulesetStats)> {
         self.state
-            .read()
+            .load()
             .matchers
             .iter()
             .map(|(k, v)| (k.clone(), v.stats()))
@@ -1055,7 +1508,7 @@ impl RulesetIndex {
 
     /// Current destination-prefix generation.
     pub fn ip_prefix_revision(&self) -> u64 {
-        self.state.read().revision
+        self.state.load().revision
     }
 
     /// Subscribe to desired-state changes. The receiver immediately contains
@@ -1071,7 +1524,7 @@ impl RulesetIndex {
     /// missing and non-IP sets. Duplicate names are removed while preserving
     /// their first occurrence.
     pub fn ip_prefix_snapshot<S: AsRef<str>>(&self, names: &[S]) -> RulesetIpPrefixSnapshot {
-        let state = self.state.read();
+        let state = self.state.load();
         build_ip_prefix_snapshot(&state, names)
     }
 
@@ -1092,7 +1545,7 @@ impl RulesetIndex {
     }
 
     fn publish_prefix_revision(&self, revision: u64) {
-        // Concurrent writers commit under the state RwLock but publish after
+        // Concurrent writers commit under the update mutex but publish after
         // releasing it. Only move the watch value forward so a slower writer
         // can never overwrite a newer desired state.
         self.prefix_revisions.send_if_modified(|published| {
@@ -1104,6 +1557,178 @@ impl RulesetIndex {
             }
         });
     }
+}
+
+fn evaluate_indexed_matcher(
+    state: &RulesetIndexState,
+    name: &str,
+    matcher: &RulesetMatcher,
+    context: &RulesetMatchContext<'_>,
+    process_resolved: bool,
+    destination_ip_resolved: bool,
+    stack: &mut Vec<String>,
+) -> RulesetMatchOutcome {
+    if stack.iter().any(|active| active == name) || stack.len() > 32 {
+        return RulesetMatchOutcome::NotMatched;
+    }
+    stack.push(name.to_owned());
+
+    let mut outcome =
+        matcher.matches_context_deferred(context, process_resolved, destination_ip_resolved);
+    if outcome == RulesetMatchOutcome::Matched {
+        stack.pop();
+        return outcome;
+    }
+
+    let source_context = RulesetMatchContext {
+        dst_host: "",
+        dst_ip: context.src_ip,
+        dst_port: context.src_port,
+        ..*context
+    };
+    for aliases in &matcher.destination_geosite_aliases {
+        outcome = or_outcome(
+            outcome,
+            evaluate_aliases(
+                state,
+                aliases,
+                context,
+                process_resolved,
+                destination_ip_resolved,
+                stack,
+            ),
+        );
+    }
+    for aliases in matcher
+        .destination_geoip_aliases
+        .iter()
+        .chain(matcher.destination_asn_aliases.iter())
+    {
+        outcome = or_outcome(
+            outcome,
+            evaluate_aliases(
+                state,
+                aliases,
+                context,
+                process_resolved,
+                destination_ip_resolved,
+                stack,
+            ),
+        );
+    }
+    for aliases in matcher
+        .source_geoip_aliases
+        .iter()
+        .chain(matcher.source_asn_aliases.iter())
+    {
+        outcome = or_outcome(
+            outcome,
+            evaluate_aliases(
+                state,
+                aliases,
+                &source_context,
+                process_resolved,
+                true,
+                stack,
+            ),
+        );
+    }
+    for logical in &matcher.logical_rules {
+        if logical.has_external_refs() {
+            outcome = or_outcome(
+                outcome,
+                logical.matches_indexed(
+                    state,
+                    context,
+                    process_resolved,
+                    destination_ip_resolved,
+                    stack,
+                ),
+            );
+        }
+    }
+    stack.pop();
+    outcome
+}
+
+fn evaluate_aliases(
+    state: &RulesetIndexState,
+    aliases: &[String],
+    context: &RulesetMatchContext<'_>,
+    process_resolved: bool,
+    destination_ip_resolved: bool,
+    stack: &mut Vec<String>,
+) -> RulesetMatchOutcome {
+    let mut outcome = RulesetMatchOutcome::NotMatched;
+    for alias in aliases {
+        let Some(matcher) = state.matchers.get(alias) else {
+            continue;
+        };
+        outcome = or_outcome(
+            outcome,
+            evaluate_indexed_matcher(
+                state,
+                alias,
+                matcher,
+                context,
+                process_resolved,
+                destination_ip_resolved,
+                stack,
+            ),
+        );
+        if outcome == RulesetMatchOutcome::Matched {
+            break;
+        }
+    }
+    outcome
+}
+
+fn outcome_requirements(outcome: RulesetMatchOutcome) -> (bool, bool) {
+    match outcome {
+        RulesetMatchOutcome::NeedsProcess => (true, false),
+        RulesetMatchOutcome::NeedsDestinationIp => (false, true),
+        RulesetMatchOutcome::NeedsProcessAndDestinationIp => (true, true),
+        RulesetMatchOutcome::Matched | RulesetMatchOutcome::NotMatched => (false, false),
+    }
+}
+
+fn deferred_outcome(process: bool, destination_ip: bool) -> RulesetMatchOutcome {
+    match (process, destination_ip) {
+        (false, false) => RulesetMatchOutcome::NotMatched,
+        (true, false) => RulesetMatchOutcome::NeedsProcess,
+        (false, true) => RulesetMatchOutcome::NeedsDestinationIp,
+        (true, true) => RulesetMatchOutcome::NeedsProcessAndDestinationIp,
+    }
+}
+
+fn or_outcome(left: RulesetMatchOutcome, right: RulesetMatchOutcome) -> RulesetMatchOutcome {
+    if left == RulesetMatchOutcome::Matched || right == RulesetMatchOutcome::Matched {
+        return RulesetMatchOutcome::Matched;
+    }
+    let (left_process, left_destination) = outcome_requirements(left);
+    let (right_process, right_destination) = outcome_requirements(right);
+    deferred_outcome(
+        left_process || right_process,
+        left_destination || right_destination,
+    )
+}
+
+fn and_outcome(left: RulesetMatchOutcome, right: RulesetMatchOutcome) -> RulesetMatchOutcome {
+    if left == RulesetMatchOutcome::NotMatched || right == RulesetMatchOutcome::NotMatched {
+        return RulesetMatchOutcome::NotMatched;
+    }
+    if left == RulesetMatchOutcome::Matched {
+        return right;
+    }
+    if right == RulesetMatchOutcome::Matched {
+        return left;
+    }
+    let (left_process, left_destination) = outcome_requirements(left);
+    let (right_process, right_destination) = outcome_requirements(right);
+    deferred_outcome(
+        left_process || right_process,
+        left_destination || right_destination,
+    )
 }
 
 fn bump_prefix_revision(state: &mut RulesetIndexState) -> u64 {
@@ -1185,7 +1810,7 @@ struct TrieNode {
 
 impl SuffixTrie {
     fn insert(&mut self, suffix: &str) {
-        let suffix = suffix.trim_matches('.').to_ascii_lowercase();
+        let suffix = normalize_domain(suffix.trim_matches('.'));
         if suffix.is_empty() {
             return;
         }
@@ -1222,7 +1847,292 @@ impl SuffixTrie {
 }
 
 fn normalize_domain(s: &str) -> String {
-    s.trim_end_matches('.').to_ascii_lowercase()
+    let trimmed = s.trim().trim_end_matches('.');
+    idna::domain_to_ascii(trimmed)
+        .unwrap_or_else(|_| trimmed.to_lowercase())
+        .to_lowercase()
+}
+
+fn normalize_domain_pattern(pattern: &str) -> String {
+    pattern
+        .trim()
+        .trim_end_matches('.')
+        .split('.')
+        .map(|label| {
+            if label.contains('*') || label.contains('?') {
+                label.to_lowercase()
+            } else {
+                idna::domain_to_ascii(label)
+                    .unwrap_or_else(|_| label.to_lowercase())
+                    .to_lowercase()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn compile_regex_set(patterns: &[String]) -> Option<RegexSet> {
+    (!patterns.is_empty())
+        .then(|| RegexSet::new(patterns).ok())
+        .flatten()
+}
+
+fn compile_glob_set(patterns: &[String]) -> Option<GlobSet> {
+    if patterns.is_empty() {
+        return None;
+    }
+    let mut set = GlobSetBuilder::new();
+    for pattern in patterns {
+        let mut builder = GlobBuilder::new(pattern);
+        builder
+            .case_insensitive(true)
+            .literal_separator(false)
+            .backslash_escape(true);
+        set.add(builder.build().ok()?);
+    }
+    set.build().ok()
+}
+
+fn insert_slash_values(target: &mut AHashSet<String>, value: &str) {
+    target.extend(
+        value
+            .split('/')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_lowercase),
+    );
+}
+
+fn ruleset_alias_candidates(kind: &str, value: &str) -> Vec<String> {
+    let value = value.trim().trim_start_matches(':').to_ascii_lowercase();
+    let mut candidates = Vec::with_capacity(3);
+    let mut push = |candidate: String| {
+        if !candidate.is_empty() && !candidates.iter().any(|old| old == &candidate) {
+            candidates.push(candidate);
+        }
+    };
+    push(value.clone());
+    push(format!("{kind}-{value}"));
+    match (kind, value.as_str()) {
+        ("geosite", "cn") => push("cn-domain".into()),
+        ("geoip", "cn") => push("geoip-cn".into()),
+        ("geoip", "private") => push("geoip-private".into()),
+        _ => {}
+    }
+    candidates
+}
+
+fn option_in_set(value: Option<&str>, set: &AHashSet<String>) -> bool {
+    value.is_some_and(|value| set.contains(&value.to_lowercase()))
+}
+
+fn parse_asn(value: &str) -> Option<u32> {
+    value
+        .trim()
+        .trim_start_matches(|character: char| matches!(character, 'A' | 'a' | 'S' | 's'))
+        .parse()
+        .ok()
+}
+
+fn parse_ip_suffix(value: &str) -> Option<IpSuffix> {
+    let (address, bits) = value.split_once('/')?;
+    let address = address.parse::<IpAddr>().ok()?;
+    let bits = bits.parse::<u8>().ok()?;
+    let maximum = if address.is_ipv4() { 32 } else { 128 };
+    (bits <= maximum).then_some(IpSuffix { address, bits })
+}
+
+fn ip_suffix_matches(candidate: IpAddr, suffix: IpSuffix) -> bool {
+    match (candidate, suffix.address) {
+        (IpAddr::V4(candidate), IpAddr::V4(expected)) => {
+            suffix_bits_match(&candidate.octets(), &expected.octets(), suffix.bits)
+        }
+        (IpAddr::V6(candidate), IpAddr::V6(expected)) => {
+            suffix_bits_match(&candidate.octets(), &expected.octets(), suffix.bits)
+        }
+        _ => false,
+    }
+}
+
+fn suffix_bits_match(candidate: &[u8], expected: &[u8], bits: u8) -> bool {
+    let bytes = usize::from(bits / 8);
+    let remaining = bits % 8;
+    if bytes > 0 && candidate[candidate.len() - bytes..] != expected[expected.len() - bytes..] {
+        return false;
+    }
+    if remaining == 0 {
+        return true;
+    }
+    let index = candidate.len() - bytes - 1;
+    let mask = (1u8 << remaining) - 1;
+    candidate[index] & mask == expected[index] & mask
+}
+
+fn compile_logical_rule(kind: ClassicalKind, payload: &str) -> Option<LogicalRule> {
+    let children = crate::parser::txt::parse_logical_payload(kind, payload).ok()?;
+    let mut rules = children
+        .into_iter()
+        .filter_map(compile_classical_rule)
+        .collect::<Vec<_>>();
+    match kind {
+        ClassicalKind::And => Some(LogicalRule::And(rules)),
+        ClassicalKind::Or => Some(LogicalRule::Or(rules)),
+        ClassicalKind::Not if rules.len() == 1 => Some(LogicalRule::Not(Box::new(rules.remove(0)))),
+        _ => None,
+    }
+}
+
+fn compile_classical_rule(entry: ClassicalEntry) -> Option<LogicalRule> {
+    match entry.kind {
+        ClassicalKind::And | ClassicalKind::Or | ClassicalKind::Not => {
+            compile_logical_rule(entry.kind, &entry.value)
+        }
+        _ => Some(LogicalRule::Leaf(Box::new(RulesetMatcher::compile(
+            "logical",
+            vec![entry],
+        )))),
+    }
+}
+
+impl LogicalRule {
+    fn matches(&self, context: &RulesetMatchContext<'_>) -> bool {
+        match self {
+            Self::Leaf(matcher) => matcher.matches_context(context),
+            Self::And(children) => children.iter().all(|child| child.matches(context)),
+            Self::Or(children) => children.iter().any(|child| child.matches(context)),
+            Self::Not(child) => !child.matches(context),
+        }
+    }
+
+    fn needs_process(&self) -> bool {
+        match self {
+            Self::Leaf(matcher) => matcher.has_process_predicates(),
+            Self::And(children) | Self::Or(children) => children.iter().any(Self::needs_process),
+            Self::Not(child) => child.needs_process(),
+        }
+    }
+
+    fn needs_destination_ip(&self) -> bool {
+        match self {
+            Self::Leaf(matcher) => matcher.has_destination_ip_predicates(),
+            Self::And(children) | Self::Or(children) => {
+                children.iter().any(Self::needs_destination_ip)
+            }
+            Self::Not(child) => child.needs_destination_ip(),
+        }
+    }
+
+    fn has_external_refs(&self) -> bool {
+        match self {
+            Self::Leaf(matcher) => {
+                !matcher.destination_geoip_aliases.is_empty()
+                    || !matcher.source_geoip_aliases.is_empty()
+                    || !matcher.destination_geosite_aliases.is_empty()
+                    || !matcher.destination_asn_aliases.is_empty()
+                    || !matcher.source_asn_aliases.is_empty()
+                    || matcher
+                        .logical_rules
+                        .iter()
+                        .any(LogicalRule::has_external_refs)
+            }
+            Self::And(children) | Self::Or(children) => {
+                children.iter().any(Self::has_external_refs)
+            }
+            Self::Not(child) => child.has_external_refs(),
+        }
+    }
+
+    fn matches_indexed(
+        &self,
+        state: &RulesetIndexState,
+        context: &RulesetMatchContext<'_>,
+        process_resolved: bool,
+        destination_ip_resolved: bool,
+        stack: &mut Vec<String>,
+    ) -> RulesetMatchOutcome {
+        match self {
+            Self::Leaf(matcher) => evaluate_indexed_matcher(
+                state,
+                &matcher.name,
+                matcher,
+                context,
+                process_resolved,
+                destination_ip_resolved,
+                stack,
+            ),
+            Self::And(children) => {
+                let mut outcome = RulesetMatchOutcome::Matched;
+                for child in children {
+                    outcome = and_outcome(
+                        outcome,
+                        child.matches_indexed(
+                            state,
+                            context,
+                            process_resolved,
+                            destination_ip_resolved,
+                            stack,
+                        ),
+                    );
+                    if outcome == RulesetMatchOutcome::NotMatched {
+                        break;
+                    }
+                }
+                outcome
+            }
+            Self::Or(children) => {
+                let mut outcome = RulesetMatchOutcome::NotMatched;
+                for child in children {
+                    outcome = or_outcome(
+                        outcome,
+                        child.matches_indexed(
+                            state,
+                            context,
+                            process_resolved,
+                            destination_ip_resolved,
+                            stack,
+                        ),
+                    );
+                    if outcome == RulesetMatchOutcome::Matched {
+                        break;
+                    }
+                }
+                outcome
+            }
+            Self::Not(child) => match child.matches_indexed(
+                state,
+                context,
+                process_resolved,
+                destination_ip_resolved,
+                stack,
+            ) {
+                RulesetMatchOutcome::Matched => RulesetMatchOutcome::NotMatched,
+                RulesetMatchOutcome::NotMatched => RulesetMatchOutcome::Matched,
+                deferred => deferred,
+            },
+        }
+    }
+}
+
+impl RulesetMatcher {
+    fn has_process_predicates(&self) -> bool {
+        !self.processes.is_empty()
+            || !self.process_paths.is_empty()
+            || self.process_regex_set.is_some()
+            || self.process_path_regex_set.is_some()
+            || self.process_wildcard_set.is_some()
+            || self.process_path_wildcard_set.is_some()
+            || self.logical_rules.iter().any(LogicalRule::needs_process)
+    }
+
+    fn has_destination_ip_predicates(&self) -> bool {
+        self.destination_ip_requires_resolution
+            || !self.mrs_v4_ranges.is_empty()
+            || !self.mrs_v6_ranges.is_empty()
+            || self
+                .logical_rules
+                .iter()
+                .any(LogicalRule::needs_destination_ip)
+    }
 }
 
 fn parse_port_range(s: &str) -> Option<(u16, u16)> {
@@ -1304,6 +2214,34 @@ mod tests {
     }
 
     #[test]
+    fn classical_no_resolve_ip_rule_does_not_request_dns() {
+        let entries = crate::parser::txt::parse_for_type(
+            b"IP-CIDR,1.1.1.0/24,no-resolve\n",
+            crate::RulesetType::Classical,
+        )
+        .unwrap();
+        let matcher = RulesetMatcher::compile("no-resolve", entries);
+        let unresolved = RulesetMatchContext {
+            dst_host: "resolver.example",
+            ..Default::default()
+        };
+        assert_eq!(
+            matcher.matches_context_deferred(&unresolved, true, false),
+            RulesetMatchOutcome::NotMatched
+        );
+
+        let resolved = RulesetMatchContext {
+            dst_host: "resolver.example",
+            dst_ip: Some("1.1.1.1".parse().unwrap()),
+            ..Default::default()
+        };
+        assert_eq!(
+            matcher.matches_context_deferred(&resolved, true, true),
+            RulesetMatchOutcome::Matched
+        );
+    }
+
+    #[test]
     fn port_and_process() {
         let m = RulesetMatcher::compile(
             "t",
@@ -1329,6 +2267,133 @@ mod tests {
         assert!(m.matches("im.qq.com", None, None, None));
         assert!(m.matches("baidu.com", None, None, None));
         assert!(m.matches("a.b.cn", None, None, None));
+    }
+
+    #[test]
+    fn domain_behavior_preserves_clash_wildcards_and_idna() {
+        let matcher = RulesetMatcher::compile_domains(
+            "domain",
+            [
+                ".blogger.com".into(),
+                "*.*.microsoft.com".into(),
+                "+.例子.测试".into(),
+            ],
+        );
+        assert!(matcher.matches("www.blogger.com", None, None, None));
+        assert!(!matcher.matches("blogger.com", None, None, None));
+        assert!(matcher.matches("a.b.microsoft.com", None, None, None));
+        assert!(!matcher.matches("b.microsoft.com", None, None, None));
+        assert!(matcher.matches("例子.测试", None, None, None));
+        assert!(matcher.matches("www.xn--fsqu00a.xn--0zwm56d", None, None, None));
+    }
+
+    #[test]
+    fn classical_provider_supports_extended_mihomo_context() {
+        let body = br#"
+IP-SUFFIX,8.8.8.8/24
+SRC-IP-SUFFIX,192.168.1.9/8
+IP-ASN,13335
+SRC-IP-ASN,9808
+IN-PORT,7890
+IN-TYPE,SOCKS/HTTP
+IN-USER,alice
+IN-NAME,mixed-in
+DSCP,4
+UID,1000
+PROCESS-NAME-REGEX,curl$
+PROCESS-PATH-WILDCARD,/usr/*/curl
+REMATCH-NAME,dns
+NETWORK,udp
+"#;
+        let entries =
+            crate::parser::txt::parse_for_type(body, crate::RulesetType::Classical).unwrap();
+        assert_eq!(entries.len(), 14);
+        let matcher = RulesetMatcher::compile("extended", entries);
+
+        let rematch_names = vec!["dns".into()];
+        let context = RulesetMatchContext {
+            inbound_port: Some(7890),
+            inbound_type: Some("http"),
+            inbound_user: Some("alice"),
+            inbound_name: Some("mixed-in"),
+            uid: Some(1000),
+            dscp: Some(4),
+            destination_asn: Some(13335),
+            source_asn: Some(9808),
+            rematch_names: &rematch_names,
+            network: Some("udp"),
+            ..Default::default()
+        };
+        assert!(matcher.matches_context(&context));
+
+        let suffix =
+            RulesetMatcher::compile("suffix", vec![entry(ClassicalKind::IpSuffix, "8.8.8.8/24")]);
+        assert!(suffix.matches_context(&RulesetMatchContext {
+            dst_ip: Some("1.8.8.8".parse().unwrap()),
+            ..Default::default()
+        }));
+        assert!(!suffix.matches_context(&RulesetMatchContext {
+            dst_ip: Some("8.8.4.4".parse().unwrap()),
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    fn classical_provider_logical_rules_keep_boolean_semantics() {
+        let entries = crate::parser::txt::parse_for_type(
+            b"AND,((DOMAIN,logic.example),(NETWORK,tcp))\n",
+            crate::RulesetType::Classical,
+        )
+        .unwrap();
+        let and_matcher = RulesetMatcher::compile("logical-and", entries);
+        assert!(and_matcher.matches_context(&RulesetMatchContext {
+            dst_host: "logic.example",
+            network: Some("tcp"),
+            ..Default::default()
+        }));
+        assert!(!and_matcher.matches_context(&RulesetMatchContext {
+            dst_host: "logic.example",
+            network: Some("udp"),
+            ..Default::default()
+        }));
+        let not_entries = crate::parser::txt::parse_for_type(
+            b"NOT,((DOMAIN,blocked.example))\n",
+            crate::RulesetType::Classical,
+        )
+        .unwrap();
+        let not_matcher = RulesetMatcher::compile("logical-not", not_entries);
+        assert!(not_matcher.matches_context(&RulesetMatchContext {
+            dst_host: "allowed.example",
+            network: Some("udp"),
+            ..Default::default()
+        }));
+        assert!(!not_matcher.matches_context(&RulesetMatchContext {
+            dst_host: "blocked.example",
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    fn classical_geoip_can_reference_an_indexed_mrs_style_ip_set() {
+        let index = RulesetIndex::new();
+        index.insert(Arc::new(RulesetMatcher::compile(
+            "geoip-cn",
+            vec![entry(ClassicalKind::IpCidr, "1.1.1.0/24")],
+        )));
+        index.insert(Arc::new(RulesetMatcher::compile(
+            "provider",
+            vec![entry(ClassicalKind::GeoIp, "CN")],
+        )));
+        let hit = index.matches_context_deferred(
+            "provider",
+            &RulesetMatchContext {
+                dst_ip: Some("1.1.1.1".parse().unwrap()),
+                ..Default::default()
+            },
+            true,
+            true,
+        );
+        assert_eq!(hit, RulesetMatchOutcome::Matched);
     }
 
     #[test]

@@ -356,7 +356,7 @@ impl OutboundAdapter for TuicOutbound {
             let session = self.ensure_session().await?;
             match session.register_association() {
                 Ok((assoc_id, receiver, association_state)) => {
-                    tracing::info!(
+                    tracing::debug!(
                         target: "dial::tuic",
                         id = ctx.dial_id,
                         proxy = %self.name,

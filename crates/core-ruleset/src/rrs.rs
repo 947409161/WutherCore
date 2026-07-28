@@ -9,12 +9,12 @@
 //! | **准确性** | 4B magic + 2B version + 8B createdAt + **CRC32(body)** + body length；任一字段错都立刻拒绝 |
 //! | **跨工具** | encode/decode 完整双向；CLI `ruleset convert` 把 yaml/txt/json ↔ rrs 互转 |
 //!
-//! ## 文件布局（v2）
+//! ## 文件布局（v3）
 //!
 //! ```text
 //!   offset  bytes  field
 //!   0       4      magic = "RRS\0"
-//!   4       2      version (u16 LE) = 2
+//!   4       2      version (u16 LE) = 3
 //!   6       2      flags  (u16 LE) —— 保留位（bit0 future zstd）
 //!   8       8      created_at (u64 LE epoch_secs)
 //!   16      4      body_len (u32 LE)
@@ -22,7 +22,7 @@
 //!   24      ...    body
 //! ```
 //!
-//! ## body —— 12 个固定顺序的 section
+//! ## body —— 12 个固定 section + 1 个扩展 classical section
 //!
 //! ```text
 //!   for kind in [DomainExact, DomainSuffix, DomainKeyword, DomainRegex,
@@ -31,6 +31,10 @@
 //!     count   var-len u32
 //!     for i in 0..count:
 //!       payload_for_kind
+//!   extended_classical:
+//!     count var-len u32
+//!     for i in 0..count:
+//!       var-len len || utf8 "KIND,VALUE[,no-resolve]"
 //! ```
 //!
 //! Per-kind payload：
@@ -56,7 +60,8 @@ use crate::{
 
 pub const MAGIC: [u8; 4] = *b"RRS\0";
 const VERSION_V1: u16 = 1;
-pub const VERSION: u16 = 2;
+const VERSION_V2: u16 = 2;
+pub const VERSION: u16 = 3;
 pub const HEADER_LEN: usize = 24;
 pub const MAX_STR_LEN: usize = 4096;
 
@@ -79,8 +84,13 @@ pub fn encode(entries: &[ClassicalEntry]) -> Vec<u8> {
     let mut src_ports: Vec<(u16, u16)> = Vec::new();
     let mut processes: Vec<String> = Vec::new();
     let mut process_paths: Vec<String> = Vec::new();
+    let mut extended: Vec<String> = Vec::new();
 
     for e in entries {
+        if e.policy.is_some() {
+            extended.push(format_classical_entry(e));
+            continue;
+        }
         match e.kind {
             ClassicalKind::Domain => domains.push(e.value.to_ascii_lowercase()),
             ClassicalKind::DomainSuffix => {
@@ -88,6 +98,7 @@ pub fn encode(entries: &[ClassicalEntry]) -> Vec<u8> {
             }
             ClassicalKind::DomainKeyword => keywords.push(e.value.to_ascii_lowercase()),
             ClassicalKind::DomainRegex => regex.push(e.value.clone()),
+            ClassicalKind::DomainWildcard => extended.push(format_classical_entry(e)),
             ClassicalKind::IpCidr => {
                 if let Ok(net) = e.value.parse::<ipnet::IpNet>() {
                     match net {
@@ -116,6 +127,7 @@ pub fn encode(entries: &[ClassicalEntry]) -> Vec<u8> {
             }
             ClassicalKind::ProcessName => processes.push(e.value.to_ascii_lowercase()),
             ClassicalKind::ProcessPath => process_paths.push(e.value.clone()),
+            _ => extended.push(format_classical_entry(e)),
         }
     }
 
@@ -129,6 +141,7 @@ pub fn encode(entries: &[ClassicalEntry]) -> Vec<u8> {
     dedup_sort(&mut regex);
     dedup_sort(&mut processes);
     dedup_sort(&mut process_paths);
+    dedup_sort(&mut extended);
     dst_v4.sort_by_key(|(ip, p)| (u32::from(*ip), *p));
     dst_v4.dedup();
     dst_v6.sort_by_key(|(ip, p)| (u128::from(*ip), *p));
@@ -156,6 +169,7 @@ pub fn encode(entries: &[ClassicalEntry]) -> Vec<u8> {
     encode_port_section(&mut body, &src_ports);
     encode_string_section(&mut body, &processes);
     encode_string_section(&mut body, &process_paths);
+    encode_string_section(&mut body, &extended);
 
     let body_len = body.len() as u32;
     let body_crc = crc32fast::hash(&body);
@@ -231,7 +245,7 @@ pub fn decode(buf: &[u8]) -> Result<Vec<ClassicalEntry>, ParseError> {
         return Err(err(format!("bad magic: {:?}", magic)));
     }
     let version = r.read_u16_le()?;
-    if !matches!(version, VERSION_V1 | VERSION) {
+    if !matches!(version, VERSION_V1 | VERSION_V2 | VERSION) {
         return Err(err(format!("unsupported RRS version: {}", version)));
     }
     let _flags = r.read_u16_le()?;
@@ -258,13 +272,37 @@ pub fn decode(buf: &[u8]) -> Result<Vec<ClassicalEntry>, ParseError> {
     let mut out = Vec::new();
     if version == VERSION_V1 {
         decode_v1_body(&mut br, &mut out)?;
+    } else if version == VERSION_V2 {
+        decode_v2_body(&mut br, &mut out)?;
     } else {
         decode_v2_body(&mut br, &mut out)?;
+        decode_extended_section(&mut br, &mut out)?;
     }
     if br.remaining() != 0 {
         return Err(err(format!("trailing bytes in body: {}", br.remaining())));
     }
     Ok(out)
+}
+
+fn decode_extended_section(
+    reader: &mut Reader<'_>,
+    out: &mut Vec<ClassicalEntry>,
+) -> Result<(), ParseError> {
+    let count = reader.read_varlen()? as usize;
+    for _ in 0..count {
+        let len = reader.read_varlen()? as usize;
+        if len > MAX_STR_LEN {
+            return Err(err(format!("extended rule too long: {len}")));
+        }
+        let bytes = reader.take(len)?;
+        let line = std::str::from_utf8(bytes)
+            .map_err(|error| err(format!("non-utf8 extended rule: {error}")))?;
+        out.push(
+            crate::parser::txt::parse_classical_line_strict(line)
+                .map_err(|error| err(format!("invalid extended rule `{line}`: {error}")))?,
+        );
+    }
+    Ok(())
 }
 
 fn decode_v1_body(
@@ -468,15 +506,12 @@ impl<'a> Reader<'a> {
 pub fn entries_to_yaml(entries: &[ClassicalEntry]) -> String {
     let mut out = String::from("payload:\n");
     for e in entries {
-        out.push_str("  - \"");
-        out.push_str(kind_str(e.kind));
-        out.push(',');
-        out.push_str(&e.value);
-        if let Some(p) = &e.policy {
-            out.push(',');
-            out.push_str(p);
-        }
-        out.push_str("\"\n");
+        out.push_str("  - ");
+        out.push_str(
+            &serde_json::to_string(&format_classical_entry(e))
+                .expect("serializing a classical rule string cannot fail"),
+        );
+        out.push('\n');
     }
     out
 }
@@ -484,20 +519,27 @@ pub fn entries_to_yaml(entries: &[ClassicalEntry]) -> String {
 pub fn entries_to_txt(entries: &[ClassicalEntry]) -> String {
     let mut out = String::new();
     for e in entries {
-        out.push_str(kind_str(e.kind));
-        out.push(',');
-        out.push_str(&e.value);
-        if let Some(p) = &e.policy {
-            out.push(',');
-            out.push_str(p);
-        }
+        out.push_str(&format_classical_entry(e));
         out.push('\n');
     }
     out
 }
 
-pub fn entries_to_singbox_json(entries: &[ClassicalEntry]) -> String {
-    use std::collections::BTreeMap;
+fn format_classical_entry(entry: &ClassicalEntry) -> String {
+    let mut line = kind_str(entry.kind).to_owned();
+    if !entry.value.is_empty() {
+        line.push(',');
+        line.push_str(&entry.value);
+    }
+    if let Some(policy) = &entry.policy {
+        line.push(',');
+        line.push_str(policy);
+    }
+    line
+}
+
+pub fn entries_to_singbox_json(entries: &[ClassicalEntry]) -> Result<String, String> {
+    use std::collections::{BTreeMap, BTreeSet};
 
     use serde_json::{Map, Value, json};
 
@@ -512,8 +554,13 @@ pub fn entries_to_singbox_json(entries: &[ClassicalEntry]) -> String {
     let mut destination_port_ranges = Vec::new();
     let mut source_ports = Vec::new();
     let mut source_port_ranges = Vec::new();
+    let mut unsupported = BTreeSet::new();
 
     for e in entries {
+        if e.policy.is_some() {
+            unsupported.insert(format_classical_entry(e));
+            continue;
+        }
         match e.kind {
             ClassicalKind::Domain => destination
                 .entry("domain")
@@ -538,6 +585,10 @@ pub fn entries_to_singbox_json(entries: &[ClassicalEntry]) -> String {
                 .entry("domain_regex")
                 .or_default()
                 .push(json!(e.value)),
+            ClassicalKind::DomainWildcard => destination
+                .entry("domain_regex")
+                .or_default()
+                .push(json!(wildcard_regex(&e.value))),
             ClassicalKind::IpCidr => destination
                 .entry("ip_cidr")
                 .or_default()
@@ -563,7 +614,16 @@ pub fn entries_to_singbox_json(entries: &[ClassicalEntry]) -> String {
             }
             ClassicalKind::ProcessName => processes.push(json!(e.value)),
             ClassicalKind::ProcessPath => process_paths.push(json!(e.value)),
+            _ => {
+                unsupported.insert(format_classical_entry(e));
+            }
         }
+    }
+    if !unsupported.is_empty() {
+        return Err(format!(
+            "以下 Mihomo classical 规则没有等价的 sing-box headless rule 表达，已拒绝有损导出：{}",
+            unsupported.into_iter().collect::<Vec<_>>().join("; ")
+        ));
     }
 
     let mut rules = Vec::new();
@@ -607,7 +667,7 @@ pub fn entries_to_singbox_json(entries: &[ClassicalEntry]) -> String {
     let mut output = serde_json::to_string_pretty(&json!({"version": 2, "rules": rules}))
         .expect("serializing a JSON value cannot fail");
     output.push('\n');
-    output
+    Ok(output)
 }
 
 fn kind_str(k: ClassicalKind) -> &'static str {
@@ -616,13 +676,64 @@ fn kind_str(k: ClassicalKind) -> &'static str {
         ClassicalKind::DomainSuffix => "DOMAIN-SUFFIX",
         ClassicalKind::DomainKeyword => "DOMAIN-KEYWORD",
         ClassicalKind::DomainRegex => "DOMAIN-REGEX",
+        ClassicalKind::DomainWildcard => "DOMAIN-WILDCARD",
+        ClassicalKind::GeoSite => "GEOSITE",
+        ClassicalKind::GeoIp => "GEOIP",
+        ClassicalKind::SrcGeoIp => "SRC-GEOIP",
         ClassicalKind::IpCidr => "IP-CIDR",
         ClassicalKind::SrcIpCidr => "SRC-IP-CIDR",
+        ClassicalKind::IpSuffix => "IP-SUFFIX",
+        ClassicalKind::SrcIpSuffix => "SRC-IP-SUFFIX",
+        ClassicalKind::IpAsn => "IP-ASN",
+        ClassicalKind::SrcIpAsn => "SRC-IP-ASN",
         ClassicalKind::DstPort => "DST-PORT",
         ClassicalKind::SrcPort => "SRC-PORT",
+        ClassicalKind::InPort => "IN-PORT",
+        ClassicalKind::InType => "IN-TYPE",
+        ClassicalKind::InUser => "IN-USER",
+        ClassicalKind::InName => "IN-NAME",
+        ClassicalKind::Dscp => "DSCP",
+        ClassicalKind::Uid => "UID",
         ClassicalKind::ProcessName => "PROCESS-NAME",
         ClassicalKind::ProcessPath => "PROCESS-PATH",
+        ClassicalKind::ProcessNameRegex => "PROCESS-NAME-REGEX",
+        ClassicalKind::ProcessPathRegex => "PROCESS-PATH-REGEX",
+        ClassicalKind::ProcessNameWildcard => "PROCESS-NAME-WILDCARD",
+        ClassicalKind::ProcessPathWildcard => "PROCESS-PATH-WILDCARD",
+        ClassicalKind::RematchName => "REMATCH-NAME",
+        ClassicalKind::Network => "NETWORK",
+        ClassicalKind::And => "AND",
+        ClassicalKind::Or => "OR",
+        ClassicalKind::Not => "NOT",
+        ClassicalKind::Match => "MATCH",
     }
+}
+
+fn wildcard_regex(pattern: &str) -> String {
+    let mut output = String::from("^");
+    let mut literal = String::new();
+    let flush = |literal: &mut String, output: &mut String| {
+        if !literal.is_empty() {
+            output.push_str(&regex::escape(literal));
+            literal.clear();
+        }
+    };
+    for character in pattern.chars() {
+        match character {
+            '*' => {
+                flush(&mut literal, &mut output);
+                output.push_str(".*");
+            }
+            '?' => {
+                flush(&mut literal, &mut output);
+                output.push('.');
+            }
+            character => literal.push(character),
+        }
+    }
+    flush(&mut literal, &mut output);
+    output.push('$');
+    output
 }
 
 #[cfg(test)]
@@ -791,7 +902,7 @@ mod tests {
             entry(ClassicalKind::DstPort, "1000-2000"),
             entry(ClassicalKind::ProcessPath, r"C:\Apps\browser.exe"),
         ];
-        let direct_json = entries_to_singbox_json(&input);
+        let direct_json = entries_to_singbox_json(&input).unwrap();
         let direct_value: serde_json::Value = serde_json::from_str(&direct_json).unwrap();
         assert_eq!(
             direct_value["rules"][0]["domain_suffix"][0],
@@ -799,7 +910,7 @@ mod tests {
         );
         let bin = encode(&input);
         let out = decode(&bin).unwrap();
-        let json = entries_to_singbox_json(&out);
+        let json = entries_to_singbox_json(&out).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(
             value["rules"][0]["domain_suffix"][0],
@@ -818,5 +929,41 @@ mod tests {
             ..Default::default()
         };
         assert!(matcher.matches_context(&context));
+    }
+
+    #[test]
+    fn v3_roundtrip_preserves_extended_rules_and_match_without_trailing_comma() {
+        let mut no_resolve = entry(ClassicalKind::IpAsn, "13335");
+        no_resolve.policy = Some("no-resolve".into());
+        let input = vec![
+            entry(ClassicalKind::DomainWildcard, "*.example.com"),
+            entry(ClassicalKind::InType, "http/socks"),
+            entry(ClassicalKind::And, "((DOMAIN,logic.example),(NETWORK,tcp))"),
+            entry(ClassicalKind::Match, ""),
+            no_resolve,
+        ];
+        let output = decode(&encode(&input)).unwrap();
+        let text = entries_to_txt(&output);
+        assert!(text.lines().any(|line| line == "MATCH"));
+        assert!(!text.lines().any(|line| line == "MATCH,"));
+        for expected in [
+            ClassicalKind::DomainWildcard,
+            ClassicalKind::InType,
+            ClassicalKind::And,
+            ClassicalKind::Match,
+            ClassicalKind::IpAsn,
+        ] {
+            assert!(output.iter().any(|entry| entry.kind == expected));
+        }
+        assert!(output.iter().any(|entry| {
+            entry.kind == ClassicalKind::IpAsn && entry.policy.as_deref() == Some("no-resolve")
+        }));
+    }
+
+    #[test]
+    fn singbox_export_rejects_rules_it_cannot_represent_without_loss() {
+        let error =
+            entries_to_singbox_json(&[entry(ClassicalKind::IpSuffix, "8.8.8.8/24")]).unwrap_err();
+        assert!(error.contains("IP-SUFFIX,8.8.8.8/24"));
     }
 }

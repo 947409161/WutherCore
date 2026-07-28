@@ -18,7 +18,7 @@ use std::{
 };
 
 use parking_lot::Mutex;
-use tracing::{debug, warn};
+use tracing::warn;
 
 use crate::{
     packet::{FrameFormat, L4, ParsedPacket, encode_tun_ip_frame, parse_ip_packet},
@@ -162,7 +162,7 @@ pub async fn write_ip_packet_to_tun(
     };
     let n = device.write_packet(frame.as_ref()).await?;
     if !matches!(format, FrameFormat::RawIp) {
-        debug!(
+        tracing::trace!(
             target: "capture::traffic",
             frame = ?format,
             ip_bytes = pkt.len(),

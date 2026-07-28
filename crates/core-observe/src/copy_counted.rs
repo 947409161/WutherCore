@@ -30,7 +30,15 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{ConnectionAccounting, Metrics};
 
-const BUF_SIZE: usize = 32 * 1024;
+const INITIAL_BUF_SIZE: usize = 8 * 1024;
+const MAX_BUF_SIZE: usize = 64 * 1024;
+
+#[inline]
+fn grow_buffer_after_full_read(buffer: &mut Vec<u8>, bytes_read: usize) {
+    if bytes_read == buffer.len() && buffer.len() < MAX_BUF_SIZE {
+        buffer.resize((buffer.len() * 2).min(MAX_BUF_SIZE), 0);
+    }
+}
 
 /// 把 `read` 结果归类为：拿到 N 字节继续 / 干净 EOF 该 break / 真错。
 ///
@@ -76,10 +84,11 @@ where
     let up_counter = up.clone();
     let cancel_up = cancel.clone();
     let up_task = async move {
-        let mut buf = vec![0u8; BUF_SIZE];
+        let mut buf = vec![0u8; INITIAL_BUF_SIZE];
         let mut total: u64 = 0;
         loop {
             tokio::select! {
+                biased;
                 _ = cancel_up.cancelled() => {
                     let _ = bw.shutdown().await;
                     break;
@@ -93,9 +102,10 @@ where
                     if let Err(e) = bw.write_all(&buf[..n]).await {
                         return Err(e);
                     }
-                    total += n as u64;
+                    total = total.saturating_add(n as u64);
                     up_counter.fetch_add(n as u64, Ordering::Relaxed);
                     if let Some(m) = &up_metrics { m.add_up(n as u64); }
+                    grow_buffer_after_full_read(&mut buf, n);
                 }
             }
         }
@@ -106,10 +116,11 @@ where
     let down_counter = down.clone();
     let cancel_down = cancel.clone();
     let down_task = async move {
-        let mut buf = vec![0u8; BUF_SIZE];
+        let mut buf = vec![0u8; INITIAL_BUF_SIZE];
         let mut total: u64 = 0;
         loop {
             tokio::select! {
+                biased;
                 _ = cancel_down.cancelled() => {
                     let _ = aw.shutdown().await;
                     break;
@@ -123,9 +134,10 @@ where
                     if let Err(e) = aw.write_all(&buf[..n]).await {
                         return Err(e);
                     }
-                    total += n as u64;
+                    total = total.saturating_add(n as u64);
                     down_counter.fetch_add(n as u64, Ordering::Relaxed);
                     if let Some(m) = &down_metrics { m.add_down(n as u64); }
+                    grow_buffer_after_full_read(&mut buf, n);
                 }
             }
         }
@@ -140,8 +152,8 @@ where
 /// 双向拷贝并通过完整连接管理器计数。
 ///
 /// 这个路径对应 mihomo `statistic.NewTCPTracker`/`NewUDPTracker` 的热路径：
-/// 每段数据同时更新连接累计值、管理器总流量、连接 max rate 和 `/traffic`
-/// 全局指标。
+/// 每段数据更新连接累计值、分片管理器总流量和 `/traffic` 全局指标。
+/// 连接 max rate 在 dashboard 快照时按累计差值采样，复制循环不获取速率锁。
 pub async fn copy_bidirectional_tracked<A, B>(
     a: &mut A,
     b: &mut B,
@@ -159,10 +171,11 @@ where
     let up_accounting = accounting.clone();
     let cancel_up = accounting.cancel_token();
     let up_task = async move {
-        let mut buf = vec![0u8; BUF_SIZE];
+        let mut buf = vec![0u8; INITIAL_BUF_SIZE];
         let mut total: u64 = 0;
         loop {
             tokio::select! {
+                biased;
                 _ = cancel_up.cancelled() => {
                     let _ = bw.shutdown().await;
                     break;
@@ -176,9 +189,10 @@ where
                     if let Err(e) = bw.write_all(&buf[..n]).await {
                         return Err(e);
                     }
-                    total += n as u64;
+                    total = total.saturating_add(n as u64);
                     up_accounting.record_upload(n as u64);
                     if let Some(m) = &up_metrics { m.add_up(n as u64); }
+                    grow_buffer_after_full_read(&mut buf, n);
                 }
             }
         }
@@ -189,10 +203,11 @@ where
     let down_accounting = accounting.clone();
     let cancel_down = accounting.cancel_token();
     let down_task = async move {
-        let mut buf = vec![0u8; BUF_SIZE];
+        let mut buf = vec![0u8; INITIAL_BUF_SIZE];
         let mut total: u64 = 0;
         loop {
             tokio::select! {
+                biased;
                 _ = cancel_down.cancelled() => {
                     let _ = aw.shutdown().await;
                     break;
@@ -206,9 +221,10 @@ where
                     if let Err(e) = aw.write_all(&buf[..n]).await {
                         return Err(e);
                     }
-                    total += n as u64;
+                    total = total.saturating_add(n as u64);
                     down_accounting.record_download(n as u64);
                     if let Some(m) = &down_metrics { m.add_down(n as u64); }
+                    grow_buffer_after_full_read(&mut buf, n);
                 }
             }
         }
@@ -248,6 +264,21 @@ mod tests {
     fn classify_normal_data_and_eof() {
         assert!(matches!(classify_read(Ok(0)), ReadOutcome::Eof));
         assert!(matches!(classify_read(Ok(42)), ReadOutcome::Data(42)));
+    }
+
+    #[test]
+    fn relay_buffer_grows_for_bulk_traffic_but_stays_small_when_idle() {
+        let mut buffer = vec![0_u8; INITIAL_BUF_SIZE];
+        assert_eq!(buffer.len(), 8 * 1024);
+        grow_buffer_after_full_read(&mut buffer, 1);
+        assert_eq!(buffer.len(), INITIAL_BUF_SIZE);
+        while buffer.len() < MAX_BUF_SIZE {
+            let full = buffer.len();
+            grow_buffer_after_full_read(&mut buffer, full);
+        }
+        assert_eq!(buffer.len(), 64 * 1024);
+        grow_buffer_after_full_read(&mut buffer, MAX_BUF_SIZE);
+        assert_eq!(buffer.len(), MAX_BUF_SIZE);
     }
 
     #[tokio::test]

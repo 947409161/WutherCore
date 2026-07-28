@@ -11,7 +11,7 @@ use std::{
 use core_runtime::{ListenerHandler, Runtime};
 use futures::{SinkExt, StreamExt};
 use tokio::{sync::oneshot, time::MissedTickBehavior};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::{
     eim_nat::EimNatTable,
@@ -342,7 +342,7 @@ async fn handle_netstack_tcp(
     let source = remote_addr;
 
     if inbound.should_hijack_dns(original_dst) {
-        info!(target: "capture::dns", network = "tcp", src = %source, dst = %original_dst, "dns tcp hijack in netstack");
+        trace!(target: "capture::dns", network = "tcp", src = %source, dst = %original_dst, "dns tcp hijack in netstack");
         if let Err(e) = crate::fakeip_dns::serve_tcp_stream(stream, dns_service).await {
             warn!(target: "capture::dns", error = %e, "netstack dns tcp hijack failed");
         }
@@ -421,9 +421,9 @@ async fn handle_netstack_tcp(
         result.outbound.clone()
     };
     if result.rule.is_empty() {
-        info!(target: "capture::traffic", "[TCP] #{conn_id} {src_label} --> {host}:{port} using {proxy}");
+        trace!(target: "capture::traffic", "[TCP] #{conn_id} {src_label} --> {host}:{port} using {proxy}");
     } else {
-        info!(target: "capture::traffic", "[TCP] #{conn_id} {src_label} --> {host}:{port} match {}({}) using {proxy}", result.rule, result.rule_payload);
+        trace!(target: "capture::traffic", "[TCP] #{conn_id} {src_label} --> {host}:{port} match {}({}) using {proxy}", result.rule, result.rule_payload);
     }
 
     // replay sniffed initial payload
@@ -456,7 +456,7 @@ async fn handle_netstack_tcp(
     let down_s = crate::tun_pump::format_bytes(down);
     match &outcome {
         Ok(_) => {
-            info!(target: "capture::traffic", "[TCP] #{conn_id} {src_label} --> {host}:{port} closed | up {up_s} down {down_s} | {elapsed_ms}ms")
+            trace!(target: "capture::traffic", "[TCP] #{conn_id} {src_label} --> {host}:{port} closed | up {up_s} down {down_s} | {elapsed_ms}ms")
         }
         Err(e) => {
             warn!(target: "capture::traffic", "[TCP] #{conn_id} {src_label} --> {host}:{port} error: {e} | up {up_s} down {down_s} | {elapsed_ms}ms")
