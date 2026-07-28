@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-28
+
 ### Security
 
 - Clash 兼容 `GET /configs` 的 `authentication` 只返回用户名，不再回传明文密码。
@@ -40,4 +42,5 @@
 - 高危依赖变更会阻止 Pull Request 合并；
 - CodeQL 初次扫描告警由 [Issue #9](https://github.com/MiChongs/WutherCore/issues/9) 跟踪，未批量忽略。
 
-[Unreleased]: https://github.com/MiChongs/WutherCore/compare/main...HEAD
+[Unreleased]: https://github.com/MiChongs/WutherCore/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/MiChongs/WutherCore/compare/v0.3.1-rc.5...v0.3.1
