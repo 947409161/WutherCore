@@ -86,6 +86,8 @@ arc-swap = "1"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
+comfy-table = "7.2.2"
+unicode-width = "0.2"
 
 # Web / API
 axum = { version = "0.8", features = ["ws", "macros"] }

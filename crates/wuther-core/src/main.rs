@@ -13,6 +13,10 @@ use std::{path::PathBuf, sync::Arc};
 use anyhow::Context;
 use async_trait::async_trait;
 use clap::{Parser, Subcommand, ValueEnum};
+use comfy_table::{
+    Attribute, Cell, CellAlignment, ColumnConstraint, ContentArrangement, Table, Width,
+    modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL_CONDENSED,
+};
 #[cfg(feature = "with_api")]
 use core_api::ApiServer;
 use core_config::loader::load_from_path;
@@ -715,20 +719,9 @@ async fn cmd_traffic(
     }
 
     println!("WutherCore 持久流量汇总");
-    println!("数据源    {source}");
-    if total.blob.first_seen_secs != 0 {
-        println!(
-            "统计区间  {} 至 {}",
-            format_epoch(total.blob.first_seen_secs),
-            format_epoch(total.blob.last_seen_secs)
-        );
-    }
-    println!("累计上传  {}", format_traffic_value(&total.upload, exact));
-    println!("累计下载  {}", format_traffic_value(&total.download, exact));
-    println!("累计总量  {}", format_traffic_value(&total.total, exact));
     println!(
-        "连接次数  {}",
-        format_decimal_grouped(&total.blob.connections.to_string())
+        "{}",
+        render_traffic_summary_table(&source, &total, exact, None)
     );
 
     let dimensions: Vec<&str> = match category.dimension() {
@@ -743,21 +736,9 @@ async fn cmd_traffic(
         println!();
         println!("{}", traffic_dimension_title(dimension));
         println!(
-            "{:<30} {:>14} {:>14} {:>14} {:>9} {:>10}",
-            "名称", "上传", "下载", "总量", "占比", "连接"
+            "{}",
+            render_traffic_dimension_table(&selected, &total, exact, None)
         );
-        for row in selected {
-            let name = truncate_chars(&row.blob.label, 28);
-            println!(
-                "{:<30} {:>14} {:>14} {:>14} {:>8} {:>10}",
-                name,
-                format_traffic_value(&row.upload, exact),
-                format_traffic_value(&row.download, exact),
-                format_traffic_value(&row.total, exact),
-                traffic_percentage(&row.total, &total.total),
-                format_decimal_grouped(&row.blob.connections.to_string()),
-            );
-        }
     }
     Ok(())
 }
@@ -948,16 +929,156 @@ fn format_decimal_grouped(value: &str) -> String {
     out
 }
 
-fn truncate_chars(value: &str, max: usize) -> String {
-    if value.chars().count() <= max {
-        return value.to_string();
+fn traffic_table(width_override: Option<u16>) -> (Table, u16) {
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL_CONDENSED)
+        .apply_modifier(UTF8_ROUND_CORNERS)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_truncation_indicator("…");
+
+    // Comfy Table detects the terminal width itself. A deterministic fallback
+    // keeps redirected output bounded, while the cap avoids unreadably wide
+    // tables on ultrawide terminals.
+    let width = width_override
+        .or_else(|| table.width())
+        .unwrap_or(120)
+        .clamp(20, 160);
+    table.set_width(width);
+    (table, width)
+}
+
+fn traffic_header(value: &str) -> Cell {
+    Cell::new(value).add_attribute(Attribute::Bold)
+}
+
+fn render_traffic_summary_table(
+    source: &str,
+    total: &TrafficRow,
+    exact: bool,
+    width_override: Option<u16>,
+) -> String {
+    let (mut table, _) = traffic_table(width_override);
+    table.set_header([traffic_header("统计项"), traffic_header("数值")]);
+    table.add_row([Cell::new("数据源"), Cell::new(source)]);
+    if total.blob.first_seen_secs != 0 {
+        table.add_row([
+            Cell::new("统计区间"),
+            Cell::new(format!(
+                "{} 至 {}",
+                format_epoch(total.blob.first_seen_secs),
+                format_epoch(total.blob.last_seen_secs)
+            )),
+        ]);
     }
-    let mut result = value
-        .chars()
-        .take(max.saturating_sub(3))
-        .collect::<String>();
-    result.push_str("...");
-    result
+    table.add_row([
+        Cell::new("累计上传"),
+        Cell::new(format_traffic_value(&total.upload, exact)),
+    ]);
+    table.add_row([
+        Cell::new("累计下载"),
+        Cell::new(format_traffic_value(&total.download, exact)),
+    ]);
+    table.add_row([
+        Cell::new("累计总量").add_attribute(Attribute::Bold),
+        Cell::new(format_traffic_value(&total.total, exact)).add_attribute(Attribute::Bold),
+    ]);
+    table.add_row([
+        Cell::new("连接次数"),
+        Cell::new(format_decimal_grouped(&total.blob.connections.to_string())),
+    ]);
+
+    if let Some(column) = table.column_mut(0) {
+        column.set_constraint(ColumnConstraint::Absolute(Width::Fixed(12)));
+    }
+    table.to_string()
+}
+
+fn render_traffic_dimension_table(
+    rows: &[&TrafficRow],
+    total: &TrafficRow,
+    exact: bool,
+    width_override: Option<u16>,
+) -> String {
+    let (mut table, width) = traffic_table(width_override);
+    if width >= 110 {
+        table.set_header([
+            traffic_header("名称"),
+            traffic_header("上传"),
+            traffic_header("下载"),
+            traffic_header("总量"),
+            traffic_header("占比"),
+            traffic_header("连接"),
+        ]);
+        for row in rows {
+            table.add_row([
+                Cell::new(&row.blob.label),
+                Cell::new(format_traffic_value(&row.upload, exact)),
+                Cell::new(format_traffic_value(&row.download, exact)),
+                Cell::new(format_traffic_value(&row.total, exact)),
+                Cell::new(traffic_percentage(&row.total, &total.total)),
+                Cell::new(format_decimal_grouped(&row.blob.connections.to_string())),
+            ]);
+        }
+        if let Some(column) = table.column_mut(0) {
+            column.set_constraint(ColumnConstraint::UpperBoundary(Width::Percentage(35)));
+        }
+        for index in 1..6 {
+            if let Some(column) = table.column_mut(index) {
+                column.set_cell_alignment(CellAlignment::Right);
+            }
+        }
+    } else if width >= 60 {
+        table.set_header([
+            traffic_header("名称"),
+            traffic_header("流量"),
+            traffic_header("占比"),
+            traffic_header("连接"),
+        ]);
+        for row in rows {
+            table.add_row([
+                Cell::new(&row.blob.label),
+                Cell::new(format!(
+                    "上传 {}\n下载 {}\n总量 {}",
+                    format_traffic_value(&row.upload, exact),
+                    format_traffic_value(&row.download, exact),
+                    format_traffic_value(&row.total, exact)
+                )),
+                Cell::new(traffic_percentage(&row.total, &total.total)),
+                Cell::new(format_decimal_grouped(&row.blob.connections.to_string())),
+            ]);
+        }
+        if let Some(column) = table.column_mut(0) {
+            column.set_constraint(ColumnConstraint::UpperBoundary(Width::Percentage(40)));
+        }
+        for index in 1..4 {
+            if let Some(column) = table.column_mut(index) {
+                column.set_cell_alignment(CellAlignment::Right);
+            }
+        }
+    } else {
+        table.set_header([traffic_header("名称"), traffic_header("明细")]);
+        for row in rows {
+            table.add_row([
+                Cell::new(&row.blob.label),
+                Cell::new(format!(
+                    "上传 {}\n下载 {}\n总量 {}\n占比 {}\n连接 {}",
+                    format_traffic_value(&row.upload, exact),
+                    format_traffic_value(&row.download, exact),
+                    format_traffic_value(&row.total, exact),
+                    traffic_percentage(&row.total, &total.total),
+                    format_decimal_grouped(&row.blob.connections.to_string())
+                )),
+            ]);
+        }
+        if let Some(column) = table.column_mut(0) {
+            column.set_constraint(ColumnConstraint::UpperBoundary(Width::Percentage(42)));
+        }
+        if let Some(column) = table.column_mut(1) {
+            column.set_cell_alignment(CellAlignment::Right);
+        }
+    }
+    table.to_string()
 }
 
 fn traffic_dimension_title(dimension: &str) -> &'static str {
@@ -2256,6 +2377,40 @@ impl FeedSink for RuntimeFeedSink {
 #[cfg(test)]
 mod traffic_cli_tests {
     use super::*;
+    use unicode_width::UnicodeWidthStr;
+
+    fn traffic_row(
+        dimension: &str,
+        label: &str,
+        upload: u64,
+        download: u64,
+        connections: u64,
+    ) -> TrafficRow {
+        let upload = BigUint::from(upload);
+        let download = BigUint::from(download);
+        TrafficRow {
+            blob: TrafficTotalBlob {
+                dimension: dimension.into(),
+                label: label.into(),
+                upload: upload.to_str_radix(10),
+                download: download.to_str_radix(10),
+                connections,
+                ..TrafficTotalBlob::default()
+            },
+            total: &upload + &download,
+            upload,
+            download,
+        }
+    }
+
+    fn assert_table_fits(output: &str, width: usize) {
+        for line in output.lines() {
+            assert!(
+                UnicodeWidthStr::width(line) <= width,
+                "line exceeds width {width}: {line:?}"
+            );
+        }
+    }
 
     #[test]
     fn byte_formatter_reaches_bb_and_keeps_growing() {
@@ -2283,6 +2438,53 @@ mod traffic_cli_tests {
     fn epoch_formatter_is_stable_utc() {
         assert_eq!(format_epoch(0), "1970-01-01 00:00:00 UTC");
         assert_eq!(format_epoch(1_704_067_200), "2024-01-01 00:00:00 UTC");
+    }
+
+    #[test]
+    fn traffic_summary_is_a_bounded_unicode_table() {
+        let mut total = traffic_row("total", "all", 1_048_576, 2_097_152, 12_345);
+        total.blob.first_seen_secs = 1_704_067_200;
+        total.blob.last_seen_secs = 1_704_070_800;
+
+        let output = render_traffic_summary_table(
+            "D:\\WutherCore\\data\\state\\wuthercore.db",
+            &total,
+            false,
+            Some(72),
+        );
+
+        assert!(output.contains("统计项"));
+        assert!(output.contains("累计总量"));
+        assert!(output.contains("12,345"));
+        assert!(output.contains("2024-01-01 00:00:00 UTC"));
+        assert_table_fits(&output, 72);
+    }
+
+    #[test]
+    fn traffic_table_uses_full_columns_on_wide_terminals() {
+        let total = traffic_row("total", "all", 10_000_000, 20_000_000, 100);
+        let row = traffic_row("outbound", "香港专线 HK-D-1-0.2x", 1_000_000, 2_000_000, 12);
+        let output = render_traffic_dimension_table(&[&row], &total, false, Some(120));
+
+        for header in ["名称", "上传", "下载", "总量", "占比", "连接"] {
+            assert!(output.contains(header), "missing header {header}");
+        }
+        assert!(output.contains("香港专线"));
+        assert!(!output.contains("明细"));
+        assert_table_fits(&output, 120);
+    }
+
+    #[test]
+    fn traffic_table_keeps_every_metric_on_narrow_terminals() {
+        let total = traffic_row("total", "all", 10_000_000, 20_000_000, 100);
+        let row = traffic_row("outbound", "香港专线 HK-D-1-0.2x", 1_000_000, 2_000_000, 12);
+        let output = render_traffic_dimension_table(&[&row], &total, false, Some(52));
+
+        assert!(output.contains("明细"));
+        for metric in ["上传", "下载", "总量", "占比", "连接"] {
+            assert!(output.contains(metric), "missing metric {metric}");
+        }
+        assert_table_fits(&output, 52);
     }
 
     #[test]

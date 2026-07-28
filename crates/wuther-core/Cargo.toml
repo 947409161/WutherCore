@@ -109,6 +109,7 @@ core-mesh     = { workspace = true }
 core-observe  = { workspace = true }
 core-young    = { workspace = true, optional = true }
 clap          = { workspace = true }
+comfy-table   = { workspace = true }
 tokio         = { workspace = true }
 anyhow        = { workspace = true }
 tracing       = { workspace = true }
@@ -119,3 +120,6 @@ serde_json    = { workspace = true }
 serde_yaml    = { workspace = true }
 async-trait   = { workspace = true }
 num-bigint    = { workspace = true }
+
+[dev-dependencies]
+unicode-width = { workspace = true }
