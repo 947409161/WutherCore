@@ -121,11 +121,11 @@ GitHub Actions 的 **Build Matrix** 和 **CI** 手动运行入口也提供 `tags
 
 | 目标类别 | 首选后端 | 兜底 | 备注 |
 |---|---|---|---|
-| `*-pc-windows-msvc` | cargo（本机） | — | 直接 cargo build |
+| `*-pc-windows-msvc` | cargo（本机） | 无 | 直接 cargo build |
 | `*-unknown-linux-*` | **cargo-zigbuild + zig** | cross 0.2.5 + Docker | zigbuild 无需 Docker，体积更小 |
 | `*-linux-android*` | **cargo-ndk + Android NDK** | cross 0.2.5 | cross 0.2.5 的 android 镜像缺 `libunwind`；强烈建议用 cargo-ndk |
-| `*-unknown-freebsd*` | cross + Docker | — | |
-| `*-apple-*` | — | — | 必须 macOS 主机 |
+| `*-unknown-freebsd*` | cross + Docker | 无 | |
+| `*-apple-*` | 无 | 无 | 必须 macOS 主机 |
 
 脚本启动时会自动安装：
 
@@ -159,9 +159,9 @@ dist/
 ```
 
 每个归档包含：
-- `wuther-core[.exe]` —— 内核可执行文件
+- `wuther-core[.exe]`：内核可执行文件
 - `README.md`、`LICENSE` 与 `BUILD-COMPONENTS.txt`
-- `examples/` —— 桌面、路由器、Android、订阅和手动节点模板
+- `examples/`：桌面、路由器、Android、订阅和手动节点模板
 
 GitHub Release 还会统一生成 `SHA256SUMS`，并为所有归档写入 GitHub Artifact Attestation。
 
@@ -179,9 +179,9 @@ GitHub Release 还会统一生成 `SHA256SUMS`，并为所有归档写入 GitHub
 | `aarch64-linux-android` | ✅ | **cargo-ndk** | 需要 ANDROID_NDK_HOME（推荐 NDK r26+） |
 | `armv7-linux-androideabi` | ✅ | cargo-ndk | 同上 |
 | `x86_64-linux-android` | ✅ | cargo-ndk | 同上 |
-| `x86_64-apple-darwin` | ❌ 跳过 | — | 需 macOS 主机或 zigbuild + Apple SDK |
-| `aarch64-apple-darwin` | ❌ 跳过 | — | 同上 |
-| `aarch64-apple-ios` | ❌ 跳过 | — | 需 macOS + Xcode |
+| `x86_64-apple-darwin` | ❌ 跳过 | 无 | 需 macOS 主机或 zigbuild + Apple SDK |
+| `aarch64-apple-darwin` | ❌ 跳过 | 无 | 同上 |
+| `aarch64-apple-ios` | ❌ 跳过 | 无 | 需 macOS + Xcode |
 
 ## 校验
 

@@ -7,7 +7,7 @@ site_author: WutherCore contributors
 repo_url: https://github.com/MiChongs/WutherCore
 repo_name: MiChongs/WutherCore
 edit_uri: edit/main/docs/
-copyright: Copyright &copy; 2026 WutherCore contributors · MIT License
+copyright: Copyright &copy; 2026 WutherCore contributors，MIT License
 
 docs_dir: docs
 site_dir: site
@@ -166,6 +166,24 @@ nav:
       - 功能矩阵: FEATURES.md
       - 配置指南: CONFIGURATION.md
       - 排错手册: TROUBLESHOOTING.md
+  - 完整手册:
+      - 手册入口: manual/index.md
+      - 配置文件: manual/configuration-file.md
+      - 监听与入站: manual/inbounds.md
+      - 订阅与节点: manual/feeds-nodes.md
+      - 策略组、路由与 DNS: manual/routing-dns.md
+      - 系统接管: manual/capture.md
+      - 运行管理: manual/runtime-management.md
+      - XHTTP 与 StreamSettings: manual/xhttp-stream.md
+      - 命令行参考: manual/cli.md
+      - 逐字段索引:
+          - 根配置与日志: manual/generated/core.md
+          - 监听与服务端入站: manual/generated/inbounds.md
+          - 订阅、节点与出站: manual/generated/feeds-nodes.md
+          - 策略组、路由与 DNS: manual/generated/routing-dns.md
+          - 系统接管与运行管理: manual/generated/capture-runtime.md
+          - XHTTP 与 SplitHTTP: manual/generated/xhttp.md
+          - StreamSettings 与 socket: manual/generated/stream.md
   - 协议与传输:
       - 协议概览: protocols/index.md
       - AnyTLS: ANYTLS.md

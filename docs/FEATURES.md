@@ -9,7 +9,7 @@
 | Friendly YAML | 已实现 | Profile 默认值、显式覆盖、`check` 与 `explain` |
 | Mixed 入站 | 已实现 | 一个监听端口同时接受 HTTP 和 SOCKS5 |
 | 订阅管理 | 已实现 | 原生 YAML/JSON、Young、格式与协议探测、HTTP/文件/内联、Age 解密、Mihomo 26 类节点、过滤与安全缓存 |
-| 外部规则集 | 已实现 | Mihomo YAML/文本/MRS v1、sing-box JSON/SRS v1–v5、内联 Payload、RRS |
+| 外部规则集 | 已实现 | Mihomo YAML/文本/MRS v1、sing-box JSON/SRS v1-v5、内联 Payload、RRS |
 | 路由匹配 | 已实现 | 域名、IP、端口、进程、规则集与嗅探信息 |
 | 策略组 | 已实现 | Manual、Load Balance、URLTest、Smart |
 | DNS | 已实现 | 多上游、缓存、Hosts、Fallback、Fake IP、IPv6 策略 |
@@ -24,12 +24,12 @@
 
 | 平台 | HTTP / SOCKS5 | TUN | TPROXY | REDIRECT | 特殊接入 |
 | --- | :---: | :---: | :---: | :---: | --- |
-| Windows | 是 | 是 | — | — | Wintun 与系统路由 |
+| Windows | 是 | 是 | 无 |，| Wintun 与系统路由 |
 | Linux | 是 | 是 | 是 | 是 | 策略路由、iptables/nftables 环境 |
-| macOS | 是 | 是 | — | — | 系统 TUN 与路由 |
+| macOS | 是 | 是 | 无 |，| 系统 TUN 与路由 |
 | Android | 宿主决定 | 是 | root | root | VpnService 文件描述符 |
 
-符号“—”表示该平台没有对应实现路径。透明代理通常需要管理员或 root 权限，并可能受防火墙、虚拟网卡和其他 VPN 软件影响。
+符号“-”表示该平台没有对应实现路径。透明代理通常需要管理员或 root 权限，并可能受防火墙、虚拟网卡和其他 VPN 软件影响。
 
 ## 出站实现
 
@@ -60,7 +60,7 @@ WireGuard 的字段、约束和完整示例见 [WireGuard 配置](WIREGUARD.md)�
 
 原生自由订阅、Mihomo provider、Age 密钥、请求头、过滤语义和协议边界见 [自由订阅与 Mihomo 代理提供者](FEEDS.md)。
 
-规则集运行时支持 Mihomo YAML/文本/MRS v1、sing-box JSON/SRS v1–v5 和 WutherCore RRS。二进制输入会先经过有界解压与结构校验，再编译为与文本规则共用的 matcher。
+规则集运行时支持 Mihomo YAML/文本/MRS v1、sing-box JSON/SRS v1-v5 和 WutherCore RRS。二进制输入会先经过有界解压与结构校验，再编译为与文本规则共用的 matcher。
 
 规则集索引还提供版本化的 destination-IP 前缀快照与 `watch` 更新通知：
 

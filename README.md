@@ -17,12 +17,12 @@
 </p>
 
 <p align="center">
-  <a href="https://michongs.github.io/WutherCore/">在线文档</a> ·
-  <a href="#快速开始">快速开始</a> ·
-  <a href="#协议支持">协议支持</a> ·
-  <a href="#流量接管">流量接管</a> ·
-  <a href="docs/CONFIGURATION.md">配置指南</a> ·
-  <a href="docs/API.md">管理 API</a> ·
+  <a href="https://michongs.github.io/WutherCore/">在线文档</a>
+  <a href="#快速开始">快速开始</a>
+  <a href="#协议支持">协议支持</a>
+  <a href="#流量接管">流量接管</a>
+  <a href="docs/CONFIGURATION.md">配置指南</a>
+  <a href="docs/API.md">管理 API</a>
   <a href="docs/ARCHITECTURE.md">架构</a>
 </p>
 

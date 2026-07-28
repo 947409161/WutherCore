@@ -10,7 +10,7 @@ hide:
 
 <div class="wuther-hero__content" markdown>
 
-<span class="wuther-eyebrow">WUTHERCORE · RUST NETWORK KERNEL</span>
+<span class="wuther-eyebrow">WUTHERCORE / RUST NETWORK KERNEL</span>
 
 # 一颗内核，<br><span class="wuther-nowrap">连接每个平台</span>
 
@@ -33,7 +33,7 @@ WutherCore 将代理协议、DNS、规则分流、透明接管、订阅更新和
 </div>
 </div>
 
-<div class="wuther-hero__visual"><div class="wuther-kernel-panel"><div class="wuther-kernel-panel__head"><span>RUNTIME PIPELINE</span><span>WC/031</span></div><div class="wuther-pipeline"><div><b>01</b><span>CAPTURE</span><small>TUN · MIXED · REDIRECT</small></div><div><b>02</b><span>RESOLVE</span><small>DNS · FAKE IP · PROCESS</small></div><div><b>03</b><span>ROUTE</span><small>RULESET · POLICY · SMART</small></div><div><b>04</b><span>TRANSPORT</span><small>TCP · QUIC · H3 · WG</small></div></div><div class="wuther-kernel-panel__foot"><span>BUILD</span><code>--features "portable"</code></div></div></div>
+<div class="wuther-hero__visual"><div class="wuther-kernel-panel"><div class="wuther-kernel-panel__head"><span>RUNTIME PIPELINE</span><span>WC/031</span></div><div class="wuther-pipeline"><div><b>01</b><span>CAPTURE</span><small>TUN / MIXED / REDIRECT</small></div><div><b>02</b><span>RESOLVE</span><small>DNS / FAKE IP / PROCESS</small></div><div><b>03</b><span>ROUTE</span><small>RULESET / POLICY / SMART</small></div><div><b>04</b><span>TRANSPORT</span><small>TCP / QUIC / H3 / WG</small></div></div><div class="wuther-kernel-panel__foot"><span>BUILD</span><code>--features "portable"</code></div></div></div>
 </section>
 
 ## 从配置到网络的数据路径

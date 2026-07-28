@@ -31,12 +31,30 @@ REQUIRED_FILES = (
     "docs/API.md",
     "docs/TROUBLESHOOTING.md",
     "docs/RELEASING.md",
+    "docs/manual/index.md",
+    "docs/manual/configuration-file.md",
+    "docs/manual/inbounds.md",
+    "docs/manual/feeds-nodes.md",
+    "docs/manual/routing-dns.md",
+    "docs/manual/capture.md",
+    "docs/manual/runtime-management.md",
+    "docs/manual/xhttp-stream.md",
+    "docs/manual/cli.md",
+    "docs/manual/generated/core.md",
+    "docs/manual/generated/inbounds.md",
+    "docs/manual/generated/feeds-nodes.md",
+    "docs/manual/generated/routing-dns.md",
+    "docs/manual/generated/capture-runtime.md",
+    "docs/manual/generated/xhttp.md",
+    "docs/manual/generated/stream.md",
     "docs/assets/wuthercore-hero.jpg",
+    "scripts/config-reference.py",
 )
 
 MARKDOWN_LINK = re.compile(r"!?\[[^\]]*]\(([^)\s]+)")
 HTML_LINK = re.compile(r"""(?:href|src)=["']([^"']+)["']""", re.IGNORECASE)
 IGNORED_SCHEMES = {"http", "https", "mailto", "data", "javascript"}
+PLAIN_PUNCTUATION = re.compile(r"[\u00b7\u2022\u2013\u2014]|^-{4,}\s*$", re.MULTILINE)
 
 
 def markdown_files() -> list[Path]:
@@ -109,11 +127,38 @@ def check_hero(errors: list[str]) -> None:
             errors.append("hero image is not a valid JPEG file")
 
 
+def check_plain_document_punctuation(errors: list[str]) -> None:
+    sources = list(markdown_files())
+    sources = [
+        path
+        for path in sources
+        if "tests" not in path.relative_to(ROOT).parts
+        and "fixtures" not in path.relative_to(ROOT).parts
+    ]
+    sources.extend(
+        path
+        for path in (ROOT / "docs").rglob("*.html")
+        if ".git" not in path.relative_to(ROOT).parts
+    )
+    sources.append(ROOT / "mkdocs.yml")
+    for source in sorted(set(sources)):
+        text = source.read_text(encoding="utf-8")
+        match = PLAIN_PUNCTUATION.search(text)
+        if match is None:
+            continue
+        line = text.count("\n", 0, match.start()) + 1
+        errors.append(
+            "reader-facing documentation uses forbidden decorative punctuation: "
+            f"{source.relative_to(ROOT).as_posix()}:{line}"
+        )
+
+
 def main() -> int:
     errors: list[str] = []
     check_required_files(errors)
     checked_links = check_local_links(errors)
     check_hero(errors)
+    check_plain_document_punctuation(errors)
 
     if errors:
         print("Repository checks failed:", file=sys.stderr)

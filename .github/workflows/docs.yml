@@ -9,7 +9,11 @@ on:
       - "docs/**"
       - "mkdocs.yml"
       - "requirements-docs.txt"
+      - "scripts/config-reference.py"
+      - "scripts/check-repository.py"
       - "scripts/README.md"
+      - "crates/core-config/src/model.rs"
+      - "crates/core-config/src/stream_settings.rs"
       - "CHANGELOG.md"
       - "CODE_OF_CONDUCT.md"
       - "CONTRIBUTING.md"
@@ -23,7 +27,11 @@ on:
       - "docs/**"
       - "mkdocs.yml"
       - "requirements-docs.txt"
+      - "scripts/config-reference.py"
+      - "scripts/check-repository.py"
       - "scripts/README.md"
+      - "crates/core-config/src/model.rs"
+      - "crates/core-config/src/stream_settings.rs"
       - "CHANGELOG.md"
       - "CODE_OF_CONDUCT.md"
       - "CONTRIBUTING.md"
@@ -62,6 +70,12 @@ jobs:
 
       - name: Install documentation dependencies
         run: python -m pip install --disable-pip-version-check -r requirements-docs.txt
+
+      - name: Verify configuration reference coverage
+        run: python scripts/config-reference.py --check
+
+      - name: Check repository presentation
+        run: python scripts/check-repository.py
 
       - name: Configure GitHub Pages
         if: github.event_name != 'pull_request'

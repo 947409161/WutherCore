@@ -17,7 +17,7 @@
 - 可用的 `iproute2`（`ip` 命令）和 nftables（`nft` 命令）。
 - 内核支持 TUN、nftables NAT REDIRECT 和 `SO_ORIGINAL_DST`。
 - TUN 接口的 MTU、IPv4 地址、启用时的 IPv6 地址和 link-up 必须全部配置成功。
-- 自定义路由表必须是私有表；Linux 的 `default/main/local` 表号 253–255 会被拒绝。
+- 自定义路由表必须是私有表；Linux 的 `default/main/local` 表号 253-255 会被拒绝。
 - 本功能使用的四个连续 rule priority 必须空闲，且 capture priority 必须位于 `4..=32765`，排在 Linux 默认 `main` rule（32766）之前；不会覆盖同优先级的外部规则。
 - 实际出站表必须有可用的同地址族 default route。启用双栈时，IPv4/IPv6 default route 必须使用同一个出站接口，因为当前 socket 接口绑定不是按地址族拆分的。
 

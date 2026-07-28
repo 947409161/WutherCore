@@ -59,30 +59,30 @@ nodes:
 | 字段 | 默认值 | 约束或语义 |
 | --- | --- | --- |
 | `login.private_key` / `params.private-key` | 必填 | 32 字节 Base64 私钥，禁止全零；两个位置同时出现且值不同会拒绝配置 |
-| `local-address` / `address` | 必填 | 1–8 个 CIDR；IPv4、IPv6 均支持，必须为单播地址 |
-| `peers` | 必填或使用单 Peer 字段 | 1–4096 个；公钥必须唯一且不能等于本机公钥 |
-| `mtu` | `1420` | 576–65475；启用 IPv6 时至少 1280 |
+| `local-address` / `address` | 必填 | 1-8 个 CIDR；IPv4、IPv6 均支持，必须为单播地址 |
+| `peers` | 必填或使用单 Peer 字段 | 1-4096 个；公钥必须唯一且不能等于本机公钥 |
+| `mtu` | `1420` | 576-65475；启用 IPv6 时至少 1280 |
 | `network` | `tcp,udp` | `tcp`、`udp`、`tcp,udp`、`udp,tcp` 或 `both` |
 | `dns` | 空 | 隧道内 DNS 服务器 IP，必须被某个 `allowed-ips` 覆盖 |
 | `remote-dns-resolve` | `false` | 开启后域名目标通过隧道内 DNS 查询 A/AAAA；UDP 截断响应自动改用 TCP |
-| `tcp-buffer-size` / `udp-buffer-size` | `262144` | 4096–16777216 字节 |
-| `max-tcp-sessions` / `max-udp-sessions` | `4096` | 1–65535；超过上限时拒绝新会话 |
-| `packet-queue` | `1024` | 16–65536；限制收发队列与重组资源，达到上限时施加背压或明确丢包 |
-| `workers` | 可用 CPU 数（最多 64） | `0` 或未填写时自动选择，显式值为 1–64；按 Peer 固定分片，保持同一 Peer 的密码学状态顺序 |
+| `tcp-buffer-size` / `udp-buffer-size` | `262144` | 4096-16777216 字节 |
+| `max-tcp-sessions` / `max-udp-sessions` | `4096` | 1-65535；超过上限时拒绝新会话 |
+| `packet-queue` | `1024` | 16-65536；限制收发队列与重组资源，达到上限时施加背压或明确丢包 |
+| `workers` | 可用 CPU 数（最多 64） | `0` 或未填写时自动选择，显式值为 1-64；按 Peer 固定分片，保持同一 Peer 的密码学状态顺序 |
 | `connect-timeout` | `15s` | 大于 0 且不超过 300 秒 |
-| `udp-timeout` | `5m` | UDP 会话空闲回收时间，5 秒–24 小时 |
+| `udp-timeout` | `5m` | UDP 会话空闲回收时间，5 秒-24 小时 |
 
 每个 Peer 支持下列字段：
 
 | 字段 | 默认值 | 约束或语义 |
 | --- | --- | --- |
 | `server` / `address` | 必填 | UDP 端点主机或 IP |
-| `port` / `server-port` | 必填 | 1–65535 |
+| `port` / `server-port` | 必填 | 1-65535 |
 | `public-key` | 必填 | 32 字节 Base64 公钥 |
 | `pre-shared-key` | 无 | 可选 32 字节 Base64 PSK |
 | `allowed-ips` | 必填 | CIDR 列表；用于出站最长前缀选路和入站源地址校验，精确重复路由会被拒绝 |
 | `persistent-keepalive` | `0`（禁用） | 秒数，`0` 表示禁用，最大 65535 |
-| `reserved` | `[0,0,0]` | 三个 0–255 字节，按兼容实现的 UDP bind 层语义收发；多 Peer 模式可用顶层值作为未单独配置 Peer 的默认值 |
+| `reserved` | `[0,0,0]` | 三个 0-255 字节，按兼容实现的 UDP bind 层语义收发；多 Peer 模式可用顶层值作为未单独配置 Peer 的默认值 |
 
 字段同时接受连字符和下划线别名。列表可由结构化 YAML 数组提供；订阅解析也会保留 Clash/Mihomo WireGuard 的 `allowed-ips`、`dns`、`reserved` 与 `peers` 结构。
 
@@ -125,12 +125,12 @@ listen:
 | 字段 | 默认值 | 约束或语义 |
 | --- | --- | --- |
 | `host` | `0.0.0.0` | 必须是数值 IPv4 或 IPv6 地址 |
-| `port` | 必填 | 1–65535；同一配置内不能重复绑定 |
+| `port` | 必填 | 1-65535；同一配置内不能重复绑定 |
 | `private-key` | 必填 | 32 字节 Base64 私钥，禁止全零 |
-| `peers` | 必填 | 1–256 个，公钥必须唯一 |
-| `mtu` | `1420` | 576–65475；存在 IPv6 AllowedIPs 时至少 1280 |
-| `packet-queue` | `1024` | 16–65536；限制认证明文包队列 |
-| `handshake-rate-limit` | `1000` | 1–1000000 次/秒；在密码学处理前限制握手洪泛 |
+| `peers` | 必填 | 1-256 个，公钥必须唯一 |
+| `mtu` | `1420` | 576-65475；存在 IPv6 AllowedIPs 时至少 1280 |
+| `packet-queue` | `1024` | 16-65536；限制认证明文包队列 |
+| `handshake-rate-limit` | `1000` | 1-1000000 次/秒；在密码学处理前限制握手洪泛 |
 
 服务端 Peer 的 `public-key`、`pre-shared-key`、`allowed-ips`、`persistent-keepalive` 和 `reserved` 与客户端 Peer 语义一致。`allowed-ips` 既用于接收源地址授权，也用于服务端回包的最长前缀选路；精确重复网段会在 `check` 阶段拒绝。字段同时接受连字符、下划线和文档中列出的 camelCase 别名，未知字段会直接报错。
 

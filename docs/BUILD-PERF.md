@@ -20,7 +20,7 @@
 
 ## 2. 用户主机一次性安装（强烈推荐）
 
-### sccache —— 跨 cargo clean 缓存编译产物
+### sccache：跨 cargo clean 缓存编译产物
 
 ```cmd
 :: Windows
@@ -35,7 +35,7 @@ cargo install sccache --locked
 echo 'export RUSTC_WRAPPER=sccache' >> ~/.bashrc
 ```
 
-### mold —— Linux 最快链接器
+### mold：Linux 最快链接器
 
 ```bash
 # Ubuntu 22.04+
@@ -45,7 +45,7 @@ sudo apt install mold
 git clone --depth=1 https://github.com/rui314/mold && cd mold && ./build.sh
 ```
 
-### lld —— 跨平台快链接器
+### lld：跨平台快链接器
 
 ```cmd
 :: Windows: rustc 已自带 rust-lld（无需安装）

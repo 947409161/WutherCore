@@ -105,6 +105,9 @@ jobs:
       - name: Check repository presentation
         run: python scripts/check-repository.py
 
+      - name: Verify configuration reference coverage
+        run: python scripts/config-reference.py --check
+
       - name: Install rustfmt
         uses: dtolnay/rust-toolchain@stable
         with:
