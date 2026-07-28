@@ -1,11 +1,11 @@
 //! core-store —— 持久化层。
 //!
-//! 选型：[`redb`] 嵌入式 B+tree 存储。理由：
-//! * **纯 Rust**，无 C 依赖（vs SQLite/rusqlite），跨平台构建与体积更友好；
-//! * **ACID + MVCC**，崩溃安全；
-//! * **写性能**：多次小写入合并到一次提交（内置 write batch）；
-//! * **读性能**：读取走 mmap，零拷贝 borrowed access；
-//! * **单文件**：`data/state/wuthercore.redb`，便于备份/迁移。
+//! 选型：[`turso`] 原生 Rust 嵌入式 SQL 数据库。
+//! * 全异步 I/O，不在 Tokio 工作线程执行同步数据库操作；
+//! * 每项操作使用独立连接，支持多线程并发读取；
+//! * 多进程 WAL 允许运行中的核心和 CLI 同时访问同一数据库；
+//! * 严格类型表、预编译语句、覆盖索引和批量事务；
+//! * 单一主文件：`data/state/wuthercore.db`。
 //!
 //! 支持的 schema（见 [`schema`]）：
 //!
@@ -17,9 +17,10 @@
 //! | `smart_pin` | `group\|host` | `node_name`（字符串） | 用户固定 |
 //! | `group_manual` | `group` | `node_name` | manual 分组当前选择 |
 //! | `feed_meta` | `feed_name` | `FeedMetaBlob` | 订阅最近抓取元数据 |
+//! | `traffic_totals` | `dimension + label` | `TrafficTotalBlob` | 任意精度持久流量汇总 |
 //! | `kv_meta` | 任意 key | bytes | 通用元数据/版本号 |
 //!
-//! 写入策略：[`Store::write_batch`] 用单事务合并多个 put；
+//! 写入策略：[`Store::write_batch`] 用异步单事务合并多个 put；
 //! [`AsyncWriter`] 提供后台 mpsc + 周期 flush（默认 200ms 或 256 项触发）。
 
 #![forbid(unsafe_code)]
@@ -32,5 +33,6 @@ pub mod store;
 pub use async_writer::{AsyncWriter, WriteOp};
 pub use blobs::{
     DnsCacheBlob, DomainBestBlob, FeedMetaBlob, HistoryEntry, NegativeBlob, NodeStatsBlob,
+    TrafficTotalBlob,
 };
-pub use store::{Store, StoreError};
+pub use store::{MultiprocessWal, Store, StoreError, StoreOptions};

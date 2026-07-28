@@ -46,6 +46,8 @@ use smallvec::SmallVec;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::{TrafficLedger, TrafficSession};
+
 /// chains / geoip 类列表 —— 典型 1-4 项，内联保存避免堆分配。
 pub type StringList = SmallVec<[CompactString; 4]>;
 
@@ -350,6 +352,7 @@ pub struct ConnectionTable {
     upload_total: AtomicU64,
     download_total: AtomicU64,
     rate: Mutex<ManagerRateState>,
+    traffic: Option<Arc<TrafficLedger>>,
 }
 
 impl ConnectionTable {
@@ -357,11 +360,22 @@ impl ConnectionTable {
         Arc::new(Self::default())
     }
 
+    pub async fn with_store(store: Arc<core_store::Store>) -> Arc<Self> {
+        Arc::new(Self {
+            traffic: Some(TrafficLedger::open(store).await),
+            ..Self::default()
+        })
+    }
+
     /// 注册一条新连接，返回 RAII guard。drop 时自动从表移除。
     /// 推荐 splice 任务持有 guard 直至双向拷贝结束。
     pub fn open(self: &Arc<Self>, mut meta: ConnectionMeta) -> ConnectionGuard {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         meta.normalize_for_tracking();
+        let traffic = self
+            .traffic
+            .as_ref()
+            .map(|ledger| ledger.begin(traffic_labels(&meta)));
         if meta.uuid.is_empty() {
             meta.uuid = Uuid::new_v4().to_compact_string();
         }
@@ -406,6 +420,7 @@ impl ConnectionTable {
             download_window,
             smart_block,
             tracked: true,
+            traffic,
         }
     }
 
@@ -429,6 +444,15 @@ impl ConnectionTable {
         let upload_window = Arc::new(Mutex::new(BucketWindow::new(10, 100)));
         let download_window = Arc::new(Mutex::new(BucketWindow::new(10, 100)));
         let smart_block = Arc::new(AtomicU8::new(SMART_BLOCK_NONE));
+        let traffic = self.traffic.as_ref().map(|ledger| {
+            ledger.begin([
+                ("network", "internal"),
+                ("inbound", "internal"),
+                ("inbound_type", "Inner"),
+                ("outbound", "INTERNAL"),
+                ("rule", "INTERNAL"),
+            ])
+        });
         ConnectionGuard {
             table: self.clone(),
             id: 0,
@@ -441,6 +465,7 @@ impl ConnectionTable {
             download_window,
             smart_block,
             tracked: false,
+            traffic,
         }
     }
 
@@ -690,6 +715,16 @@ impl ConnectionTable {
         *rate = ManagerRateState::default();
     }
 
+    pub async fn shutdown(&self) {
+        if let Some(traffic) = &self.traffic {
+            traffic.shutdown().await;
+        }
+    }
+
+    pub fn persistent_traffic_snapshot(&self) -> Option<Vec<core_store::TrafficTotalBlob>> {
+        self.traffic.as_ref().map(|traffic| traffic.snapshot())
+    }
+
     pub fn manager_snapshot(&self) -> ConnectionManagerSnapshot {
         let (upload_total, download_total) = self.total();
         let mut connections: Vec<_> = self
@@ -871,6 +906,7 @@ pub struct ConnectionGuard {
     /// 是否真的入了 ConnectionTable —— [`ConnectionTable::open`] 路径设 true，
     /// [`Self::detached`] 路径设 false。Drop 用它判断要不要触发 `remove_silent`。
     tracked: bool,
+    traffic: Option<TrafficSession>,
 }
 
 impl ConnectionGuard {
@@ -891,6 +927,7 @@ impl ConnectionGuard {
             cancel: self.cancel.clone(),
             upload_window: self.upload_window.clone(),
             download_window: self.download_window.clone(),
+            traffic: self.traffic.clone(),
         }
     }
     pub fn record_upload(&self, size: u64) {
@@ -926,6 +963,7 @@ pub struct ConnectionAccounting {
     cancel: CancellationToken,
     upload_window: Arc<Mutex<BucketWindow>>,
     download_window: Arc<Mutex<BucketWindow>>,
+    traffic: Option<TrafficSession>,
 }
 
 impl ConnectionAccounting {
@@ -943,6 +981,9 @@ impl ConnectionAccounting {
         }
         self.up.fetch_add(size, Ordering::Relaxed);
         self.table.push_uploaded(size);
+        if let Some(traffic) = &self.traffic {
+            traffic.record_upload(size);
+        }
         let rate = self.upload_window.lock().update_max_rate(size);
         if rate > self.max_upload_rate.load(Ordering::Relaxed) {
             self.max_upload_rate.store(rate, Ordering::Relaxed);
@@ -955,11 +996,69 @@ impl ConnectionAccounting {
         }
         self.down.fetch_add(size, Ordering::Relaxed);
         self.table.push_downloaded(size);
+        if let Some(traffic) = &self.traffic {
+            traffic.record_download(size);
+        }
         let rate = self.download_window.lock().update_max_rate(size);
         if rate > self.max_download_rate.load(Ordering::Relaxed) {
             self.max_download_rate.store(rate, Ordering::Relaxed);
         }
     }
+}
+
+fn traffic_labels(meta: &ConnectionMeta) -> Vec<(String, String)> {
+    let mut labels = Vec::with_capacity(18);
+    let mut push = |dimension: &str, value: &str| {
+        let value = value.trim();
+        if !value.is_empty() {
+            labels.push((dimension.to_string(), value.to_string()));
+        }
+    };
+
+    push("network", meta.network.as_str());
+    push("inbound", meta.inbound_name.as_str());
+    push("inbound_type", meta.kind.as_str());
+    push("inbound_user", meta.inbound_user.as_str());
+
+    if let Some(outbound) = meta.chains.first() {
+        push("outbound", outbound.as_str());
+    }
+    for group in meta.chains.iter().skip(1) {
+        push("group", group.as_str());
+    }
+    for provider in &meta.provider_chains {
+        push("provider", provider.as_str());
+    }
+
+    push("rule", meta.rule.as_str());
+    push("rule_payload", meta.rule_payload.as_str());
+    let process = if !meta.process.is_empty() {
+        meta.process.as_str()
+    } else {
+        meta.process_path.as_str()
+    };
+    push("process", process);
+
+    let destination = if !meta.host.is_empty() {
+        meta.host.as_str()
+    } else {
+        meta.destination_ip.as_str()
+    };
+    push("destination", destination);
+    push("destination_port", meta.destination_port.as_str());
+    push("source", meta.source_ip.as_str());
+    push("source_asn", meta.source_ip_asn.as_str());
+    push("destination_asn", meta.destination_ip_asn.as_str());
+    if let Some(geo) = &meta.source_geoip {
+        push("source_geoip", &geo.join("/"));
+    }
+    if let Some(geo) = &meta.destination_geoip {
+        push("destination_geoip", &geo.join("/"));
+    }
+    if meta.uid != 0 {
+        push("uid", &meta.uid.to_string());
+    }
+    labels
 }
 
 fn now_secs() -> u64 {

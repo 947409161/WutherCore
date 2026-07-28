@@ -131,16 +131,16 @@ impl Default for MutableConfig {
 impl Runtime {
     /// 从 [`RuntimePlan`] 构造 Runtime，但不启动任何监听。
     pub fn build(plan: RuntimePlan) -> Result<Self, RuntimeError> {
-        Self::build_with(plan, None, None)
+        futures::executor::block_on(Self::build_with(plan, None, None))
     }
 
     /// 同 [`Runtime::build`]，但带持久化 store —— Smart 评分、group 手选、
     /// pin/avoid 等数据会从 store 加载并由后台 writer 异步落盘。
-    pub fn build_with_store(
+    pub async fn build_with_store(
         plan: RuntimePlan,
         store: Option<Arc<Store>>,
     ) -> Result<Self, RuntimeError> {
-        Self::build_with(plan, store, None)
+        Self::build_with(plan, store, None).await
     }
 
     /// 完整版构造：同时接受 store + RulesetIndex。
@@ -149,7 +149,7 @@ impl Runtime {
     /// 这样 [`RouteEngine`] 才能在 `set:<name>` 规则评估时查到外部规则集；
     /// 同一个 `Arc<RulesetIndex>` 应同时传给 `core_capture` 的
     /// `RulesetIpSetProvider`，保证 route + capture 共用同一份索引。
-    pub fn build_with(
+    pub async fn build_with(
         plan: RuntimePlan,
         store: Option<Arc<Store>>,
         rulesets: Option<Arc<core_ruleset::RulesetIndex>>,
@@ -177,7 +177,7 @@ impl Runtime {
         let mut resolver = Resolver::try_new_with_rulesets(plan.resolver.clone(), rulesets.clone())
             .map_err(|error| RuntimeError::ResolverConfig(error.to_string()))?;
         if let Some(store) = store.clone() {
-            resolver.attach_store(store);
+            resolver.attach_store(store).await;
         }
         let resolver = Arc::new(resolver);
         // 把 resolver 注入到 core-outbound 的全局，让 TcpTransport / TlsTransport
@@ -202,11 +202,7 @@ impl Runtime {
         // 出站 ifindex / 接口名对它即时生效，不需要 client rebuild。
         // engine 启动时也不需要"初始 client"。
         let smart = if let Some(store) = store.clone() {
-            Arc::new(SmartSelector::with_store(
-                plan.smart.goal,
-                plan.smart.sticky,
-                store,
-            ))
+            Arc::new(SmartSelector::with_store(plan.smart.goal, plan.smart.sticky, store).await)
         } else {
             Arc::new(SmartSelector::new(plan.smart.goal, plan.smart.sticky))
         };
@@ -218,7 +214,7 @@ impl Runtime {
 
         // 恢复 group manual 选择
         if let Some(store) = &store {
-            if let Ok(rows) = store.iter_string(GROUP_MANUAL) {
+            if let Ok(rows) = store.iter_string(GROUP_MANUAL).await {
                 for (group_name, picked) in rows {
                     if let Some(g) = groups.get(&group_name) {
                         if g.members().iter().any(|m| m == &picked) {
@@ -242,6 +238,10 @@ impl Runtime {
         } else {
             None
         };
+        let connections = match store.clone() {
+            Some(store) => ConnectionTable::with_store(store).await,
+            None => ConnectionTable::new(),
+        };
         Ok(Self {
             plan,
             outbounds,
@@ -254,7 +254,7 @@ impl Runtime {
             dns_service,
             smart,
             metrics: Metrics::new(),
-            connections: ConnectionTable::new(),
+            connections,
             store,
             logs: Arc::new(core_observe::LogBus::new(512)),
             mutable: parking_lot::RwLock::new(mutable),
@@ -320,7 +320,7 @@ impl Runtime {
     }
 
     /// 把 group manual 选择写入 store（持久化跨重启）。
-    pub fn set_group_manual(&self, group: &str, node: &str) {
+    pub async fn set_group_manual(&self, group: &str, node: &str) {
         let groups = self.groups.read();
         if let Some(g) = groups.get(group) {
             // mihomo 兼容：空 node = 清除固定（PUT /proxies/<group> {"name":""}）
@@ -331,24 +331,23 @@ impl Runtime {
             }
         }
         if let Some(store) = &self.store {
-            let _ = store.put_json::<String>(
-                core_store::schema::GROUP_MANUAL,
-                group,
-                &node.to_string(),
-            );
-            // 不用 JSON：直接存裸字符串。这里复用 put_json 会写入 "node" 带引号的 JSON。
-            // 改为直接 batch put：
-            let _ = store.write_batch(&[core_store::store::BatchOp::PutGroupManual(
-                group.to_string(),
-                node.to_string(),
-            )]);
+            let _ = store
+                .write_batch(&[core_store::store::BatchOp::PutGroupManual(
+                    group.to_string(),
+                    node.to_string(),
+                )])
+                .await;
         }
     }
 
     /// 优雅停止：把 Smart writer 的内存数据 flush 到磁盘。
     pub async fn shutdown(&self) {
+        self.connections.shutdown().await;
         self.smart.shutdown().await;
         self.resolver.flush_to_store().await;
+        if let Some(store) = &self.store {
+            let _ = store.checkpoint().await;
+        }
     }
 
     pub fn group_names(&self) -> Vec<String> {
@@ -1725,7 +1724,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let store = core_store::Store::open(&path).unwrap();
+        let store = core_store::Store::open(&path).await.unwrap();
         let expire_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -1740,6 +1739,7 @@ mod tests {
                     origin: "test".into(),
                 },
             )])
+            .await
             .unwrap();
 
         let plan = load_plan(
@@ -1755,7 +1755,7 @@ route:
   preset: direct
 "#,
         );
-        let runtime = Runtime::build_with_store(plan, Some(store)).unwrap();
+        let runtime = Runtime::build_with_store(plan, Some(store)).await.unwrap();
 
         let ips = runtime
             .resolver
@@ -2509,8 +2509,8 @@ route:
         );
     }
 
-    #[test]
-    fn runtime_ruleset_step_is_evaluated_before_preset_fallback() {
+    #[tokio::test]
+    async fn runtime_ruleset_step_is_evaluated_before_preset_fallback() {
         let idx = core_ruleset::RulesetIndex::new();
         idx.insert(std::sync::Arc::new(
             core_ruleset::RulesetMatcher::compile_domains(
@@ -2540,7 +2540,7 @@ route:
     - "set:openai -> ai"
 "#,
         );
-        let runtime = Runtime::build_with(plan, None, Some(idx)).unwrap();
+        let runtime = Runtime::build_with(plan, None, Some(idx)).await.unwrap();
 
         let pick = runtime.pick_outbound("api.openai.com", 443, NetworkKind::Tcp);
 

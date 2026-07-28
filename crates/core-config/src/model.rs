@@ -3,7 +3,7 @@
 //! 所有 field 默认值通过 `Profile::apply_defaults` 注入，
 //! 模型本身只负责"原样反序列化 + 短写法/长写法兼容"。
 
-use std::{collections::BTreeMap, fmt, time::Duration};
+use std::{collections::BTreeMap, fmt, path::PathBuf, time::Duration};
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,8 @@ pub struct UserConfig {
     pub name: Option<String>,
     #[serde(default)]
     pub log: Option<Log>,
+    #[serde(default, alias = "storage", alias = "store")]
+    pub database: DatabaseConfig,
     #[serde(default)]
     pub listen: Option<Listen>,
     #[serde(default)]
@@ -77,6 +79,94 @@ impl Default for FindProcessMode {
 impl FindProcessMode {
     pub fn is_enabled(self) -> bool {
         !matches!(self, Self::Off)
+    }
+}
+
+/* ---------------- database ---------------- */
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DatabasePathBase {
+    #[serde(alias = "config-directory", alias = "config_directory")]
+    Config,
+    #[serde(
+        alias = "working-directory",
+        alias = "working_directory",
+        alias = "workdir"
+    )]
+    Cwd,
+}
+
+impl Default for DatabasePathBase {
+    fn default() -> Self {
+        Self::Cwd
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MultiprocessWalMode {
+    Auto,
+    On,
+    Off,
+}
+
+impl Default for MultiprocessWalMode {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DatabaseConfig {
+    #[serde(default = "default_true", alias = "on")]
+    pub enabled: bool,
+    #[serde(default = "default_database_path")]
+    pub path: PathBuf,
+    #[serde(
+        default,
+        rename = "relative-to",
+        alias = "relative_to",
+        alias = "path-base",
+        alias = "path_base"
+    )]
+    pub relative_to: DatabasePathBase,
+    #[serde(
+        default = "default_database_busy_timeout",
+        with = "humantime_serde",
+        rename = "busy-timeout",
+        alias = "busy_timeout"
+    )]
+    pub busy_timeout: Duration,
+    #[serde(
+        default = "default_database_write_attempts",
+        rename = "max-write-attempts",
+        alias = "max_write_attempts"
+    )]
+    pub max_write_attempts: usize,
+    #[serde(default, rename = "multiprocess-wal", alias = "multiprocess_wal")]
+    pub multiprocess_wal: MultiprocessWalMode,
+    #[serde(
+        default = "default_true",
+        rename = "experimental-vacuum",
+        alias = "experimental_vacuum",
+        alias = "vacuum"
+    )]
+    pub experimental_vacuum: bool,
+}
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            path: default_database_path(),
+            relative_to: DatabasePathBase::Cwd,
+            busy_timeout: default_database_busy_timeout(),
+            max_write_attempts: default_database_write_attempts(),
+            multiprocess_wal: MultiprocessWalMode::Auto,
+            experimental_vacuum: true,
+        }
     }
 }
 
@@ -4160,6 +4250,13 @@ pub struct GroupSpec {
     pub sticky: Option<String>,
     #[serde(default)]
     pub path: Vec<String>,
+    /// 是否在支持该字段的 Clash dashboard 中隐藏策略组。
+    #[serde(default)]
+    pub hidden: bool,
+    /// 图标 URL、路径、data:image Base64 URI、`base64:<payload>` 或原始
+    /// Base64 图像。Base64 写法在编译阶段统一为 data URI。
+    #[serde(default)]
+    pub icon: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -5500,6 +5597,15 @@ fn default_xhttp_http_idle_timeout() -> Duration {
 }
 fn default_log_file_path() -> String {
     "data/logs/wuthercore.log".into()
+}
+fn default_database_path() -> PathBuf {
+    PathBuf::from("data/state/wuthercore.db")
+}
+fn default_database_busy_timeout() -> Duration {
+    Duration::from_secs(5)
+}
+fn default_database_write_attempts() -> usize {
+    12
 }
 fn default_feed_every() -> Duration {
     Duration::from_secs(12 * 3600)

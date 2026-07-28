@@ -24,12 +24,49 @@ pub fn load_from_str(text: &str) -> ConfigResult<RuntimePlan> {
 
 /// 读取文件后转交 [`load_from_str`]。
 pub fn load_from_path<P: AsRef<Path>>(path: P) -> ConfigResult<RuntimePlan> {
-    let text = std::fs::read_to_string(&path).map_err(|e| {
+    let path = path.as_ref();
+    let text = std::fs::read_to_string(path).map_err(|e| {
         ConfigError::new(ConfigErrorKind::Io(e))
-            .at(path.as_ref().display().to_string())
+            .at(path.display().to_string())
             .hint("请确认文件存在且具有读取权限")
     })?;
-    load_from_str(&text)
+    let mut plan = load_from_str(&text)?;
+    if plan.database.enabled && plan.database.path.is_relative() {
+        let base = match plan.database.relative_to {
+            DatabasePathBase::Config => {
+                let config_path = if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    std::env::current_dir()
+                        .map_err(|error| {
+                            ConfigError::new(ConfigErrorKind::Io(error))
+                                .at(path.display().to_string())
+                                .hint("无法读取当前工作目录")
+                        })?
+                        .join(path)
+                };
+                config_path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+            }
+            DatabasePathBase::Cwd => std::env::current_dir().map_err(|error| {
+                ConfigError::new(ConfigErrorKind::Io(error))
+                    .at("database.relative-to")
+                    .hint("无法读取当前工作目录")
+            })?,
+        };
+        plan.database.path = base.join(&plan.database.path);
+    }
+    if plan.database.enabled && plan.database.path.is_dir() {
+        return Err(ConfigError::invalid(format!(
+            "database.path 必须是文件，当前指向目录: {}",
+            plan.database.path.display()
+        ))
+        .at("database.path")
+        .hint("请在路径末尾填写数据库文件名"));
+    }
+    Ok(plan)
 }
 
 #[cfg(test)]
@@ -653,5 +690,64 @@ route:
         assert!(plan.route.sets.contains_key("ads"));
         assert!(plan.route.sets.contains_key("cn-ip"));
         assert!(plan.route.sets.contains_key("global"));
+    }
+
+    #[test]
+    fn database_options_are_compiled() {
+        let plan = load_from_str(
+            r#"
+version: 1
+database:
+  enabled: true
+  path: state/custom.sqlite
+  relative-to: cwd
+  busy-timeout: 9s
+  max-write-attempts: 24
+  multiprocess-wal: off
+  experimental-vacuum: false
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.database.path,
+            std::path::PathBuf::from("state/custom.sqlite")
+        );
+        assert_eq!(plan.database.relative_to, DatabasePathBase::Cwd);
+        assert_eq!(plan.database.busy_timeout, Duration::from_secs(9));
+        assert_eq!(plan.database.max_write_attempts, 24);
+        assert_eq!(plan.database.multiprocess_wal, MultiprocessWalMode::Off);
+        assert!(!plan.database.experimental_vacuum);
+    }
+
+    #[test]
+    fn database_path_can_be_relative_to_config_file() {
+        let root =
+            std::env::temp_dir().join(format!("wuther-config-database-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let config_path = root.join("config.yaml");
+        std::fs::write(
+            &config_path,
+            "version: 1\ndatabase:\n  path: state/custom.db\n  relative-to: config\n",
+        )
+        .unwrap();
+
+        let plan = load_from_path(&config_path).unwrap();
+        assert_eq!(plan.database.path, root.join("state/custom.db"));
+
+        std::fs::remove_file(config_path).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn enabled_database_rejects_unsafe_empty_limits() {
+        for yaml in [
+            "version: 1\ndatabase:\n  path: ''\n",
+            "version: 1\ndatabase:\n  busy-timeout: 0s\n",
+            "version: 1\ndatabase:\n  max-write-attempts: 0\n",
+        ] {
+            let error = load_from_str(yaml).unwrap_err().to_string();
+            assert!(error.contains("database."), "{error}");
+        }
     }
 }

@@ -4,6 +4,21 @@
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-07-28
+
+### Added
+
+- 新增持久化累计流量汇总。统计支持任意精度总字节数，并覆盖全部运行时分类。
+- 新增 `traffic` 命令。默认输出便于阅读的单位，最大单位为 BB；`--exact` 与 `--json` 保留完整十进制数值。
+- 策略组支持 `hidden` 与 `icon`。图标接受 URL 和 Base64 data URI，并通过 Clash API 暴露。
+- 顶层 `database` 配置支持自定义 Turso 文件路径和完整运行参数。
+
+### Changed
+
+- 持久化引擎从 redb 切换到 Turso 0.7.1。数据库访问改为全异步多连接架构，并使用短事务和缓存预编译语句。
+- 旧数据库文件不会被读取或变更。新数据库路径完全由 `database.path` 控制。
+- `store info` 与 `store reset` 以及 `traffic` 支持通过 `--config` 复用运行时数据库设置。
+
 ### Fixed
 
 - provider 中的 `skip-cert-verify`，`allowInsecure` 等旧式扁平 TLS 字段不再被错误写入严格的 Xray `tlsSettings`。它们现在通过独立的传输兼容开关生效，包含 XHTTP 节点的订阅可以正常原子激活；结构化 `tlsSettings.allowInsecure=true` 仍保持拒绝。
@@ -60,6 +75,7 @@
 - 高危依赖变更会阻止 Pull Request 合并；
 - CodeQL 初次扫描告警由 [Issue #9](https://github.com/MiChongs/WutherCore/issues/9) 跟踪，未批量忽略。
 
-[Unreleased]: https://github.com/MiChongs/WutherCore/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/MiChongs/WutherCore/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/MiChongs/WutherCore/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/MiChongs/WutherCore/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/MiChongs/WutherCore/compare/v0.3.1-rc.5...v0.3.1

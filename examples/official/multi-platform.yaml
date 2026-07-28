@@ -16,6 +16,15 @@ log:
     on: false
     path: data/logs/wuther-core.log
 
+database:
+  enabled: true
+  path: data/state/wuthercore.db
+  relative-to: cwd
+  busy-timeout: 5s
+  max-write-attempts: 12
+  multiprocess-wal: auto
+  experimental-vacuum: true
+
 listen:
   local: 7890
   panel: 127.0.0.1:9090

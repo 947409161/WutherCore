@@ -56,3 +56,20 @@ pub struct DnsCacheBlob {
     pub expire_secs: u64,
     pub origin: String,
 }
+
+/// 一项持久化流量汇总。
+///
+/// 字节数使用十进制字符串而不是固定宽度整数，因此累计值不会受 u64 或
+/// u128 上限约束。旧版本若缺少时间字段，仍可用默认值读取。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct TrafficTotalBlob {
+    pub dimension: String,
+    pub label: String,
+    pub upload: String,
+    pub download: String,
+    pub connections: u64,
+    #[serde(default)]
+    pub first_seen_secs: u64,
+    #[serde(default)]
+    pub last_seen_secs: u64,
+}

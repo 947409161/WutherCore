@@ -57,12 +57,13 @@ smart:
 Smart 学习、站点最佳节点、固定选择和分组手动选择会写入 store。命令行提供：
 
 ```bash
-wuther-core store info --path data/state/wuthercore.redb
-wuther-core store reset --path data/state/wuthercore.redb
+wuther-core store info --config config.yaml
+wuther-core store reset --config config.yaml
+wuther-core traffic --config config.yaml
 ```
 
-`reset` 会删除学习和手动状态，应在停止服务或确认没有并发写入时使用。具体参数见
-[命令行参考](cli.md#store)。
+路径和 Turso 并发参数由顶层 `database` 配置控制，也可以用 `--path` 临时覆盖。
+`reset` 会删除累计流量、学习和手动状态。具体参数见[命令行参考](cli.md#store)。
 
 ## UI 与 API
 

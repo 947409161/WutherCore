@@ -29,7 +29,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -72,9 +72,9 @@ hickory-proto = "0.26"
 # Hash / 集合 / 内存优化
 ahash = "0.8"
 dashmap = "6"
-# `deadlock_detection` 让 watchdog 能侦测出循环互斥 —— 生产环境 API 卡死的
-# 头号嫌疑（同 thread 在 entry RefMut 里再访问同 shard 的递归 RwLock）。
-parking_lot = { version = "0.12", features = ["deadlock_detection"] }
+# Turso 的全异步连接需要 parking_lot 的 send_guard。该特性与
+# deadlock_detection 在上游互斥，锁卡顿由独立 watchdog 的心跳和栈采样诊断。
+parking_lot = "0.12"
 # 卡死时拿当前所有线程的栈，写进 panic.log 给运行人员排障。
 backtrace = "0.3"
 # 短字符串内联（≤24 字节不分配堆），活跃连接的 metadata 字段几乎全部命中。
@@ -104,7 +104,7 @@ tonic-prost      = "=0.14.6"
 tokio-stream     = { version = "=0.1.19", features = ["sync"] }
 flate2           = "1"
 brotli           = "8"
-redb = "2.6"
+turso = { version = "0.7.1", default-features = false }
 # 加密 / TLS / WS / 协议层
 aes-gcm           = "0.11"
 chacha20poly1305  = "0.11"
@@ -160,6 +160,7 @@ regex = "1"
 fancy-regex = "0.18"
 percent-encoding = "2"
 base64 = "0.23"
+num-bigint = "0.4"
 rand = "0.10"
 rand_chacha = "0.10"
 hex = "0.4"

@@ -493,6 +493,9 @@ def category_for(name: str, source: Path) -> str:
         "LogFile",
         "LogLevel",
         "LogFormat",
+        "DatabaseConfig",
+        "DatabasePathBase",
+        "MultiprocessWalMode",
     }:
         return "core"
     if name.startswith("Xhttp"):

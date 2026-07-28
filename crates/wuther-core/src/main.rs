@@ -12,7 +12,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use async_trait::async_trait;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 #[cfg(feature = "with_api")]
 use core_api::ApiServer;
 use core_config::loader::load_from_path;
@@ -30,7 +30,8 @@ use core_outbound::proto::wireguard::{
 };
 use core_ruleset::{RulesetManager, RulesetSpec, RulesetType};
 use core_runtime::{Runtime, UrlTestConfig, UrlTester};
-use core_store::Store;
+use core_store::{MultiprocessWal, Store, StoreOptions, TrafficTotalBlob};
+use num_bigint::BigUint;
 use tracing::{info, warn};
 
 use crate::host_resources::listener_resource_claims;
@@ -76,6 +77,36 @@ enum Cmd {
     Store {
         #[command(subcommand)]
         action: StoreCmd,
+    },
+    /// 查询持久化累计流量及完整分类。
+    Traffic {
+        /// Turso 数据库路径。
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// 从正在运行的核心读取，例如 http://127.0.0.1:9090。
+        #[arg(long)]
+        api: Option<String>,
+        /// 从配置解析 API 监听地址和密钥，适合自定义端口。
+        #[arg(short, long, value_name = "FILE")]
+        config: Option<PathBuf>,
+        /// API 密钥。也可通过 WUTHERCORE_SECRET 环境变量提供。
+        #[arg(long)]
+        secret: Option<String>,
+        /// 只显示指定分类，默认显示全部分类。
+        #[arg(long, value_enum, default_value_t = TrafficCategory::All)]
+        category: TrafficCategory,
+        /// 每个分类显示的最大条目数，0 表示不限制。
+        #[arg(long, default_value_t = 10)]
+        top: usize,
+        /// 按哪个指标排序。
+        #[arg(long, value_enum, default_value_t = TrafficSort::Total)]
+        sort: TrafficSort,
+        /// 显示完整十进制字节数。
+        #[arg(long)]
+        exact: bool,
+        /// 输出机器可读 JSON，字节数始终为无损十进制字符串。
+        #[arg(long)]
+        json: bool,
     },
     /// 外部规则集操作（mihomo yaml/txt/list、sing-box json、自定义 payload）。
     Ruleset {
@@ -124,14 +155,80 @@ enum RulesetCmd {
 enum StoreCmd {
     /// 显示 store 路径、大小与各表行数。
     Info {
-        #[arg(long, default_value = "data/state/wuthercore.redb")]
-        path: PathBuf,
+        /// 显式指定 Turso 数据库路径，优先于配置文件。
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// 从配置文件读取完整 database 设置。
+        #[arg(short, long, value_name = "FILE")]
+        config: Option<PathBuf>,
     },
     /// 清空所有学习数据（保留 schema 版本）。
     Reset {
-        #[arg(long, default_value = "data/state/wuthercore.redb")]
-        path: PathBuf,
+        /// 显式指定 Turso 数据库路径，优先于配置文件。
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// 从配置文件读取完整 database 设置。
+        #[arg(short, long, value_name = "FILE")]
+        config: Option<PathBuf>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum TrafficCategory {
+    All,
+    Network,
+    Inbound,
+    InboundType,
+    InboundUser,
+    Outbound,
+    Group,
+    Provider,
+    Rule,
+    RulePayload,
+    Process,
+    Destination,
+    DestinationPort,
+    Source,
+    SourceGeoip,
+    DestinationGeoip,
+    SourceAsn,
+    DestinationAsn,
+    Uid,
+}
+
+impl TrafficCategory {
+    fn dimension(self) -> Option<&'static str> {
+        Some(match self {
+            Self::All => return None,
+            Self::Network => "network",
+            Self::Inbound => "inbound",
+            Self::InboundType => "inbound_type",
+            Self::InboundUser => "inbound_user",
+            Self::Outbound => "outbound",
+            Self::Group => "group",
+            Self::Provider => "provider",
+            Self::Rule => "rule",
+            Self::RulePayload => "rule_payload",
+            Self::Process => "process",
+            Self::Destination => "destination",
+            Self::DestinationPort => "destination_port",
+            Self::Source => "source",
+            Self::SourceGeoip => "source_geoip",
+            Self::DestinationGeoip => "destination_geoip",
+            Self::SourceAsn => "source_asn",
+            Self::DestinationAsn => "destination_asn",
+            Self::Uid => "uid",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum TrafficSort {
+    Total,
+    Upload,
+    Download,
+    Connections,
+    Name,
 }
 
 #[derive(Subcommand, Debug)]
@@ -180,7 +277,30 @@ fn main() -> anyhow::Result<()> {
                 .build()?;
             rt.block_on(cmd_feeds(action))
         }
-        Cmd::Store { action } => cmd_store(action),
+        Cmd::Store { action } => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(cmd_store(action))
+        }
+        Cmd::Traffic {
+            path,
+            api,
+            config,
+            secret,
+            category,
+            top,
+            sort,
+            exact,
+            json,
+        } => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(cmd_traffic(
+                path, api, config, secret, category, top, sort, exact, json,
+            ))
+        }
         Cmd::Ruleset { action } => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -459,15 +579,458 @@ fn format_label(f: core_ruleset::RulesetFormat) -> &'static str {
     }
 }
 
-fn cmd_store(action: StoreCmd) -> anyhow::Result<()> {
+#[derive(Debug, Clone)]
+struct TrafficRow {
+    blob: TrafficTotalBlob,
+    upload: BigUint,
+    download: BigUint,
+    total: BigUint,
+}
+
+const TRAFFIC_DIMENSIONS: &[&str] = &[
+    "network",
+    "inbound",
+    "inbound_type",
+    "inbound_user",
+    "outbound",
+    "group",
+    "provider",
+    "rule",
+    "rule_payload",
+    "process",
+    "destination",
+    "destination_port",
+    "source",
+    "source_geoip",
+    "destination_geoip",
+    "source_asn",
+    "destination_asn",
+    "uid",
+];
+
+async fn cmd_traffic(
+    path: Option<PathBuf>,
+    api: Option<String>,
+    config: Option<PathBuf>,
+    secret: Option<String>,
+    category: TrafficCategory,
+    top: usize,
+    sort: TrafficSort,
+    exact: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    let config_was_provided = config.is_some();
+    let (config_api, config_secret, config_store) = if let Some(config) = config {
+        let plan = load_from_path(&config).map_err(|error| anyhow::anyhow!("{error}"))?;
+        let config_api = plan.listen.panel.as_ref().map(|panel| {
+            let host = match panel.host.as_str() {
+                "0.0.0.0" => "127.0.0.1".to_string(),
+                "::" | "[::]" => "[::1]".to_string(),
+                host if host.contains(':') && !host.starts_with('[') => format!("[{host}]"),
+                host => host.to_string(),
+            };
+            format!("http://{host}:{}", panel.port)
+        });
+        let config_store = plan
+            .database
+            .enabled
+            .then(|| store_options_from_config(&plan.database));
+        (config_api, plan.ui.secret.clone(), config_store)
+    } else {
+        (None, None, None)
+    };
+    let api = api.or(config_api);
+    let secret = secret
+        .or_else(|| std::env::var("WUTHERCORE_SECRET").ok())
+        .or(config_secret);
+    let store_options = match (path, config_store) {
+        (Some(path), Some(mut options)) => {
+            options.path = path;
+            Some(options)
+        }
+        (Some(path), None) => Some(StoreOptions::new(path)),
+        (None, Some(options)) => Some(options),
+        (None, None) if !config_was_provided => Some(StoreOptions::new("data/state/wuthercore.db")),
+        (None, None) => None,
+    };
+
+    let (source, saved) =
+        if let Some(options) = store_options.filter(|options| options.path.exists()) {
+            match Store::read_traffic_totals_with_options(options.clone()).await {
+                Ok(rows) => (
+                    options.path.display().to_string(),
+                    rows.into_iter().map(|(_, blob)| blob).collect(),
+                ),
+                Err(error) => {
+                    let fallback_api = api.as_deref().unwrap_or("http://127.0.0.1:9090");
+                    fetch_live_traffic(fallback_api, secret.as_deref())
+                    .await
+                    .map_err(|api_error| {
+                        anyhow::anyhow!(
+                            "直接读取 Turso 数据库失败: {error}\n读取核心快照也失败: {api_error}\n\
+                             自定义监听地址请传 --config <FILE> 或 --api <URL>"
+                        )
+                    })?
+                }
+            }
+        } else if let Some(api) = api {
+            fetch_live_traffic(&api, secret.as_deref()).await?
+        } else {
+            anyhow::bail!("流量数据库不存在，并且没有可用的核心 API");
+        };
+    let mut rows = Vec::with_capacity(saved.len());
+    for blob in saved {
+        let upload = parse_traffic_integer(&blob.upload)
+            .with_context(|| format!("无效的上传累计值: {} / {}", blob.dimension, blob.label))?;
+        let download = parse_traffic_integer(&blob.download)
+            .with_context(|| format!("无效的下载累计值: {} / {}", blob.dimension, blob.label))?;
+        let total = &upload + &download;
+        rows.push(TrafficRow {
+            blob,
+            upload,
+            download,
+            total,
+        });
+    }
+
+    let total = rows
+        .iter()
+        .find(|row| row.blob.dimension == "total" && row.blob.label == "all")
+        .cloned()
+        .unwrap_or_else(|| TrafficRow {
+            blob: TrafficTotalBlob {
+                dimension: "total".into(),
+                label: "all".into(),
+                upload: "0".into(),
+                download: "0".into(),
+                ..TrafficTotalBlob::default()
+            },
+            upload: BigUint::default(),
+            download: BigUint::default(),
+            total: BigUint::default(),
+        });
+
+    if json {
+        return print_traffic_json(&source, &rows, &total, category, top, sort);
+    }
+
+    println!("WutherCore 持久流量汇总");
+    println!("数据源    {source}");
+    if total.blob.first_seen_secs != 0 {
+        println!(
+            "统计区间  {} 至 {}",
+            format_epoch(total.blob.first_seen_secs),
+            format_epoch(total.blob.last_seen_secs)
+        );
+    }
+    println!("累计上传  {}", format_traffic_value(&total.upload, exact));
+    println!("累计下载  {}", format_traffic_value(&total.download, exact));
+    println!("累计总量  {}", format_traffic_value(&total.total, exact));
+    println!(
+        "连接次数  {}",
+        format_decimal_grouped(&total.blob.connections.to_string())
+    );
+
+    let dimensions: Vec<&str> = match category.dimension() {
+        Some(dimension) => vec![dimension],
+        None => TRAFFIC_DIMENSIONS.to_vec(),
+    };
+    for dimension in dimensions {
+        let selected = sorted_traffic_rows(&rows, dimension, sort, top);
+        if selected.is_empty() {
+            continue;
+        }
+        println!();
+        println!("{}", traffic_dimension_title(dimension));
+        println!(
+            "{:<30} {:>14} {:>14} {:>14} {:>9} {:>10}",
+            "名称", "上传", "下载", "总量", "占比", "连接"
+        );
+        for row in selected {
+            let name = truncate_chars(&row.blob.label, 28);
+            println!(
+                "{:<30} {:>14} {:>14} {:>14} {:>8} {:>10}",
+                name,
+                format_traffic_value(&row.upload, exact),
+                format_traffic_value(&row.download, exact),
+                format_traffic_value(&row.total, exact),
+                traffic_percentage(&row.total, &total.total),
+                format_decimal_grouped(&row.blob.connections.to_string()),
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn fetch_live_traffic(
+    api: &str,
+    secret: Option<&str>,
+) -> anyhow::Result<(String, Vec<TrafficTotalBlob>)> {
+    let base = api.trim().trim_end_matches('/');
+    let endpoint = if base.ends_with("/traffic/summary") {
+        base.to_string()
+    } else if base.ends_with("/v1") {
+        format!("{base}/traffic/summary")
+    } else {
+        format!("{base}/v1/traffic/summary")
+    };
+    let mut options = core_fetch::FetchOptions {
+        accept_encoding: false,
+        max_body_bytes: 64 * 1024 * 1024,
+        ..core_fetch::FetchOptions::default()
+    };
+    if let Some(secret) = secret.filter(|secret| !secret.is_empty()) {
+        options
+            .headers
+            .push(("Authorization".into(), format!("Bearer {secret}")));
+    }
+    let response = core_fetch::fetch(&endpoint, &options)
+        .await
+        .with_context(|| format!("无法读取运行中核心的流量汇总: {endpoint}"))?;
+    let body: serde_json::Value =
+        serde_json::from_slice(&response.bytes).context("流量汇总 API 返回了无效 JSON")?;
+    let totals = body
+        .get("totals")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("流量汇总 API 缺少 totals 字段"))?;
+    let rows = serde_json::from_value::<Vec<TrafficTotalBlob>>(totals)
+        .context("流量汇总 API 的 totals 格式无效")?;
+    Ok((endpoint, rows))
+}
+
+fn print_traffic_json(
+    source: &str,
+    rows: &[TrafficRow],
+    total: &TrafficRow,
+    category: TrafficCategory,
+    top: usize,
+    sort: TrafficSort,
+) -> anyhow::Result<()> {
+    let dimensions: Vec<&str> = match category.dimension() {
+        Some(dimension) => vec![dimension],
+        None => TRAFFIC_DIMENSIONS.to_vec(),
+    };
+    let mut categories = serde_json::Map::new();
+    for dimension in dimensions {
+        let selected = sorted_traffic_rows(rows, dimension, sort, top);
+        if selected.is_empty() {
+            continue;
+        }
+        categories.insert(
+            dimension.to_string(),
+            serde_json::Value::Array(selected.into_iter().map(traffic_row_json).collect()),
+        );
+    }
+    let output = serde_json::json!({
+        "source": source,
+        "generatedAt": now_epoch_secs(),
+        "total": traffic_row_json(total),
+        "categories": categories,
+    });
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+fn traffic_row_json(row: &TrafficRow) -> serde_json::Value {
+    serde_json::json!({
+        "dimension": row.blob.dimension,
+        "label": row.blob.label,
+        "upload": row.upload.to_str_radix(10),
+        "download": row.download.to_str_radix(10),
+        "total": row.total.to_str_radix(10),
+        "uploadFormatted": format_big_bytes(&row.upload),
+        "downloadFormatted": format_big_bytes(&row.download),
+        "totalFormatted": format_big_bytes(&row.total),
+        "connections": row.blob.connections,
+        "firstSeen": row.blob.first_seen_secs,
+        "lastSeen": row.blob.last_seen_secs,
+    })
+}
+
+fn sorted_traffic_rows<'a>(
+    rows: &'a [TrafficRow],
+    dimension: &str,
+    sort: TrafficSort,
+    top: usize,
+) -> Vec<&'a TrafficRow> {
+    let mut selected = rows
+        .iter()
+        .filter(|row| row.blob.dimension == dimension)
+        .collect::<Vec<_>>();
+    selected.sort_by(|a, b| {
+        let order = match sort {
+            TrafficSort::Total => b.total.cmp(&a.total),
+            TrafficSort::Upload => b.upload.cmp(&a.upload),
+            TrafficSort::Download => b.download.cmp(&a.download),
+            TrafficSort::Connections => b.blob.connections.cmp(&a.blob.connections),
+            TrafficSort::Name => a.blob.label.cmp(&b.blob.label),
+        };
+        order.then_with(|| a.blob.label.cmp(&b.blob.label))
+    });
+    if top != 0 {
+        selected.truncate(top);
+    }
+    selected
+}
+
+fn parse_traffic_integer(value: &str) -> anyhow::Result<BigUint> {
+    BigUint::parse_bytes(value.as_bytes(), 10).ok_or_else(|| anyhow::anyhow!("不是非负十进制整数"))
+}
+
+/// 1024 进制的人类可读格式。单位最多显示为 BB，但数值本身继续任意增长。
+fn format_big_bytes(value: &BigUint) -> String {
+    const UNITS: [&str; 10] = ["B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB", "BB"];
+    let base = BigUint::from(1024u16);
+    let mut unit = 0usize;
+    let mut divisor = BigUint::from(1u8);
+    while unit + 1 < UNITS.len() {
+        let next = &divisor * &base;
+        if value < &next {
+            break;
+        }
+        divisor = next;
+        unit += 1;
+    }
+    if unit == 0 {
+        return format!("{} B", value.to_str_radix(10));
+    }
+
+    let whole = value / &divisor;
+    let remainder = value % &divisor;
+    let fraction = ((remainder * 100u8) / &divisor)
+        .to_u64_digits()
+        .first()
+        .copied()
+        .unwrap_or(0);
+    if whole >= BigUint::from(100u8) || fraction == 0 {
+        format!("{} {}", whole.to_str_radix(10), UNITS[unit])
+    } else if whole >= BigUint::from(10u8) {
+        format!(
+            "{}.{} {}",
+            whole.to_str_radix(10),
+            fraction / 10,
+            UNITS[unit]
+        )
+    } else {
+        format!("{}.{:02} {}", whole.to_str_radix(10), fraction, UNITS[unit])
+    }
+}
+
+fn format_traffic_value(value: &BigUint, exact: bool) -> String {
+    if exact {
+        format!("{} B", format_decimal_grouped(&value.to_str_radix(10)))
+    } else {
+        format_big_bytes(value)
+    }
+}
+
+fn traffic_percentage(value: &BigUint, total: &BigUint) -> String {
+    if total == &BigUint::default() {
+        return "0.00%".into();
+    }
+    let basis_points = ((value * 10_000u16) / total)
+        .to_u64_digits()
+        .first()
+        .copied()
+        .unwrap_or(0);
+    format!("{}.{:02}%", basis_points / 100, basis_points % 100)
+}
+
+fn format_decimal_grouped(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + value.len() / 3);
+    let first = value.len() % 3;
+    for (index, ch) in value.chars().enumerate() {
+        if index != 0 && (index == first || (index > first && (index - first) % 3 == 0)) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn truncate_chars(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value.to_string();
+    }
+    let mut result = value
+        .chars()
+        .take(max.saturating_sub(3))
+        .collect::<String>();
+    result.push_str("...");
+    result
+}
+
+fn traffic_dimension_title(dimension: &str) -> &'static str {
+    match dimension {
+        "network" => "按网络协议",
+        "inbound" => "按入站",
+        "inbound_type" => "按入站类型",
+        "inbound_user" => "按入站用户",
+        "outbound" => "按出站节点",
+        "group" => "按策略组",
+        "provider" => "按远程订阅",
+        "rule" => "按匹配规则",
+        "rule_payload" => "按规则内容",
+        "process" => "按进程",
+        "destination" => "按目标地址",
+        "destination_port" => "按目标端口",
+        "source" => "按来源地址",
+        "source_geoip" => "按来源地区",
+        "destination_geoip" => "按目标地区",
+        "source_asn" => "按来源 ASN",
+        "destination_asn" => "按目标 ASN",
+        "uid" => "按用户 UID",
+        _ => "其他分类",
+    }
+}
+
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn format_epoch(seconds: u64) -> String {
+    let days = (seconds / 86_400) as i64;
+    let day_seconds = seconds % 86_400;
+    let hour = day_seconds / 3_600;
+    let minute = (day_seconds % 3_600) / 60;
+    let second = day_seconds % 60;
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} UTC")
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i64, u64, u64) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month as u64, day as u64)
+}
+
+async fn cmd_store(action: StoreCmd) -> anyhow::Result<()> {
     match action {
-        StoreCmd::Info { path } => {
-            if !path.exists() {
-                println!("store 不存在：{}", path.display());
+        StoreCmd::Info { path, config } => {
+            let options = resolve_store_options(path, config)?;
+            if !options.path.exists() {
+                println!("store 不存在：{}", options.path.display());
                 return Ok(());
             }
-            let s = Store::open(&path).map_err(|e| anyhow::anyhow!("{e}"))?;
-            let st = s.approximate_stats().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let s = Store::open_with_options(options)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let st = s
+                .approximate_stats()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             println!("store: {}", st.path);
             println!("  size:              {} bytes", st.size_bytes);
             println!("  smart_node_stats:  {}", st.smart_node_stats);
@@ -476,18 +1039,63 @@ fn cmd_store(action: StoreCmd) -> anyhow::Result<()> {
             println!("  smart_pin:         {}", st.smart_pin);
             println!("  group_manual:      {}", st.group_manual);
             println!("  feed_meta:         {}", st.feed_meta);
+            println!("  dns_cache:         {}", st.dns_cache);
+            println!("  traffic_totals:    {}", st.traffic_totals);
             Ok(())
         }
-        StoreCmd::Reset { path } => {
-            if !path.exists() {
-                println!("store 不存在：{}", path.display());
+        StoreCmd::Reset { path, config } => {
+            let options = resolve_store_options(path, config)?;
+            if !options.path.exists() {
+                println!("store 不存在：{}", options.path.display());
                 return Ok(());
             }
-            let s = Store::open(&path).map_err(|e| anyhow::anyhow!("{e}"))?;
-            s.reset().map_err(|e| anyhow::anyhow!("{e}"))?;
-            println!("已清空所有学习数据：{}", path.display());
+            let database_path = options.path.clone();
+            let s = Store::open_with_options(options)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            s.reset().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("已清空所有学习数据：{}", database_path.display());
             Ok(())
         }
+    }
+}
+
+fn resolve_store_options(
+    path: Option<PathBuf>,
+    config: Option<PathBuf>,
+) -> anyhow::Result<StoreOptions> {
+    let configured = if let Some(config_path) = config {
+        let plan = load_from_path(&config_path).map_err(|error| anyhow::anyhow!("{error}"))?;
+        if !plan.database.enabled && path.is_none() {
+            anyhow::bail!("配置 {} 已禁用 database", config_path.display());
+        }
+        Some(store_options_from_config(&plan.database))
+    } else {
+        None
+    };
+
+    match (path, configured) {
+        (Some(path), Some(mut options)) => {
+            options.path = path;
+            Ok(options)
+        }
+        (Some(path), None) => Ok(StoreOptions::new(path)),
+        (None, Some(options)) => Ok(options),
+        (None, None) => Ok(StoreOptions::new("data/state/wuthercore.db")),
+    }
+}
+
+fn store_options_from_config(config: &core_config::model::DatabaseConfig) -> StoreOptions {
+    StoreOptions {
+        path: config.path.clone(),
+        busy_timeout: config.busy_timeout,
+        max_write_attempts: config.max_write_attempts,
+        multiprocess_wal: match config.multiprocess_wal {
+            core_config::model::MultiprocessWalMode::Auto => MultiprocessWal::Auto,
+            core_config::model::MultiprocessWalMode::On => MultiprocessWal::Enabled,
+            core_config::model::MultiprocessWalMode::Off => MultiprocessWal::Disabled,
+        },
+        experimental_vacuum: config.experimental_vacuum,
     }
 }
 
@@ -985,16 +1593,16 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
         "mesh supervisor ready"
     );
 
-    // 打开持久化 store（默认 data/state/wuthercore.redb）。
-    let store = match Store::open("data/state/wuthercore.redb") {
-        Ok(s) => {
-            info!(target: "store", path = %s.path().display(), "store opened");
-            Some(s)
-        }
-        Err(e) => {
-            warn!(target: "store", error = %e, "store open failed; running in-memory only");
-            None
-        }
+    // 按配置打开持久化 Turso store。
+    let store = if plan.database.enabled {
+        let store = Store::open_with_options(store_options_from_config(&plan.database))
+            .await
+            .with_context(|| format!("无法打开 Turso 数据库 {}", plan.database.path.display()))?;
+        info!(target: "store", path = %store.path().display(), "store opened");
+        Some(store)
+    } else {
+        info!(target: "store", "persistent store disabled by configuration");
+        None
     };
 
     // 先建好共享的 RulesetIndex —— 让 RouteEngine（runtime 内）与 capture
@@ -1004,6 +1612,7 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
 
     let runtime = Arc::new(
         Runtime::build_with(plan.clone(), store, Some(ruleset_index.clone()))
+            .await
             .context("运行时出站配置构建失败")?,
     );
     // XHTTP 的证书/ALPN 与 TCP/UDP socket 必须在宣告进程启动前全部准备完成。
@@ -1641,5 +2250,61 @@ impl FeedSink for RuntimeFeedSink {
         self.runtime
             .apply_feed_nodes(&update.name, update.nodes.clone())
             .map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod traffic_cli_tests {
+    use super::*;
+
+    #[test]
+    fn byte_formatter_reaches_bb_and_keeps_growing() {
+        let one_bb = BigUint::from(1024u16).pow(9);
+        assert_eq!(format_big_bytes(&one_bb), "1 BB");
+
+        let beyond_bb = BigUint::from(1024u16).pow(12);
+        assert_eq!(format_big_bytes(&beyond_bb), "1073741824 BB");
+    }
+
+    #[test]
+    fn byte_formatter_accepts_arbitrary_precision_values() {
+        let value = parse_traffic_integer(
+            "999999999999999999999999999999999999999999999999999999999999999999",
+        )
+        .unwrap();
+        assert!(format_big_bytes(&value).ends_with(" BB"));
+        assert_eq!(
+            value.to_str_radix(10),
+            "999999999999999999999999999999999999999999999999999999999999999999"
+        );
+    }
+
+    #[test]
+    fn epoch_formatter_is_stable_utc() {
+        assert_eq!(format_epoch(0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(format_epoch(1_704_067_200), "2024-01-01 00:00:00 UTC");
+    }
+
+    #[test]
+    fn database_config_maps_to_turso_options_without_loss() {
+        let plan = core_config::loader::load_from_str(
+            r#"
+version: 1
+database:
+  path: state/custom.db
+  busy-timeout: 11s
+  max-write-attempts: 31
+  multiprocess-wal: on
+  experimental-vacuum: false
+"#,
+        )
+        .unwrap();
+
+        let options = store_options_from_config(&plan.database);
+        assert_eq!(options.path, PathBuf::from("state/custom.db"));
+        assert_eq!(options.busy_timeout, std::time::Duration::from_secs(11));
+        assert_eq!(options.max_write_attempts, 31);
+        assert_eq!(options.multiprocess_wal, MultiprocessWal::Enabled);
+        assert!(!options.experimental_vacuum);
     }
 }

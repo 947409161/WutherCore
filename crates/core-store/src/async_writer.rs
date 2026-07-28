@@ -90,37 +90,37 @@ async fn run_loop(store: Arc<Store>, mut rx: mpsc::Receiver<WriteOp>, shutdown: 
                         WriteOp::Batch(ops) => buffer.extend(ops),
                     }
                 }
-                flush(&store, &mut buffer);
+                flush(&store, &mut buffer).await;
                 debug!(target: "store::writer", "shutdown flush done");
                 return;
             }
             _ = tick.tick() => {
-                flush(&store, &mut buffer);
+                flush(&store, &mut buffer).await;
             }
             maybe = rx.recv() => {
                 match maybe {
                     Some(WriteOp::Single(op)) => buffer.push(op),
                     Some(WriteOp::Batch(ops)) => buffer.extend(ops),
                     None => {
-                        flush(&store, &mut buffer);
+                        flush(&store, &mut buffer).await;
                         return;
                     }
                 }
                 if buffer.len() >= FLUSH_THRESHOLD {
-                    flush(&store, &mut buffer);
+                    flush(&store, &mut buffer).await;
                 }
             }
         }
     }
 }
 
-fn flush(store: &Arc<Store>, buffer: &mut Vec<BatchOp>) {
+async fn flush(store: &Arc<Store>, buffer: &mut Vec<BatchOp>) {
     if buffer.is_empty() {
         return;
     }
     let n = buffer.len();
     let drained: Vec<BatchOp> = buffer.drain(..).collect();
-    match store.write_batch(&drained) {
+    match store.write_batch(&drained).await {
         Ok(()) => debug!(target: "store::writer", n, "flushed"),
         Err(e) => warn!(target: "store::writer", error = %e, "flush failed; data lost"),
     }
@@ -140,7 +140,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let store = Store::open(&path).unwrap();
+        let store = Store::open(&path).await.unwrap();
         let writer = AsyncWriter::spawn(store.clone());
         for i in 0..32 {
             let blob = NodeStatsBlob {
@@ -150,7 +150,7 @@ mod tests {
             assert!(writer.enqueue(BatchOp::PutNodeStats(format!("N{i}"), blob)));
         }
         writer.shutdown().await;
-        let stats = store.approximate_stats().unwrap();
+        let stats = store.approximate_stats().await.unwrap();
         assert_eq!(stats.smart_node_stats, 32);
     }
 }

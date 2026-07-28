@@ -69,7 +69,7 @@ sequenceDiagram
 | `core-feeds` | 订阅拉取、缓存、解析和更新 | 出站握手 |
 | `core-api` | 原生 API、兼容 API、鉴权与限流 | 系统权限管理 |
 | `core-observe` | 日志、流量、连接表和 watchdog | 路由配置 |
-| `core-store` | redb 持久化 | 业务策略 |
+| `core-store` | Turso 异步持久化与多进程 WAL | 业务策略 |
 | `core-process` | 进程识别 | 连接转发 |
 | `core-mesh` | Mesh 相关抽象 | 顶层 CLI |
 

@@ -257,7 +257,7 @@ impl DnsCache {
 
     /* ---------------- 持久化 ---------------- */
 
-    /// 序列化所有 entry 为 (key, blob) 列表 —— 调用方写入 redb / 文件。
+    /// 序列化所有 entry 为 (key, blob) 列表，供调用方写入数据库或文件。
     /// key 形态：`"{host}|A"` / `"{host}|AAAA"` / `"{host}|BOTH"`。
     pub fn dump(&self) -> Vec<(String, core_store::DnsCacheBlob)> {
         let now_inst = std::time::Instant::now();
@@ -290,7 +290,7 @@ impl DnsCache {
         out
     }
 
-    /// 从 redb / 文件恢复；过期项自动丢弃。
+    /// 从数据库或文件恢复，过期项自动丢弃。
     pub fn load(&self, rows: Vec<(String, core_store::DnsCacheBlob)>) {
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

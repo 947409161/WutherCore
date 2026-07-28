@@ -3,10 +3,10 @@ name = "core-store"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "WutherCore 持久化层 —— redb 嵌入式 KV"
+description = "WutherCore 持久化层 —— Turso 异步嵌入式数据库"
 
 [dependencies]
-redb        = { workspace = true }
+turso       = { workspace = true }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
 parking_lot = { workspace = true }

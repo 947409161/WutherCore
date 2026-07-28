@@ -121,20 +121,41 @@ wuther-core feeds refresh config.yaml --cache-dir data/feeds
 
 ```bash
 wuther-core store info
-wuther-core store info --path data/state/wuthercore.redb
+wuther-core store info --config config.yaml
+wuther-core store info --path data/state/wuthercore.db
 ```
 
-输出 store 的摘要信息，包括节点学习、站点最佳节点、固定选择和分组手动状态。
+输出 Turso store 的路径、文件大小和各命名空间行数，包括累计流量、节点学习、
+站点最佳节点、固定选择和分组手动状态。`--path` 优先于配置文件中的数据库路径。
 
 ### `store reset`
 
 ```bash
 wuther-core store reset
-wuther-core store reset --path data/state/wuthercore.redb
+wuther-core store reset --config config.yaml
+wuther-core store reset --path data/state/wuthercore.db
 ```
 
-重置指定 store。此操作会丢失学习和手动选择结果。执行前停止使用同一 store 的服务，
-并按部署策略保留备份。
+重置指定 store。此操作会清除累计流量、学习结果和手动选择，保留 schema 与面板通用
+存储。Turso 多进程 WAL 可用时不要求停止核心。
+
+## `traffic`
+
+```bash
+wuther-core traffic --config config.yaml
+wuther-core traffic --path data/state/wuthercore.db
+wuther-core traffic --config config.yaml --category outbound --top 20
+wuther-core traffic --config config.yaml --exact
+wuther-core traffic --config config.yaml --json
+```
+
+优先直接读取持久化 Turso 数据库。传入 `--config` 时自动使用 `database` 路径和参数，
+也会读取 API 地址与密钥作为平台不支持多进程 WAL 时的回退。分类包括网络、入站、
+入站类型、入站用户、出站、策略组、Provider、规则、规则载荷、进程、源地址、目标
+地址、端口、GeoIP、ASN 和 UID。
+
+默认输出适合人工阅读的单位，最大显示单位为 BB。`--exact` 同时显示无损十进制字节数。
+`--json` 中上传与下载总量始终是十进制字符串，不受整数位数限制。
 
 ## `ruleset`
 

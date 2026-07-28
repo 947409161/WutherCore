@@ -50,6 +50,8 @@ pub fn apply_defaults(cfg: &mut UserConfig) {
             check: None,
             sticky: None,
             path: vec![],
+            hidden: false,
+            icon: String::new(),
         };
         // 默认引用所有 feeds 与 nodes
         for k in cfg.feeds.keys() {

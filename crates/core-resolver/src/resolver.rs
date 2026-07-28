@@ -1448,8 +1448,10 @@ impl Resolver {
         rx
     }
 
-    pub fn attach_store(&mut self, store: Arc<Store>) {
-        if let Ok(rows) = store.iter_json::<core_store::DnsCacheBlob>(core_store::schema::DNS_CACHE)
+    pub async fn attach_store(&mut self, store: Arc<Store>) {
+        if let Ok(rows) = store
+            .iter_json::<core_store::DnsCacheBlob>(core_store::schema::DNS_CACHE)
+            .await
         {
             self.cache.load(rows);
         }
@@ -2278,7 +2280,21 @@ impl ResolverBuilder {
         self
     }
 
-    pub fn build(self) -> Resolver {
+    pub async fn build_async(mut self) -> Resolver {
+        let store = self.store.take();
+        let mut resolver = self.build();
+        if let Some(store) = store {
+            resolver.attach_store(store).await;
+        }
+        resolver
+    }
+
+    pub fn build(mut self) -> Resolver {
+        debug_assert!(
+            self.store.is_none(),
+            "ResolverBuilder::store requires build_async"
+        );
+        self.store = None;
         let cfg = self.cfg.unwrap_or_default();
         let cache = Arc::new(DnsCache::new(self.cache_cfg.unwrap_or_default()));
         let policy = Arc::new(self.policy.unwrap_or_else(|| {
@@ -2299,7 +2315,7 @@ impl ResolverBuilder {
         groups
             .entry("default".into())
             .or_insert_with(|| bootstrap.clone());
-        let mut r = Resolver {
+        Resolver {
             ipv6_enabled: cfg.ipv6,
             ipv6_timeout: cfg.ipv6_timeout,
             cfg,
@@ -2319,11 +2335,7 @@ impl ResolverBuilder {
             default_ttl: self.default_ttl,
             writer: None,
             global_client_subnet: self.global_client_subnet,
-        };
-        if let Some(s) = self.store {
-            r.attach_store(s);
         }
-        r
     }
 }
 
@@ -2809,7 +2821,7 @@ mod tests {
                 .as_nanos()
         ));
         {
-            let store = Store::open(&path).unwrap();
+            let store = Store::open(&path).await.unwrap();
             let (up, g) = group_with("9.9.9.9");
             let mut policy = PolicyEngine::new().with_default(DnsAction::Direct("g".into()));
             policy.rules.clear();
@@ -2820,7 +2832,8 @@ mod tests {
                 .policy(policy)
                 .store(store.clone())
                 .default_ttl(Duration::from_secs(3600))
-                .build();
+                .build_async()
+                .await;
             let _ = r.resolve("persist.example.com").await.unwrap();
             r.flush_to_store().await;
             assert_eq!(up.n.load(Ordering::Relaxed), 1);
@@ -2828,7 +2841,7 @@ mod tests {
             drop(store);
         }
         {
-            let store = Store::open(&path).unwrap();
+            let store = Store::open(&path).await.unwrap();
             let (up, g) = group_with("0.0.0.0");
             let mut policy = PolicyEngine::new().with_default(DnsAction::Direct("g".into()));
             policy.rules.clear();
@@ -2838,7 +2851,8 @@ mod tests {
                 .bootstrap(g.clone())
                 .policy(policy)
                 .store(store)
-                .build();
+                .build_async()
+                .await;
             let v = r.resolve("persist.example.com").await.unwrap();
             assert!(v.contains(&"9.9.9.9".parse::<IpAddr>().unwrap()));
             // Cache hit: upstream not queried for A (AAAA may or may not be cached)

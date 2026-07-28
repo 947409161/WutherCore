@@ -14,6 +14,7 @@ pub mod copy_counted;
 pub mod log_bus;
 pub mod metrics;
 pub mod tracing_init;
+pub mod traffic;
 pub mod watchdog;
 
 pub use connections::{
@@ -29,4 +30,5 @@ pub use tracing_init::{
     TracingConfig, TracingFileConfig, TracingFormat, attach_log_bus, init_tracing,
     init_tracing_with_bus, init_tracing_with_config,
 };
+pub use traffic::{TrafficLedger, TrafficSession};
 pub use watchdog::{Watchdog, WatchdogConfig};

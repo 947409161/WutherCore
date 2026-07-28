@@ -317,6 +317,42 @@ async fn proxies_includes_global_and_direct() {
 }
 
 #[tokio::test]
+async fn proxies_exposes_group_hidden_and_base64_icon() {
+    let cfg = r#"
+version: 1
+profile: desktop
+listen:
+  local: 7890
+groups:
+  main:
+    choose: manual
+    hidden: true
+    icon: "base64:iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+nodes: []
+"#;
+    let plan = load_from_str(cfg).expect("plan");
+    let runtime = Arc::new(Runtime::build(plan).unwrap());
+    let state = NativeState::for_tests(runtime, UrlTester::new(Default::default()), None);
+    let response = core_api::compat::router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/proxies")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["proxies"]["main"]["hidden"], true);
+    assert!(
+        body["proxies"]["main"]["icon"]
+            .as_str()
+            .is_some_and(|icon| icon.starts_with("data:image/png;base64,iVBOR"))
+    );
+}
+
+#[tokio::test]
 async fn provider_nodes_are_immediately_visible_in_proxy_group_and_native_apis() {
     let cfg = r#"
 version: 1
@@ -710,8 +746,11 @@ route:
 "#;
     let plan = load_from_str(cfg).unwrap();
     let index = core_ruleset::RulesetIndex::new();
-    let runtime =
-        Arc::new(Runtime::build_with(plan, None, Some(index.clone())).expect("runtime with rules"));
+    let runtime = Arc::new(
+        Runtime::build_with(plan, None, Some(index.clone()))
+            .await
+            .expect("runtime with rules"),
+    );
     let mut sets = std::collections::BTreeMap::new();
     sets.insert(
         "hot".into(),

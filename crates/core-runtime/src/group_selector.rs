@@ -102,7 +102,7 @@ GroupOptions：扩展 GroupPlan 用不上的 mihomo 选项
 ============================================================ */
 
 /// 与 mihomo `GroupCommonOption` 同语义的运行期选项。
-/// 从 `GroupPlan` 派生默认值；未来可由 YAML schema 注入。
+/// 从 `GroupPlan` 派生 dashboard 展示字段，其余运行期选项使用默认值。
 #[derive(Debug, Clone)]
 pub struct GroupOptions {
     /// 默认探测 URL（覆盖 UrlTester::default_url 用）
@@ -264,7 +264,12 @@ pub struct GroupSelector {
 
 impl GroupSelector {
     pub fn new(plan: GroupPlan) -> Self {
-        Self::with_options(plan, GroupOptions::default())
+        let opts = GroupOptions {
+            hidden: plan.hidden,
+            icon: plan.icon.clone(),
+            ..GroupOptions::default()
+        };
+        Self::with_options(plan, opts)
     }
 
     pub fn with_options(plan: GroupPlan, opts: GroupOptions) -> Self {
@@ -866,6 +871,8 @@ mod tests {
             check: None,
             sticky: None,
             path: vec![],
+            hidden: false,
+            icon: String::new(),
         }
     }
 
@@ -1124,5 +1131,16 @@ mod tests {
         let v = g.to_clash_json();
         assert_eq!(v["type"], "LoadBalance");
         assert_eq!(v["strategy"], "sticky-sessions");
+    }
+
+    #[test]
+    fn to_clash_json_uses_group_hidden_and_icon() {
+        let mut group_plan = plan(ChooseStrategy::Manual, &["a"]);
+        group_plan.hidden = true;
+        group_plan.icon = "data:image/png;base64,iVBORw0KGgo=".into();
+        let group = GroupSelector::new(group_plan);
+        let value = group.to_clash_json();
+        assert_eq!(value["hidden"], true);
+        assert_eq!(value["icon"], "data:image/png;base64,iVBORw0KGgo=");
     }
 }

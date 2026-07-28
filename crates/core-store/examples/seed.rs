@@ -1,10 +1,8 @@
-use std::sync::Arc;
-
 use core_store::{AsyncWriter, NodeStatsBlob, Store, store::BatchOp};
 
 #[tokio::main]
 async fn main() {
-    let store = Store::open("data/state/wuthercore.redb").unwrap();
+    let store = Store::open("data/state/wuthercore.db").await.unwrap();
     let writer = AsyncWriter::spawn(store.clone());
     for i in 0..5 {
         let mut blob = NodeStatsBlob::default();

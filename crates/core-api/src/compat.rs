@@ -547,10 +547,10 @@ async fn proxy_put(
     Path(group): Path<String>,
     Json(body): Json<ProxyPutBody>,
 ) -> impl IntoResponse {
-    // Empty name 与 mihomo / sing-box `URLTest.SelectOutbound("")` 等价 ——
+    // Empty name 与 mihomo / sing-box `URLTest.SelectOutbound("")` 等价。
     // 清空当前固定选择。
     if body.name.is_empty() {
-        let r = clear_pin_inner(&s, &group);
+        let r = clear_pin_inner(&s, &group).await;
         s.caches.invalidate_proxy_state();
         return r;
     }
@@ -570,7 +570,7 @@ async fn proxy_put(
             .into_response();
     }
     drop(groups);
-    s.runtime.set_group_manual(&group, &body.name);
+    s.runtime.set_group_manual(&group, &body.name).await;
     s.caches.invalidate_proxy_state();
     (StatusCode::NO_CONTENT, Json(json!({}))).into_response()
 }
@@ -581,12 +581,12 @@ async fn proxy_clear(
     State(s): State<NativeState>,
     Path(name): Path<String>,
 ) -> axum::response::Response {
-    let r = clear_pin_inner(&s, &name);
+    let r = clear_pin_inner(&s, &name).await;
     s.caches.invalidate_proxy_state();
     r
 }
 
-fn clear_pin_inner(s: &NativeState, group: &str) -> axum::response::Response {
+async fn clear_pin_inner(s: &NativeState, group: &str) -> axum::response::Response {
     let groups = s.runtime.groups.read();
     let Some(g) = groups.get(group) else {
         return (
@@ -601,7 +601,7 @@ fn clear_pin_inner(s: &NativeState, group: &str) -> axum::response::Response {
         .or_else(|| g.members().first().cloned())
         .unwrap_or_default();
     drop(groups);
-    s.runtime.set_group_manual(group, "");
+    s.runtime.set_group_manual(group, "").await;
     Json(json!({
         "group": group,
         "previous_pin": previous,
@@ -1972,7 +1972,10 @@ fn storage_key(key: &str) -> String {
 
 async fn storage_get(State(s): State<NativeState>, Path(key): Path<String>) -> Response {
     if let Some(store) = s.runtime.store.as_ref() {
-        return match store.get_json::<Value>(core_store::schema::KV_META, &storage_key(&key)) {
+        return match store
+            .get_json::<Value>(core_store::schema::KV_META, &storage_key(&key))
+            .await
+        {
             Ok(Some(value)) => Json(value).into_response(),
             Ok(None) => json_bytes(Bytes::from_static(b"null")),
             Err(error) => (
@@ -2002,7 +2005,10 @@ async fn storage_put(
             .into_response();
     };
     if let Some(store) = s.runtime.store.as_ref() {
-        return match store.put_json(core_store::schema::KV_META, &storage_key(&key), &value) {
+        return match store
+            .put_json(core_store::schema::KV_META, &storage_key(&key), &value)
+            .await
+        {
             Ok(()) => StatusCode::NO_CONTENT.into_response(),
             Err(error) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2017,7 +2023,10 @@ async fn storage_put(
 
 async fn storage_delete(State(s): State<NativeState>, Path(key): Path<String>) -> Response {
     if let Some(store) = s.runtime.store.as_ref() {
-        return match store.delete(core_store::schema::KV_META, &storage_key(&key)) {
+        return match store
+            .delete(core_store::schema::KV_META, &storage_key(&key))
+            .await
+        {
             Ok(()) => StatusCode::NO_CONTENT.into_response(),
             Err(error) => (
                 StatusCode::INTERNAL_SERVER_ERROR,

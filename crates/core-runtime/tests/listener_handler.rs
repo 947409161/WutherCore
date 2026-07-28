@@ -28,8 +28,8 @@ fn inbound_metadata_keeps_fake_destination_out_of_route_context() {
     assert_eq!(metadata.dns_mode, "fake-ip");
 }
 
-#[test]
-fn listener_handler_routes_ruleset_metadata_before_preset_fallback() {
+#[tokio::test]
+async fn listener_handler_routes_ruleset_metadata_before_preset_fallback() {
     let idx = core_ruleset::RulesetIndex::new();
     idx.insert(Arc::new(core_ruleset::RulesetMatcher::compile_domains(
         "openai",
@@ -57,7 +57,7 @@ route:
     - "set:openai -> ai"
 "#,
     );
-    let runtime = Arc::new(Runtime::build_with(plan, None, Some(idx)).unwrap());
+    let runtime = Arc::new(Runtime::build_with(plan, None, Some(idx)).await.unwrap());
     let handler = ListenerHandler::new(runtime);
     let metadata = InboundMetadata::tcp(
         "mixed",

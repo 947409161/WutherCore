@@ -40,6 +40,7 @@ YAML 字段推断功能一定关闭。
 | `profile` | `desktop`、`router`、`server`、`mobile` | `desktop` | 选择整块配置缺失时的默认值 |
 | `name` | 字符串 | 不设置 | 配置实例的显示名称 |
 | `log` | 对象 | 使用 Profile 后的日志默认 | 日志级别、过滤器、输出和连接摘要 |
+| `database` | 对象 | 启用 Turso 和默认路径 | 持久化流量、学习结果、DNS 缓存和面板状态 |
 | `listen` | 对象 | 由 Profile 创建 | Mixed、面板和服务端协议监听 |
 | `feeds` | 名称到订阅定义的映射 | 空 | 远程或内联节点来源 |
 | `nodes` | 节点列表 | 空 | URI 短写或结构化手动节点 |
@@ -71,6 +72,7 @@ Profile 只补整块缺失的配置。显式字段优先。
 | `capture.on` | `false` | `true` | `false` | `false` |
 | `smart` | 默认启用 | 默认启用 | 默认启用 | 默认启用 |
 | `ui` | 默认启用 | 默认启用 | 默认启用 | 默认启用 |
+| `database` | 默认启用 | 默认启用 | 默认启用 | 默认启用 |
 
 当 DNS 服务为空时，默认加入：
 
@@ -149,6 +151,46 @@ log:
 连接摘要使用 `conntable` target，包含总连接数、主要目的地、主要进程、规则、
 出站和长连接。生产环境建议从 `30s` 到 `5m`。
 
+## 数据库
+
+```yaml
+database:
+  enabled: true
+  path: data/state/wuthercore.db
+  relative-to: cwd
+  busy-timeout: 5s
+  max-write-attempts: 12
+  multiprocess-wal: auto
+  experimental-vacuum: true
+```
+
+数据库使用 Turso 的异步本地引擎。累计流量、Smart 学习结果、分组手动选择、DNS
+缓存和 Clash 面板存储共用 `path` 指定的主数据库。不会读取、删除或迁移旧格式
+数据库。
+
+| 字段 | 默认值 | 作用 |
+| --- | --- | --- |
+| `enabled` | `true` | 是否启用持久化。关闭后只保留本次进程内状态 |
+| `path` | `data/state/wuthercore.db` | Turso 主数据库文件，可使用任意文件名和绝对路径 |
+| `relative-to` | `cwd` | 相对路径基准。`cwd` 使用进程工作目录，`config` 使用配置文件目录 |
+| `busy-timeout` | `5s` | 遇到并发写锁时的等待时间 |
+| `max-write-attempts` | `12` | 可重试写冲突的最大尝试次数 |
+| `multiprocess-wal` | `auto` | `auto` 按平台能力启用，`on` 强制启用，`off` 禁用 |
+| `experimental-vacuum` | `true` | 启用 Turso 的增量空间回收能力 |
+
+`multiprocess-wal: auto` 适合大多数部署。它允许支持的平台由运行中的核心和独立 CLI
+同时访问数据库。`on` 不会降级，平台不支持时启动直接失败。数据库启用时，路径无效
+或数据库无法打开也会阻止核心启动，防止持久化静默失效。
+
+使用配置文件中的数据库设置查询状态：
+
+```bash
+wuther-core store info --config config.yaml
+wuther-core traffic --config config.yaml
+```
+
+`--path` 可以临时覆盖文件路径。与 `--config` 同时使用时，其余 Turso 参数仍取自配置。
+
 ## 进程反查
 
 | 值 | 行为 | 成本 |
@@ -175,7 +217,8 @@ Linux、Windows、macOS 和 Android 的实现与权限不同。规则需要进�
 - 面板监听非回环地址或 `listen.share` 为 `home`、`all` 时，必须设置
   `ui.secret`。
 - `explain` 可能包含节点和认证信息。共享输出前先脱敏。
-- 相对文件路径按进程工作目录解析。服务管理器启动时应设置稳定的工作目录。
+- 普通相对文件路径按进程工作目录解析。`database.relative-to` 可单独选择工作目录或
+  配置文件目录。
 
 ## 验证结果怎么理解
 

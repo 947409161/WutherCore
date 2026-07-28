@@ -30,6 +30,7 @@ pub struct RuntimePlan {
     pub profile: Profile,
     pub name: String,
     pub log: Option<Log>,
+    pub database: DatabaseConfig,
     pub listen: ListenPlan,
     pub feeds: BTreeMap<String, FeedDetail>,
     pub nodes: Vec<ParsedNode>,
@@ -283,6 +284,10 @@ pub struct GroupPlan {
     pub check: Option<String>,
     pub sticky: Option<String>,
     pub path: Vec<String>,
+    #[serde(default)]
+    pub hidden: bool,
+    #[serde(default)]
+    pub icon: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -351,6 +356,7 @@ pub enum RouteAction {
 
 /// 用户配置 -> RuntimePlan。要求 [`crate::profile::apply_defaults`] 已执行。
 pub fn compile(mut cfg: UserConfig) -> ConfigResult<RuntimePlan> {
+    validate_database(&cfg.database)?;
     let listen = compile_listen(&cfg)?;
     let feeds = compile_feeds(&cfg.feeds)?;
     let nodes = compile_nodes(&cfg.nodes)?;
@@ -376,6 +382,7 @@ pub fn compile(mut cfg: UserConfig) -> ConfigResult<RuntimePlan> {
         profile: cfg.profile,
         name: cfg.name.unwrap_or_else(|| "wuthercore".into()),
         log: cfg.log,
+        database: cfg.database,
         listen,
         feeds,
         nodes,
@@ -388,6 +395,30 @@ pub fn compile(mut cfg: UserConfig) -> ConfigResult<RuntimePlan> {
         mesh,
         find_process_mode,
     })
+}
+
+fn validate_database(database: &DatabaseConfig) -> ConfigResult<()> {
+    if !database.enabled {
+        return Ok(());
+    }
+    if database.path.as_os_str().is_empty() {
+        return Err(ConfigError::invalid("database.path 不能为空")
+            .at("database.path")
+            .hint("填写 Turso 数据库文件路径，例如 data/state/wuthercore.db"));
+    }
+    if database.busy_timeout.is_zero() {
+        return Err(ConfigError::invalid("database.busy-timeout 必须大于 0")
+            .at("database.busy-timeout")
+            .hint("推荐保持默认值 5s"));
+    }
+    if database.max_write_attempts == 0 {
+        return Err(
+            ConfigError::invalid("database.max-write-attempts 必须大于 0")
+                .at("database.max-write-attempts")
+                .hint("推荐保持默认值 12"),
+        );
+    }
+    Ok(())
 }
 
 fn compile_listen(cfg: &UserConfig) -> ConfigResult<ListenPlan> {
@@ -2867,10 +2898,119 @@ fn compile_groups(
                 check: g.check.clone(),
                 sticky: g.sticky.clone(),
                 path: g.path.clone(),
+                hidden: g.hidden,
+                icon: normalize_group_icon(&g.icon).map_err(|message| {
+                    ConfigError::invalid(format!("groups.{name}.icon: {message}"))
+                        .at(format!("groups.{name}.icon"))
+                })?,
             },
         );
     }
     Ok(out)
+}
+
+const MAX_INLINE_GROUP_ICON_BYTES: usize = 8 * 1024 * 1024;
+
+fn normalize_group_icon(icon: &str) -> Result<String, String> {
+    use base64::engine::general_purpose;
+
+    let icon = icon.trim();
+    if icon.is_empty() {
+        return Ok(String::new());
+    }
+
+    if icon.starts_with("data:") {
+        let (header, payload) = icon
+            .split_once(',')
+            .ok_or_else(|| "data URI 缺少逗号分隔的 Base64 内容".to_string())?;
+        if !header.starts_with("data:image/") || !header.ends_with(";base64") {
+            return Err("只接受 data:image/<type>;base64,<payload> 图像".into());
+        }
+        let bytes = decode_group_icon_base64(payload)
+            .ok_or_else(|| "data URI 包含无效的 Base64".to_string())?;
+        return canonical_group_icon_data_uri(bytes, &general_purpose::STANDARD);
+    }
+
+    let explicit = icon.strip_prefix("base64:");
+    if let Some(payload) = explicit {
+        let bytes = decode_group_icon_base64(payload)
+            .ok_or_else(|| "base64: 后的内容不是有效 Base64".to_string())?;
+        return canonical_group_icon_data_uri(bytes, &general_purpose::STANDARD);
+    }
+
+    // 原始 Base64 只有在解码后确实是已知图像时才视作内联图标。普通 URL、
+    // 文件路径和 dashboard 自定义标识原样保留。
+    if icon.len() >= 24
+        && icon.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'_' | b'-' | b'=')
+        })
+        && let Some(bytes) = decode_group_icon_base64(icon)
+        && infer_group_icon_mime(&bytes).is_some()
+    {
+        return canonical_group_icon_data_uri(bytes, &general_purpose::STANDARD);
+    }
+
+    Ok(icon.to_string())
+}
+
+fn canonical_group_icon_data_uri(
+    bytes: Vec<u8>,
+    encoder: &base64::engine::GeneralPurpose,
+) -> Result<String, String> {
+    use base64::Engine as _;
+
+    if bytes.len() > MAX_INLINE_GROUP_ICON_BYTES {
+        return Err(format!(
+            "内联图标解码后为 {} bytes，最大允许 {} bytes",
+            bytes.len(),
+            MAX_INLINE_GROUP_ICON_BYTES
+        ));
+    }
+    let mime = infer_group_icon_mime(&bytes)
+        .ok_or_else(|| "Base64 内容不是 PNG、JPEG、GIF、WebP、SVG、ICO 或 BMP 图像".to_string())?;
+    Ok(format!("data:{mime};base64,{}", encoder.encode(bytes)))
+}
+
+fn decode_group_icon_base64(value: &str) -> Option<Vec<u8>> {
+    use base64::{
+        Engine as _,
+        engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
+    };
+
+    let compact = value
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect::<String>();
+    [STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD]
+        .into_iter()
+        .find_map(|engine| engine.decode(compact.as_bytes()).ok())
+}
+
+fn infer_group_icon_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png");
+    }
+    if bytes.starts_with(b"\xff\xd8\xff") {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    if bytes.starts_with(&[0, 0, 1, 0]) {
+        return Some("image/x-icon");
+    }
+    if bytes.starts_with(b"BM") {
+        return Some("image/bmp");
+    }
+    let text = String::from_utf8_lossy(bytes);
+    let trimmed = text.trim_start_matches('\u{feff}').trim_start();
+    if trimmed.starts_with("<svg") || (trimmed.starts_with("<?xml") && trimmed.contains("<svg")) {
+        return Some("image/svg+xml");
+    }
+    None
 }
 
 fn compile_route(
@@ -3697,6 +3837,21 @@ mod tests {
     fn base64url_bytes(byte: u8, len: usize) -> String {
         use base64::Engine as _;
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vec![byte; len])
+    }
+
+    #[test]
+    fn group_icon_accepts_and_normalizes_base64_png() {
+        let icon = normalize_group_icon(
+            "base64:iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+        )
+        .unwrap();
+        assert!(icon.starts_with("data:image/png;base64,iVBOR"));
+    }
+
+    #[test]
+    fn group_icon_rejects_non_image_base64() {
+        let error = normalize_group_icon("base64:aGVsbG8gd29ybGQ=").unwrap_err();
+        assert!(error.contains("不是 PNG"));
     }
 
     fn valid_reality_listener() -> RealityListen {

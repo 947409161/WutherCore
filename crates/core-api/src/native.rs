@@ -61,6 +61,7 @@ pub fn router(state: NativeState) -> Router {
     Router::new()
         .route("/status", get(status))
         .route("/traffic", get(traffic))
+        .route("/traffic/summary", get(traffic_summary))
         .route("/nodes", get(nodes))
         .route("/groups", get(groups))
         .route("/groups/{name}", patch(patch_group))
@@ -94,6 +95,17 @@ async fn traffic(State(s): State<NativeState>) -> impl IntoResponse {
     Json(s.runtime.metrics.snapshot())
 }
 
+async fn traffic_summary(State(s): State<NativeState>) -> impl IntoResponse {
+    Json(json!({
+        "schema": 1,
+        "totals": s
+            .runtime
+            .connections
+            .persistent_traffic_snapshot()
+            .unwrap_or_default(),
+    }))
+}
+
 async fn nodes(State(s): State<NativeState>) -> impl IntoResponse {
     let nodes: Vec<_> = s
         .runtime
@@ -122,10 +134,13 @@ async fn groups(State(s): State<NativeState>) -> impl IntoResponse {
         .read()
         .iter()
         .map(|(_, g)| {
+            let options = g.options();
             json!({
                 "name": g.name(),
                 "members": g.members(),
                 "manual": g.current_manual(),
+                "hidden": options.hidden,
+                "icon": options.icon,
             })
         })
         .collect();
@@ -150,7 +165,7 @@ async fn patch_group(
         )
             .into_response();
     }
-    s.runtime.set_group_manual(&name, &body.pick);
+    s.runtime.set_group_manual(&name, &body.pick).await;
     (
         StatusCode::OK,
         Json(json!({"ok": true, "group": name, "pick": body.pick})),
@@ -374,7 +389,7 @@ async fn smart_avoid(State(s): State<NativeState>, Json(b): Json<AvoidBody>) -> 
 
 async fn smart_reset(State(s): State<NativeState>) -> impl IntoResponse {
     if let Some(store) = &s.runtime.store {
-        match store.reset() {
+        match store.reset().await {
             Ok(()) => Json(json!({"ok": true, "reset": "store cleared"})).into_response(),
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,

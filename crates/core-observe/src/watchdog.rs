@@ -20,9 +20,8 @@
 //!   完整 backtrace。
 //! * 一份 `watchdog.log`：每 N 秒一条 heartbeat；停跳超过 stuck_threshold 时
 //!   写一条 STUCK 警告 + dump 所有线程栈。
-//! * deadlock 检测：调用 [`parking_lot::deadlock::check_deadlock`]，发现
-//!   循环锁等待立即写入 `panic.log` 并 abort 进程（防止僵尸进程让运维以为
-//!   还活着）。
+//! * 卡顿诊断：独立线程不依赖 Tokio，心跳超时后把完整线程栈写入
+//!   `panic.log` 和 `watchdog.log`。
 //!
 //! ## 使用方式
 //!
@@ -61,7 +60,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 /// Watchdog 配置。所有 path 父目录会按需创建。
@@ -121,7 +120,7 @@ impl Watchdog {
     /// 调用一次完成三件事：
     /// 1. 创建 panic.log / watchdog.log（按需 mkdir -p）。
     /// 2. 注册 panic hook：每条 panic 写 panic.log（含线程名 + backtrace）。
-    /// 3. 启动两个独立 std::thread：heartbeat watcher + deadlock detector。
+    /// 3. 启动独立 std::thread heartbeat watcher。
     pub fn install(config: WatchdogConfig) -> Arc<Self> {
         // 文件先建好；建不了直接 panic 就好，这是启动期前置条件。
         ensure_parent_dir(&config.panic_log_path);
@@ -143,9 +142,6 @@ impl Watchdog {
 
         // 启动 heartbeat watcher 线程。
         spawn_heartbeat_watcher(inner.clone());
-
-        // 启动 deadlock detector 线程。
-        spawn_deadlock_detector(inner.clone());
 
         let wd = Arc::new(Self { inner });
         wd.append_watchdog_line("watchdog installed");
@@ -270,48 +266,6 @@ fn spawn_heartbeat_watcher(inner: Arc<WatchdogInner>) {
             }
         })
         .expect("watchdog: spawn heartbeat thread");
-}
-
-/// 启动 parking_lot 死锁检测线程。
-fn spawn_deadlock_detector(inner: Arc<WatchdogInner>) {
-    thread::Builder::new()
-        .name("rp-watchdog-dl".into())
-        .spawn(move || {
-            let interval = inner.config.deadlock_check_interval;
-            loop {
-                thread::sleep(interval);
-                if inner.shutdown.load(Ordering::Acquire) {
-                    return;
-                }
-                let deadlocks = parking_lot::deadlock::check_deadlock();
-                if deadlocks.is_empty() {
-                    continue;
-                }
-                let mut msg = String::new();
-                msg.push_str(&format!(
-                    "==== DEADLOCK ====\nat: {}\ncount: {}\n",
-                    iso_now(),
-                    deadlocks.len()
-                ));
-                for (i, threads) in deadlocks.iter().enumerate() {
-                    msg.push_str(&format!("  -- cycle #{} ({} threads):\n", i, threads.len()));
-                    for t in threads {
-                        msg.push_str(&format!(
-                            "    thread id {:?}\n{:?}\n",
-                            t.thread_id(),
-                            t.backtrace()
-                        ));
-                    }
-                }
-                // 死锁是不可恢复的；写文件后 abort 让外层 supervisor / systemd 重拉。
-                write_line(&inner.panic_file, &msg);
-                write_line(&inner.wd_file, &msg);
-                eprintln!("{msg}");
-                // abort —— 不调 panic（panic 也可能被吞掉），直接 OS 杀。
-                std::process::abort();
-            }
-        })
-        .expect("watchdog: spawn deadlock thread");
 }
 
 /* ====================== 辅助 ====================== */

@@ -139,16 +139,19 @@ impl SmartSelector {
     /// 启动时调用：从 [`Store`] 加载所有节点统计与 domain_best 缓存，并绑定
     /// 异步写入器；之后每次 record_success / record_failure / pin / 选择
     /// 都会把更新通过 mpsc 推给 writer，由 writer 批量落盘。
-    pub fn with_store(goal: SmartGoal, sticky: SmartSticky, store: Arc<Store>) -> Self {
+    pub async fn with_store(goal: SmartGoal, sticky: SmartSticky, store: Arc<Store>) -> Self {
         let mut me = Self::new(goal, sticky);
         // 1) 加载节点统计
-        if let Ok(rows) = store.iter_json::<core_store::NodeStatsBlob>(SMART_NODE_STATS) {
+        if let Ok(rows) = store
+            .iter_json::<core_store::NodeStatsBlob>(SMART_NODE_STATS)
+            .await
+        {
             for (k, blob) in rows {
                 me.nodes.insert(k, Arc::new(NodeStats::from_blob(&blob)));
             }
         }
         // 2) 加载 domain_best 缓存（若值未到期则回填）
-        if let Ok(rows) = store.iter_json::<DomainBestBlob>(SMART_DOMAIN_BEST) {
+        if let Ok(rows) = store.iter_json::<DomainBestBlob>(SMART_DOMAIN_BEST).await {
             let now = unix_now();
             for (k, blob) in rows {
                 if now.saturating_sub(blob.set_at_secs) <= 60 * 60 {
@@ -157,7 +160,7 @@ impl SmartSelector {
             }
         }
         // 3) 加载 negative cache
-        if let Ok(rows) = store.iter_json::<NegativeBlob>(SMART_NEGATIVE) {
+        if let Ok(rows) = store.iter_json::<NegativeBlob>(SMART_NEGATIVE).await {
             let now = unix_now();
             for (node, blob) in rows {
                 if blob.until_secs > now {
@@ -171,7 +174,7 @@ impl SmartSelector {
         me
     }
 
-    /// 优雅停止：把所有内存脏数据 flush 到 redb。
+    /// 优雅停止：把所有内存脏数据异步写入 Turso。
     pub async fn shutdown(&self) {
         if let Some(w) = &self.writer {
             // 把所有节点统计完整快照入队（保证停机时拥有最新状态）。
@@ -483,8 +486,9 @@ mod tests {
                 .as_nanos()
         ));
         {
-            let store = core_store::Store::open(&path).unwrap();
-            let sel = SmartSelector::with_store(SmartGoal::Balanced, SmartSticky::Site, store);
+            let store = core_store::Store::open(&path).await.unwrap();
+            let sel =
+                SmartSelector::with_store(SmartGoal::Balanced, SmartSticky::Site, store).await;
             sel.record_success("HK-1", Duration::from_millis(80));
             sel.record_success("HK-1", Duration::from_millis(60));
             sel.record_failure("US-1", "timeout");
@@ -492,8 +496,8 @@ mod tests {
             drop(sel);
         }
 
-        let store2 = core_store::Store::open(&path).unwrap();
-        let sel2 = SmartSelector::with_store(SmartGoal::Balanced, SmartSticky::Site, store2);
+        let store2 = core_store::Store::open(&path).await.unwrap();
+        let sel2 = SmartSelector::with_store(SmartGoal::Balanced, SmartSticky::Site, store2).await;
         let hk_snap = sel2.ensure_node("HK-1").snapshot();
         let us_snap = sel2.ensure_node("US-1").snapshot();
         assert!(
