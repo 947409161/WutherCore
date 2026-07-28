@@ -65,7 +65,7 @@ groups:
     choose: manual
     use: [primary, nodes]
     check: https://www.gstatic.com/generate_204
-    sticky: site
+    expected-status: 200-299
 
   auto:
     choose: smart
@@ -73,25 +73,42 @@ groups:
     prefer: [香港, HK, 日本, JP, 新加坡, SG]
     avoid: [DIRECT-FALLBACK, 过期, 到期, 剩余]
     check: https://www.gstatic.com/generate_204
+    expected-status: 200-299
+    interval: 1m
+    idle-timeout: 10m
+    unified-delay: true
+    max-failed-times: 3
+    test-timeout: 5s
     sticky: site
 
   low-latency:
     choose: fast
     use: [primary, nodes]
     check: https://www.gstatic.com/generate_204
-    sticky: site
+    expected-status: 200-299
+    interval: 30s
+    idle-timeout: 5m
+    tolerance: 50
+    unified-delay: true
 
   failover:
     choose: stable
     use: [primary, nodes]
     check: https://www.gstatic.com/generate_204
-    sticky: site
+    expected-status: 200-299
+    interval: 1m
+    idle-timeout: 10m
+    max-failed-times: 3
+    test-timeout: 5s
 
   load-balance:
     choose: spread
     use: [primary, nodes]
     check: https://www.gstatic.com/generate_204
-    sticky: session
+    expected-status: 200-299
+    interval: 1m
+    idle-timeout: 10m
+    strategy: sticky-sessions
 
   ai:
     choose: smart
@@ -99,6 +116,10 @@ groups:
     prefer: [美国, US, 新加坡, SG, 日本, JP]
     avoid: [DIRECT-FALLBACK, 香港, HK, 过期, 到期]
     check: https://www.gstatic.com/generate_204
+    expected-status: 200-299
+    interval: 1m
+    idle-timeout: 10m
+    unified-delay: true
     sticky: site
 
   streaming:
@@ -107,6 +128,10 @@ groups:
     prefer: [香港, HK, 新加坡, SG, 日本, JP, 美国, US]
     avoid: [DIRECT-FALLBACK, 过期, 到期]
     check: https://www.gstatic.com/generate_204
+    expected-status: 200-299
+    interval: 1m
+    idle-timeout: 10m
+    unified-delay: true
     sticky: site
 
   gaming:
@@ -114,21 +139,29 @@ groups:
     use: [primary, nodes]
     prefer: [香港, HK, 日本, JP, 新加坡, SG]
     check: https://www.gstatic.com/generate_204
-    sticky: session
+    expected-status: 200-299
+    interval: 20s
+    idle-timeout: 5m
+    tolerance: 35
+    unified-delay: true
 
   development:
     choose: stable
     use: [primary, nodes]
     prefer: [香港, HK, 日本, JP, 新加坡, SG, 美国, US]
     check: https://www.gstatic.com/generate_204
-    sticky: site
+    expected-status: 200-299
+    interval: 1m
+    idle-timeout: 10m
 
   messaging:
     choose: stable
     use: [primary, nodes]
     prefer: [新加坡, SG, 香港, HK, 日本, JP]
     check: https://www.gstatic.com/generate_204
-    sticky: site
+    expected-status: 200-299
+    interval: 1m
+    idle-timeout: 10m
 
 route:
   preset: custom

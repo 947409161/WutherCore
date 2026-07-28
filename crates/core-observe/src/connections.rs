@@ -386,7 +386,15 @@ impl ConnectionTable {
 
     /// 注册一条新连接，返回 RAII guard。drop 时自动从表移除。
     /// 推荐 splice 任务持有 guard 直至双向拷贝结束。
-    pub fn open(self: &Arc<Self>, mut meta: ConnectionMeta) -> ConnectionGuard {
+    pub fn open(self: &Arc<Self>, meta: ConnectionMeta) -> ConnectionGuard {
+        self.open_observed(meta, None)
+    }
+
+    pub fn open_observed(
+        self: &Arc<Self>,
+        mut meta: ConnectionMeta,
+        observer: Option<Arc<dyn ConnectionObserver>>,
+    ) -> ConnectionGuard {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         meta.normalize_for_tracking();
         let traffic = self
@@ -438,6 +446,7 @@ impl ConnectionTable {
             smart_block,
             tracked: true,
             traffic,
+            observer,
         }
     }
 
@@ -483,6 +492,7 @@ impl ConnectionTable {
             smart_block,
             tracked: false,
             traffic,
+            observer: None,
         }
     }
 
@@ -924,6 +934,16 @@ pub struct ConnectionGuard {
     /// [`Self::detached`] 路径设 false。Drop 用它判断要不要触发 `remove_silent`。
     tracked: bool,
     traffic: Option<TrafficSession>,
+    observer: Option<Arc<dyn ConnectionObserver>>,
+}
+
+/// 数据面的低开销连接观察器。
+///
+/// 实现只应执行原子计数或其他常数时间操作；复制循环会在每个数据块调用。
+pub trait ConnectionObserver: Send + Sync {
+    fn on_upload(&self, bytes: u64);
+    fn on_download(&self, bytes: u64);
+    fn on_close(&self);
 }
 
 impl ConnectionGuard {
@@ -945,6 +965,7 @@ impl ConnectionGuard {
             upload_window: self.upload_window.clone(),
             download_window: self.download_window.clone(),
             traffic: self.traffic.clone(),
+            observer: self.observer.clone(),
         }
     }
     pub fn record_upload(&self, size: u64) {
@@ -966,6 +987,9 @@ impl Drop for ConnectionGuard {
         if self.tracked {
             self.table.remove_silent(self.id);
         }
+        if let Some(observer) = &self.observer {
+            observer.on_close();
+        }
         // detached：从未入表，无需 remove。
     }
 }
@@ -981,6 +1005,7 @@ pub struct ConnectionAccounting {
     upload_window: Arc<Mutex<BucketWindow>>,
     download_window: Arc<Mutex<BucketWindow>>,
     traffic: Option<TrafficSession>,
+    observer: Option<Arc<dyn ConnectionObserver>>,
 }
 
 impl ConnectionAccounting {
@@ -1001,6 +1026,9 @@ impl ConnectionAccounting {
         if let Some(traffic) = &self.traffic {
             traffic.record_upload(size);
         }
+        if let Some(observer) = &self.observer {
+            observer.on_upload(size);
+        }
         let rate = self.upload_window.lock().update_max_rate(size);
         if rate > self.max_upload_rate.load(Ordering::Relaxed) {
             self.max_upload_rate.store(rate, Ordering::Relaxed);
@@ -1015,6 +1043,9 @@ impl ConnectionAccounting {
         self.table.push_downloaded(size);
         if let Some(traffic) = &self.traffic {
             traffic.record_download(size);
+        }
+        if let Some(observer) = &self.observer {
+            observer.on_download(size);
         }
         let rate = self.download_window.lock().update_max_rate(size);
         if rate > self.max_download_rate.load(Ordering::Relaxed) {

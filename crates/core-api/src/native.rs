@@ -139,6 +139,13 @@ async fn groups(State(s): State<NativeState>) -> impl IntoResponse {
                 "name": g.name(),
                 "members": g.members(),
                 "manual": g.current_manual(),
+                "pin": g.current_pin().map(|pin| json!({
+                    "node": pin.node,
+                    "generation": pin.generation,
+                    "created_at_ms": pin.created_at_ms,
+                    "source": pin.source.as_str(),
+                })),
+                "strategy": format!("{:?}", g.plan().choose).to_ascii_lowercase(),
                 "hidden": options.hidden,
                 "icon": options.icon,
             })
@@ -157,15 +164,34 @@ async fn patch_group(
     Path(name): Path<String>,
     Json(body): Json<GroupPatch>,
 ) -> impl IntoResponse {
-    let exists = s.runtime.groups.read().contains_key(&name);
-    if !exists {
+    let valid = s.runtime.groups.read().get(&name).map(|group| {
+        body.pick.is_empty() || group.members().iter().any(|member| member == &body.pick)
+    });
+    if valid.is_none() {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({"error": "unknown group"})),
         )
             .into_response();
     }
-    s.runtime.set_group_manual(&name, &body.pick).await;
+    if valid != Some(true) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "node not in group"})),
+        )
+            .into_response();
+    }
+    if !s
+        .runtime
+        .set_group_pin(&name, &body.pick, core_runtime::PinSource::NativeApi)
+        .await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "failed to persist group pin"})),
+        )
+            .into_response();
+    }
     (
         StatusCode::OK,
         Json(json!({"ok": true, "group": name, "pick": body.pick})),
@@ -356,6 +382,9 @@ async fn smart_why(
         host: q.host.clone(),
         prefer: vec![],
         avoid: vec![],
+        current: g.last_pick(),
+        sticky: None,
+        session_key: None,
     };
     let choice = s.runtime.smart.choose(&ctx, g.members());
     Json(serde_json::to_value(&choice.explain).unwrap_or_default()).into_response()

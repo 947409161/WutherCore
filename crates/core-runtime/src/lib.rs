@@ -16,7 +16,9 @@ pub use dns_listener::{DnsListener, DnsListenerError, parse_dns_listen_addr, spa
 pub use engine::{
     DialResult, RoutePick, Runtime, RuntimeError, RuntimeNodeSnapshot, UdpDialResult,
 };
-pub use group_selector::{FlowMeta, GroupOptions, GroupSelector, LbStrategy};
+pub use group_selector::{
+    FlowMeta, GroupOptions, GroupPin, GroupSelector, LbStrategy, ManualProbeToken, PinSource,
+};
 pub use health::{
     DEAD_DELAY, DelayError, FAST_PICK_TTL, HistoryEntry, NodeUrlStats, UrlTestConfig, UrlTestOpts,
     UrlTester, spawn_periodic,

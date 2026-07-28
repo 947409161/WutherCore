@@ -371,7 +371,12 @@ impl ListenerHandler {
             self.runtime.connections.open_detached()
         } else {
             let meta = udp_connection_meta(&metadata, &result);
-            self.runtime.connections.open(meta)
+            let observer = if matches!(result.outbound.as_str(), "DIRECT" | "BLOCK") {
+                None
+            } else {
+                Some(self.runtime.smart.open_flow(&result.outbound))
+            };
+            self.runtime.connections.open_observed(meta, observer)
         };
         Ok(PreparedUdpPacket {
             socket: result.socket,
@@ -435,9 +440,14 @@ impl ListenerHandler {
     }
 
     pub fn open_tcp(&self, metadata: &InboundMetadata, result: &DialResult) -> ConnectionGuard {
+        let observer = if matches!(result.outbound.as_str(), "DIRECT" | "BLOCK") {
+            None
+        } else {
+            Some(self.runtime.smart.open_flow(&result.outbound))
+        };
         self.runtime
             .connections
-            .open(tcp_connection_meta(metadata, result))
+            .open_observed(tcp_connection_meta(metadata, result), observer)
     }
 
     /// 与 mihomo `tunnel.handleTCPConn`/`handleUDPConn` 的 `findProcessMode`

@@ -282,12 +282,60 @@ pub struct GroupPlan {
     pub prefer: Vec<String>,
     pub avoid: Vec<String>,
     pub check: Option<String>,
+    #[serde(default)]
+    pub expected_status: String,
+    #[serde(default = "default_group_plan_interval")]
+    pub interval: Duration,
+    #[serde(default = "default_group_plan_idle_timeout")]
+    pub idle_timeout: Duration,
+    #[serde(default = "default_group_plan_tolerance")]
+    pub tolerance: u32,
+    #[serde(default)]
+    pub unified_delay: Option<bool>,
+    #[serde(default = "default_group_plan_strategy")]
+    pub strategy: String,
+    #[serde(default)]
+    pub filter: String,
+    #[serde(default)]
+    pub exclude_filter: String,
+    #[serde(default)]
+    pub exclude_type: String,
+    #[serde(default = "default_group_plan_max_failed_times")]
+    pub max_failed_times: u32,
+    #[serde(default = "default_group_plan_test_timeout")]
+    pub test_timeout: Duration,
+    #[serde(default)]
+    pub disable_udp: bool,
     pub sticky: Option<String>,
     pub path: Vec<String>,
     #[serde(default)]
     pub hidden: bool,
     #[serde(default)]
     pub icon: String,
+}
+
+fn default_group_plan_interval() -> Duration {
+    Duration::from_secs(60)
+}
+
+fn default_group_plan_idle_timeout() -> Duration {
+    Duration::from_secs(10 * 60)
+}
+
+fn default_group_plan_tolerance() -> u32 {
+    50
+}
+
+fn default_group_plan_strategy() -> String {
+    "consistent-hashing".to_string()
+}
+
+fn default_group_plan_max_failed_times() -> u32 {
+    5
+}
+
+fn default_group_plan_test_timeout() -> Duration {
+    Duration::from_secs(5)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2845,6 +2893,67 @@ fn compile_groups(
     let valid_feeds: std::collections::HashSet<&str> =
         cfg.feeds.keys().map(|s| s.as_str()).collect();
     for (name, g) in &cfg.groups {
+        if g.interval < Duration::from_secs(1) {
+            return Err(
+                ConfigError::invalid(format!("groups.{name}.interval 必须至少为 1s"))
+                    .at(format!("groups.{name}.interval")),
+            );
+        }
+        if g.idle_timeout < g.interval {
+            return Err(ConfigError::invalid(format!(
+                "groups.{name}.idle-timeout 不能小于 interval"
+            ))
+            .at(format!("groups.{name}.idle-timeout")));
+        }
+        if g.max_failed_times == 0 {
+            return Err(
+                ConfigError::invalid(format!("groups.{name}.max-failed-times 必须大于 0"))
+                    .at(format!("groups.{name}.max-failed-times")),
+            );
+        }
+        if let Some(check) = g.check.as_deref() {
+            let parsed = url::Url::parse(check).map_err(|error| {
+                ConfigError::invalid(format!("groups.{name}.check URL 非法: {error}"))
+                    .at(format!("groups.{name}.check"))
+            })?;
+            if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+                return Err(ConfigError::invalid(format!(
+                    "groups.{name}.check 只支持带主机名的 http/https URL"
+                ))
+                .at(format!("groups.{name}.check")));
+            }
+        }
+        validate_group_expected_status(&g.expected_status).map_err(|message| {
+            ConfigError::invalid(format!("groups.{name}.expected-status: {message}"))
+                .at(format!("groups.{name}.expected-status"))
+        })?;
+        if g.choose == ChooseStrategy::Spread
+            && !matches!(
+                g.strategy.as_str(),
+                "consistent-hashing"
+                    | "consistent_hashing"
+                    | "round-robin"
+                    | "round_robin"
+                    | "sticky-sessions"
+                    | "sticky_sessions"
+            )
+        {
+            return Err(ConfigError::invalid(format!(
+                "groups.{name}.strategy 不支持 `{}`",
+                g.strategy
+            ))
+            .at(format!("groups.{name}.strategy"))
+            .hint("可用值: consistent-hashing、round-robin、sticky-sessions"));
+        }
+        if let Some(sticky) = g.sticky.as_deref()
+            && !matches!(sticky, "off" | "site" | "session")
+        {
+            return Err(
+                ConfigError::invalid(format!("groups.{name}.sticky 不支持 `{sticky}`"))
+                    .at(format!("groups.{name}.sticky"))
+                    .hint("可用值: off、site、session"),
+            );
+        }
         if g.choose == ChooseStrategy::Chain {
             return Err(ConfigError::invalid(format!(
                 "groups.{name}.choose = chain 尚未实现多跳 relay"
@@ -2896,6 +3005,18 @@ fn compile_groups(
                 prefer: g.prefer.clone(),
                 avoid: g.avoid.clone(),
                 check: g.check.clone(),
+                expected_status: g.expected_status.clone(),
+                interval: g.interval,
+                idle_timeout: g.idle_timeout,
+                tolerance: g.tolerance,
+                unified_delay: g.unified_delay,
+                strategy: g.strategy.clone(),
+                filter: g.filter.clone(),
+                exclude_filter: g.exclude_filter.clone(),
+                exclude_type: g.exclude_type.clone(),
+                max_failed_times: g.max_failed_times,
+                test_timeout: g.test_timeout,
+                disable_udp: g.disable_udp,
                 sticky: g.sticky.clone(),
                 path: g.path.clone(),
                 hidden: g.hidden,
@@ -2907,6 +3028,41 @@ fn compile_groups(
         );
     }
     Ok(out)
+}
+
+fn validate_group_expected_status(expression: &str) -> Result<(), String> {
+    let expression = expression.trim();
+    if expression.is_empty() || expression == "*" {
+        return Ok(());
+    }
+    for part in expression.split('/') {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err("存在空状态码片段".into());
+        }
+        let (start, end) = if let Some((start, end)) = part.split_once('-') {
+            let start = start
+                .trim()
+                .parse::<u16>()
+                .map_err(|_| format!("非法状态码 `{part}`"))?;
+            let end = end
+                .trim()
+                .parse::<u16>()
+                .map_err(|_| format!("非法状态码 `{part}`"))?;
+            (start, end)
+        } else {
+            let status = part
+                .parse::<u16>()
+                .map_err(|_| format!("非法状态码 `{part}`"))?;
+            (status, status)
+        };
+        if start < 100 || end > 599 || start > end {
+            return Err(format!(
+                "状态码范围 `{part}` 必须位于 100..=599 且起点不大于终点"
+            ));
+        }
+    }
+    Ok(())
 }
 
 const MAX_INLINE_GROUP_ICON_BYTES: usize = 8 * 1024 * 1024;
@@ -5310,6 +5466,29 @@ route:
             msg.contains("chain") && msg.contains("尚未实现"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[test]
+    fn group_sticky_rejects_unknown_scope() {
+        let error = crate::loader::load_from_str(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+nodes: ["direct://0.0.0.0:0#A"]
+groups:
+  main:
+    choose: smart
+    use: [nodes]
+    sticky: forever
+route:
+  preset: direct
+"#,
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("sticky") && message.contains("forever"));
     }
 
     #[test]

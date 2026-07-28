@@ -34,6 +34,18 @@ impl DomainBest {
         self.map
             .insert(key.to_string(), (node.to_string(), Instant::now()));
     }
+
+    /// 选择结果未变化时不刷新 map，也不触发数据库写。TTL 过半后才续租，
+    /// 防止热域名每次连接都产生持久化操作。
+    pub fn put_if_changed(&self, key: &str, node: &str) -> bool {
+        if let Some(entry) = self.map.get(key) {
+            if entry.0 == node && entry.1.elapsed() < self.ttl / 2 {
+                return false;
+            }
+        }
+        self.put(key, node);
+        true
+    }
 }
 
 #[derive(Debug)]
@@ -59,11 +71,16 @@ impl NegativeCache {
             .insert(node.to_string(), (Instant::now() + dur, reason.into()));
     }
     pub fn is_cool(&self, node: &str) -> Option<String> {
-        let entry = self.map.get(node)?;
-        if entry.0 > Instant::now() {
-            Some(entry.1.clone())
-        } else {
-            None
+        let expired = {
+            let entry = self.map.get(node)?;
+            if entry.0 > Instant::now() {
+                return Some(entry.1.clone());
+            }
+            true
+        };
+        if expired {
+            self.map.remove(node);
         }
+        None
     }
 }

@@ -478,6 +478,7 @@ fn encode_ops(ops: &[BatchOp]) -> Result<Vec<EncodedOp>, StoreError> {
                 key: key.clone(),
                 value: value.as_bytes().to_vec(),
             }),
+            BatchOp::PutGroupPin(key, value) => encoded_json(GROUP_PIN, key, value),
             BatchOp::PutGroupManual(key, value) => Ok(EncodedOp::Put {
                 table: GROUP_MANUAL,
                 key: key.clone(),
@@ -571,6 +572,7 @@ pub enum BatchOp {
     PutDomainBest(String, DomainBestBlob),
     PutNegative(String, NegativeBlob),
     PutPin(String, String),
+    PutGroupPin(String, GroupPinBlob),
     PutGroupManual(String, String),
     PutFeedMeta(String, FeedMetaBlob),
     PutDnsCache(String, DnsCacheBlob),

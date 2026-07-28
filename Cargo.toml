@@ -29,7 +29,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.3.4"
+version = "0.3.5"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -83,6 +83,10 @@ compact_str = { version = "0.10", features = ["serde"] }
 smallvec = { version = "1", features = ["serde", "union", "const_generics", "const_new"] }
 # Arc 原子换页，给"连接表写入低频、快照读取高频"的场景做无锁切换。
 arc-swap = "1"
+# O(1) sticky-session 淘汰，避免旧实现容量满时每次 O(n) 扫描最老项。
+lru = "0.16"
+# Mozilla Public Suffix List 的无分配静态实现，用于真实 registrable domain。
+psl = "2"
 
 # CLI
 clap = { version = "4", features = ["derive"] }

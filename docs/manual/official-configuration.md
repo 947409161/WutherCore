@@ -91,6 +91,13 @@ feeds:
 项目当前会拒绝 `chain`，不会把未实现的多跳组降级为单跳。因此官方配置覆盖全部可
 执行策略，但不写不可执行的示例。
 
+这些组都支持 Clash API 持久 pin。Manual 会一直保持选择；Smart、Fast、Stable
+和 Spread 的固定节点失活时临时回退，成功执行组测速后解除旧 pin 并恢复自动选择。
+官方配置为自动组设置了 `expected-status`、`interval`、`idle-timeout`、
+`unified-delay`、失败阈值和切换迟滞。没有参与真实选路的组不会在后台扫描订阅。
+`load-balance` 使用 `strategy: sticky-sessions`，不要把 Smart 的 `sticky` 字段
+误当成 Spread 算法。
+
 ## 规则集
 
 远程 MRS 来自

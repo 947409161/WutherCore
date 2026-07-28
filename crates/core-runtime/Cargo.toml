@@ -35,3 +35,9 @@ rustls-pki-types = { workspace = true }
 webpki-roots     = { workspace = true }
 socket2          = { version = "0.6", features = ["all"] }
 compact_str      = { workspace = true }
+lru              = { workspace = true }
+psl              = { workspace = true }
+url              = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -7,8 +7,20 @@ pub struct NodeStatsBlob {
     pub samples: u32,
     pub success_ewma: f64,
     pub p50_latency_ms: f64,
+    #[serde(default)]
+    pub p90_latency_ms: f64,
     pub jitter_ms: f64,
     pub timeout_rate: f64,
+    #[serde(default)]
+    pub baseline_latency_ms: f64,
+    #[serde(default)]
+    pub degraded: bool,
+    #[serde(default)]
+    pub throughput_ewma_bps: f64,
+    #[serde(default)]
+    pub throughput_peak_bps: f64,
+    #[serde(default)]
+    pub throughput_updated_secs: Option<u64>,
     /// 最近一次失败相对于 UNIX_EPOCH 的秒数；None 表示无。
     pub last_failure_secs: Option<u64>,
     pub last_error: Option<String>,
@@ -35,6 +47,24 @@ pub struct DomainBestBlob {
 pub struct NegativeBlob {
     pub until_secs: u64,
     pub reason: String,
+}
+
+/// 策略组 pin 的持久化状态。
+///
+/// `generation` 是单调世代号。一次手动组测速开始时会记录该值，只有测速
+/// 完成时世代仍相同，才允许自动策略解除 pin。这可防止慢测速覆盖用户刚做的
+/// 新选择。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct GroupPinBlob {
+    pub node: String,
+    #[serde(default)]
+    pub strategy: String,
+    #[serde(default)]
+    pub generation: u64,
+    #[serde(default)]
+    pub created_at_ms: u64,
+    #[serde(default)]
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

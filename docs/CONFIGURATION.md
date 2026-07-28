@@ -71,7 +71,11 @@ groups:
 
 订阅正文不要求使用 Mihomo 外形。原生 YAML/JSON 可以用 `nodes` 或 `outbounds`，节点通过 `type` 指定 Young 等协议；省略时只对具有唯一字段特征的协议自动探测。格式和示例见 [自由订阅指南](FEEDS.md)。
 
-策略组可以从订阅和其他路径聚合节点，并通过 `prefer`、`avoid`、健康检查和粘性配置影响选择。修改后用 API 的 Smart 解释端点确认实际决策。
+策略组可以从订阅和其他路径聚合节点，并通过 `prefer`、`avoid`、`interval`、
+`idle-timeout`、`tolerance`、`unified-delay`、过滤器和粘性配置影响选择。
+所有已实现策略支持 Clash API 持久 pin，自动策略可由成功的组测速安全解锁。
+完整算法、字段和 API 语义见
+[高级路由、策略组与 DNS](manual/advanced-routing-dns.md)。
 
 Naive 节点需要 `naive` Cargo feature 和匹配的 Cronet 动态库，支持 H2/H3、UoT v2、ECH 与自定义证书。字段、构建和许可说明见 [Naive 出站](NAIVE.md)。
 

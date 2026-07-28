@@ -19,6 +19,7 @@ use core_observe::ConnectionMeta;
 use core_runtime::{Runtime, UrlTester};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt;
 
 const CFG: &str = r#"
@@ -547,7 +548,9 @@ async fn configs_get_and_patch_round_trip() {
                 .method("PATCH")
                 .uri("/configs")
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"mode":"global","log-level":"debug"}"#))
+                .body(Body::from(
+                    r#"{"mode":"global","log-level":"debug","unified-delay":true}"#,
+                ))
                 .unwrap(),
         )
         .await
@@ -567,6 +570,7 @@ async fn configs_get_and_patch_round_trip() {
     let v = body_json(resp).await;
     assert_eq!(v["mode"], "global");
     assert_eq!(v["log-level"], "debug");
+    assert_eq!(v["unified-delay"], true);
 }
 
 #[tokio::test]
@@ -1052,6 +1056,162 @@ route:
 }
 
 #[tokio::test]
+async fn clash_pin_is_visible_and_effective_for_every_automatic_group() {
+    for strategy in ["smart", "fast", "stable", "spread"] {
+        let cfg = format!(
+            r#"
+version: 1
+profile: desktop
+listen:
+  local: 7890
+nodes:
+  - {{name: NodeA, protocol: direct, address: "127.0.0.1:1"}}
+  - {{name: NodeB, protocol: direct, address: "127.0.0.1:2"}}
+groups:
+  picker:
+    choose: {strategy}
+    use: [nodes]
+route:
+  preset: global
+  final: picker
+"#
+        );
+        let runtime = Arc::new(Runtime::build(load_from_str(&cfg).unwrap()).unwrap());
+        let app = core_api::compat::router(NativeState::for_tests(
+            runtime.clone(),
+            UrlTester::new(Default::default()),
+            None,
+        ));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/proxies/picker")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"NodeB"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT, "{strategy}");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/group/picker")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_json(response).await;
+        assert_eq!(body["now"], "NodeB", "{strategy}: {body}");
+        assert_eq!(body["fixed"], "NodeB", "{strategy}: {body}");
+        assert_eq!(body["pin"]["node"], "NodeB", "{strategy}: {body}");
+        assert_eq!(body["pin"]["persistent"], true, "{strategy}: {body}");
+        assert_eq!(
+            runtime
+                .pick_outbound("example.com", 443, core_route::NetworkKind::Tcp)
+                .label,
+            "NodeB",
+            "{strategy}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn successful_clash_group_delay_unlocks_an_automatic_pin() {
+    let cfg = r#"
+version: 1
+profile: desktop
+listen:
+  local: 7890
+nodes:
+  - {name: NodeA, protocol: direct, address: "127.0.0.1:1"}
+  - {name: NodeB, protocol: direct, address: "127.0.0.1:2"}
+groups:
+  picker:
+    choose: fast
+    use: [nodes]
+route:
+  preset: global
+  final: picker
+"#;
+    let runtime = Arc::new(Runtime::build(load_from_str(cfg).unwrap()).unwrap());
+    let app = core_api::compat::router(NativeState::for_tests(
+        runtime.clone(),
+        UrlTester::new(Default::default()),
+        None,
+    ));
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/proxies/picker")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"NodeB"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(read > 0);
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        }
+    });
+    let uri = format!(
+        "/group/picker/delay?url=http%3A%2F%2F{}%2Fcheck&timeout=2000",
+        address
+    );
+    let response = app
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert!(body.get("NodeA").is_some(), "{body}");
+    assert!(body.get("NodeB").is_some(), "{body}");
+    server.await.unwrap();
+    assert!(
+        runtime
+            .groups
+            .read()
+            .get("picker")
+            .unwrap()
+            .current_pin()
+            .is_none()
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/group/picker")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let group = body_json(response).await;
+    assert_eq!(group["fixed"], "");
+    assert!(group["pin"].is_null(), "{group}");
+    let now = group["now"].as_str().unwrap();
+    assert!(body.get(now).is_some(), "{group}");
+}
+
+#[tokio::test]
 async fn group_history_inherits_from_selected_member() {
     // Mihomo: group 的 `history` / `alive` / `extra` 应取自当前 `now` 成员的
     // urltest 状态。WutherCore 之前 `to_clash_json` 永远输出 history=[]，
@@ -1068,13 +1228,14 @@ groups:
   picker:
     choose: manual
     use: [nodes]
+    check: https://probe.example/check
 route:
   final: picker
 "#;
     let plan = load_from_str(cfg).unwrap();
     let runtime = Arc::new(Runtime::build(plan).unwrap());
     let urltest = UrlTester::new(Default::default());
-    let url = urltest.current_config().default_url;
+    let url = "https://probe.example/check".to_string();
     urltest.ensure_stats("NodeB", &url).record(123, true);
     let state = NativeState::for_tests(runtime.clone(), urltest.clone(), None);
     let app = core_api::compat::router(state);
@@ -1111,6 +1272,7 @@ route:
     );
     assert_eq!(history[0]["delay"], 123);
     assert_eq!(picker["alive"], true);
+    assert_eq!(picker["testUrl"], url);
     let extra = picker["extra"]
         .as_object()
         .expect("extra must be an object");

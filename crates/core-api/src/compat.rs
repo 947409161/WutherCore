@@ -573,7 +573,17 @@ async fn proxy_put(
             .into_response();
     }
     drop(groups);
-    s.runtime.set_group_manual(&group, &body.name).await;
+    if !s
+        .runtime
+        .set_group_pin(&group, &body.name, core_runtime::PinSource::ClashApi)
+        .await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"message": "failed to persist group pin"})),
+        )
+            .into_response();
+    }
     s.caches.invalidate_proxy_state();
     (StatusCode::NO_CONTENT, Json(json!({}))).into_response()
 }
@@ -604,7 +614,13 @@ async fn clear_pin_inner(s: &NativeState, group: &str) -> axum::response::Respon
         .or_else(|| g.members().first().cloned())
         .unwrap_or_default();
     drop(groups);
-    s.runtime.set_group_manual(group, "").await;
+    if !s.runtime.clear_group_pin(group).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"message": "failed to persist group pin deletion"})),
+        )
+            .into_response();
+    }
     Json(json!({
         "group": group,
         "previous_pin": previous,
@@ -766,8 +782,18 @@ async fn group_delay(
         }
         None => None,
     };
-    let members = match s.runtime.groups.read().get(&name) {
-        Some(g) => g.members().to_vec(),
+    let (members, probe_token, unified_delay) = match s.runtime.groups.read().get(&name) {
+        Some(g) => {
+            let registry = s.runtime.outbounds.read();
+            let mut members = g.filtered_members(|node| {
+                registry
+                    .get(node)
+                    .map(|outbound| outbound.protocol().to_string())
+                    .unwrap_or_default()
+            });
+            members.retain(|node| registry.get(node).is_some());
+            (members, g.begin_manual_probe(), g.options().unified_delay)
+        }
         None => {
             return (
                 StatusCode::NOT_FOUND,
@@ -779,7 +805,26 @@ async fn group_delay(
     let to = q.timeout.map(Duration::from_millis);
     // sing-box GroupBase.URLTest: 并发上限 4，避免 1000 节点同时拨号互相
     // 抢带宽导致测速值被网络拥塞放大。
-    let body = group_delay_bounded(&s, &members, Some(url), to, expected, 4).await;
+    let body = group_delay_bounded(
+        &s,
+        &members,
+        Some(url.clone()),
+        to,
+        expected,
+        unified_delay,
+        4,
+    )
+    .await;
+    let released = s
+        .runtime
+        .complete_group_manual_probe(&name, probe_token, !body.is_empty())
+        .await;
+    if released {
+        if let Some(group) = s.runtime.groups.read().get(&name) {
+            group.reselect_after_manual_probe(&members, &url, &s.runtime.smart, &s.urltest);
+        }
+        s.caches.invalidate_proxy_state();
+    }
     Json(Value::Object(body)).into_response()
 }
 
@@ -790,46 +835,29 @@ async fn group_delay_bounded(
     url: Option<String>,
     timeout: Option<Duration>,
     expected_status: Option<core_runtime::IntRanges>,
+    unified_delay: Option<bool>,
     max_in_flight: usize,
 ) -> Map<String, Value> {
-    use tokio::sync::Semaphore;
-
     if members.is_empty() {
         return Map::new();
     }
-    let sem = Arc::new(Semaphore::new(max_in_flight.max(1)));
-    let mut handles = Vec::with_capacity(members.len());
-    for name in members {
-        // acquire 在 spawn 前完成；保证全局并发 ≤ max_in_flight。
-        let permit = match sem.clone().acquire_owned().await {
-            Ok(p) => p,
-            Err(_) => break, // semaphore closed (program shutting down)
-        };
-        let urltest = s.urltest.clone();
-        let runtime = s.runtime.clone();
-        let url_for = url.clone();
-        let expected_for = expected_status.clone();
-        let n = name.clone();
-        handles.push(tokio::spawn(async move {
-            let _permit = permit; // hold until task ends
-            let r = urltest
-                .test_node_with(
-                    &runtime,
-                    &n,
-                    core_runtime::UrlTestOpts {
-                        url: url_for,
-                        timeout,
-                        expected_status: expected_for,
-                        unified_delay: None,
-                    },
-                )
-                .await;
-            (n, r)
-        }));
-    }
+    let results = s
+        .urltest
+        .test_many_with_limit(
+            &s.runtime,
+            members,
+            core_runtime::UrlTestOpts {
+                url,
+                timeout,
+                expected_status,
+                unified_delay,
+            },
+            max_in_flight,
+        )
+        .await;
     let mut out = Map::new();
-    for h in handles {
-        if let Ok((name, Ok(ms))) = h.await {
+    for (name, result) in results {
+        if let Ok(ms) = result {
             out.insert(name, Value::from(ms));
         }
     }
@@ -857,18 +885,14 @@ fn collect_proxy_map(s: &NativeState) -> Map<String, Value> {
                 .map(|e| core_runtime::HistoryEntry {
                     time_ms: e.time_ms,
                     delay_ms: e.delay_ms as u32,
+                    connect_ms: 0,
+                    handshake_ms: 0,
+                    response_ms: 0,
+                    unified: false,
                 })
                 .collect();
         }
-        let h: Vec<Value> = entries
-            .into_iter()
-            .map(|e| {
-                json!({
-                    "time": iso8601(e.time_ms / 1000),
-                    "delay": e.delay_ms,
-                })
-            })
-            .collect();
+        let h: Vec<Value> = entries.into_iter().map(history_entry_json).collect();
         Value::Array(h)
     };
 
@@ -883,15 +907,7 @@ fn collect_proxy_map(s: &NativeState) -> Map<String, Value> {
             return json!({});
         }
         let alive = urltest.alive_for_url(node, &url);
-        let h: Vec<Value> = entries
-            .into_iter()
-            .map(|e| {
-                json!({
-                    "time": iso8601(e.time_ms / 1000),
-                    "delay": e.delay_ms,
-                })
-            })
-            .collect();
+        let h: Vec<Value> = entries.into_iter().map(history_entry_json).collect();
         json!({
             url: {
                 "alive": alive,
@@ -995,6 +1011,11 @@ fn group_json(
     runtime: &Arc<Runtime>,
 ) -> Value {
     let mut json = g.to_clash_json();
+    let test_url = g
+        .options()
+        .url
+        .filter(|url| !url.is_empty())
+        .unwrap_or_else(|| default_url.to_string());
     let now = json
         .get("now")
         .and_then(|v| v.as_str())
@@ -1002,11 +1023,6 @@ fn group_json(
         .filter(|s| !s.is_empty());
 
     if let Some(obj) = json.as_object_mut() {
-        if obj.get("type").and_then(Value::as_str) == Some("LoadBalance") {
-            obj.remove("now");
-            obj.remove("strategy");
-            obj.remove("fixed");
-        }
         // 默认填空 history / alive / delay，避免 dashboard 取不到字段
         // 时把 group 渲染为"超时"。
         if !obj.contains_key("history") {
@@ -1028,6 +1044,7 @@ fn group_json(
         obj.entry("dialer-proxy")
             .or_insert(Value::String(String::new()));
         obj.entry("emptyFallback").or_insert(Value::Bool(false));
+        obj.insert("testUrl".into(), Value::String(test_url.clone()));
         let member_capabilities: Vec<_> = g
             .members()
             .iter()
@@ -1043,15 +1060,15 @@ fn group_json(
             Value::Bool(member_capabilities.iter().any(|(_, multiplex)| *multiplex)),
         );
         if let Some(now_node) = now.as_deref() {
-            let history = node_history(urltest, runtime, now_node, default_url);
-            let alive = urltest.alive_for_url(now_node, default_url);
+            let history = node_history(urltest, runtime, now_node, &test_url);
+            let alive = urltest.alive_for_url(now_node, &test_url);
             let delay = delay_from_history(&history);
             obj.insert("history".into(), history.clone());
             obj.insert("alive".into(), Value::Bool(alive));
             obj.insert("delay".into(), Value::from(delay));
             obj.insert(
                 "extra".into(),
-                node_extra(urltest, now_node, default_url, &history),
+                node_extra(urltest, now_node, &test_url, &history),
             );
         }
     }
@@ -1113,20 +1130,14 @@ fn node_history(
             .map(|e| core_runtime::HistoryEntry {
                 time_ms: e.time_ms,
                 delay_ms: e.delay_ms as u32,
+                connect_ms: 0,
+                handshake_ms: 0,
+                response_ms: 0,
+                unified: false,
             })
             .collect();
     }
-    Value::Array(
-        entries
-            .into_iter()
-            .map(|e| {
-                json!({
-                    "time": iso8601(e.time_ms / 1000),
-                    "delay": e.delay_ms,
-                })
-            })
-            .collect(),
-    )
+    Value::Array(entries.into_iter().map(history_entry_json).collect())
 }
 
 fn node_extra(
@@ -1154,6 +1165,17 @@ fn delay_from_history(history: &Value) -> u64 {
         .and_then(|entry| entry.get("delay"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0)
+}
+
+fn history_entry_json(entry: core_runtime::HistoryEntry) -> Value {
+    json!({
+        "time": iso8601(entry.time_ms / 1000),
+        "delay": entry.delay_ms,
+        "connect": entry.connect_ms,
+        "handshake": entry.handshake_ms,
+        "response": entry.response_ms,
+        "unified": entry.unified,
+    })
 }
 
 fn map_proto(p: &str) -> &'static str {
@@ -1323,12 +1345,7 @@ fn provider_json(s: &NativeState, name: &str) -> Value {
                 urltest
                     .history(&n.name, &default_url)
                     .into_iter()
-                    .map(|e| {
-                        json!({
-                            "time": iso8601(e.time_ms / 1000),
-                            "delay": e.delay_ms,
-                        })
-                    })
+                    .map(history_entry_json)
                     .collect(),
             );
             let delay = delay_from_history(&history);
@@ -1743,6 +1760,13 @@ struct ConfigsPut {
     ipv6: Option<bool>,
     #[serde(default)]
     tun: Option<TunPut>,
+    #[serde(
+        rename = "unified-delay",
+        alias = "unified_delay",
+        alias = "unifiedDelay",
+        default
+    )]
+    unified_delay: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -1784,6 +1808,7 @@ async fn configs_put(
     State(s): State<NativeState>,
     Json(body): Json<ConfigsPut>,
 ) -> impl IntoResponse {
+    let unified_delay = body.unified_delay;
     // mode 已接入选路；其余字段仍只更新 MutableConfig 视图。
     // allow-lan / tun_enable / ipv6 / log-level 的真实副作用尚未热切换绑定/capture，
     // 但至少 mode 不再是“写成功假象”。
@@ -1846,6 +1871,9 @@ async fn configs_put(
         }
     }
     drop(mc);
+    if let Some(unified_delay) = unified_delay {
+        s.urltest.cfg.write().default_unified_delay = unified_delay;
+    }
     s.caches.invalidate_config_state();
     (StatusCode::NO_CONTENT, Json(json!({}))).into_response()
 }

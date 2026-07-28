@@ -24,11 +24,15 @@ use core_outbound::{
 use core_resolver::Resolver;
 use core_route::{FlowContext, NetworkKind, RouteDecision, RouteEngine};
 use core_smart::SmartSelector;
-use core_store::{Store, schema::GROUP_MANUAL};
+use core_store::{
+    GroupPinBlob, Store,
+    schema::{GROUP_MANUAL, GROUP_PIN},
+    store::BatchOp,
+};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
-use crate::group_selector::GroupSelector;
+use crate::group_selector::{GroupPin, GroupSelector, ManualProbeToken, PinSource};
 
 const DIAL_MAX_RETRIES: usize = 10;
 
@@ -50,6 +54,9 @@ pub struct Runtime {
     pub plan: RuntimePlan,
     pub outbounds: Arc<parking_lot::RwLock<OutboundRegistry>>,
     pub groups: parking_lot::RwLock<BTreeMap<String, Arc<GroupSelector>>>,
+    /// pin 是低频控制面事务。串行化内存状态与 Turso 提交，避免并发 API
+    /// 更新造成数据库和运行时顺序分叉。
+    group_pin_lock: tokio::sync::Mutex<()>,
     node_info: parking_lot::RwLock<BTreeMap<String, RuntimeNodeInfo>>,
     node_update_lock: parking_lot::Mutex<()>,
     node_revision: AtomicU64,
@@ -212,12 +219,30 @@ impl Runtime {
             smart.ensure_node(&n.name);
         }
 
-        // 恢复 group manual 选择
+        // 恢复完整 group pin。provider 节点可能要在启动后的订阅 bootstrap 才
+        // 出现，因此不能以当前 members 是否包含节点为恢复条件。
         if let Some(store) = &store {
+            if let Ok(rows) = store.iter_json::<GroupPinBlob>(GROUP_PIN).await {
+                for (group_name, blob) in rows {
+                    if blob.node.is_empty() {
+                        continue;
+                    }
+                    if let Some(group) = groups.get(&group_name) {
+                        group.restore_pin(GroupPin {
+                            node: blob.node,
+                            generation: blob.generation.max(1),
+                            created_at_ms: blob.created_at_ms,
+                            source: PinSource::parse(&blob.source),
+                        });
+                    }
+                }
+            }
+            // v0.3.4 及更早只保存字符串。仅在新命名空间没有该组时回填；
+            // 后续第一次写入会删除旧键。
             if let Ok(rows) = store.iter_string(GROUP_MANUAL).await {
                 for (group_name, picked) in rows {
                     if let Some(g) = groups.get(&group_name) {
-                        if g.members().iter().any(|m| m == &picked) {
+                        if g.current_pin().is_none() && !picked.is_empty() {
                             g.set_manual(picked);
                         }
                     }
@@ -246,6 +271,7 @@ impl Runtime {
             plan,
             outbounds,
             groups: parking_lot::RwLock::new(groups),
+            group_pin_lock: tokio::sync::Mutex::new(()),
             node_info: parking_lot::RwLock::new(node_info),
             node_update_lock: parking_lot::Mutex::new(()),
             node_revision: AtomicU64::new(0),
@@ -275,6 +301,8 @@ impl Runtime {
     /// 由 main.rs 在 UrlTester::new 之后注入，让策略组的 URLTest/Fallback/LB
     /// 能拿到 alive_for_url / pick_fast。
     pub fn set_urltest(&self, t: Arc<crate::health::UrlTester>) {
+        // 不在启动时探测所有组。首次真实选路会 touch 对应计划，闲置组不会
+        // 为海量 provider 节点创建连接和 future。
         *self.urltest.write() = Some(t);
     }
 
@@ -319,25 +347,132 @@ impl Runtime {
         Some(handle)
     }
 
-    /// 把 group manual 选择写入 store（持久化跨重启）。
-    pub async fn set_group_manual(&self, group: &str, node: &str) {
-        let groups = self.groups.read();
-        if let Some(g) = groups.get(group) {
-            // mihomo 兼容：空 node = 清除固定（PUT /proxies/<group> {"name":""}）
-            if node.is_empty() {
-                g.clear_manual();
-            } else {
-                g.set_manual(node);
+    /// 设置所有策略组通用的持久化 pin。
+    pub async fn set_group_pin(&self, group: &str, node: &str, source: PinSource) -> bool {
+        if node.is_empty() {
+            return self.clear_group_pin(group).await;
+        }
+        let _commit = self.group_pin_lock.lock().await;
+        let (selector, strategy) = {
+            let groups = self.groups.read();
+            let Some(selector) = groups.get(group) else {
+                return false;
+            };
+            if !selector.members().iter().any(|member| member == node) {
+                return false;
+            }
+            (selector.clone(), selector.plan().choose)
+        };
+        let previous_pin = selector.current_pin();
+        let previous_pick = selector.last_pick();
+        let pin = selector.set_pin(node.to_string(), source);
+        if let Some(store) = &self.store {
+            if let Err(error) = store
+                .write_batch(&[
+                    BatchOp::PutGroupPin(
+                        group.to_string(),
+                        GroupPinBlob {
+                            node: pin.node.clone(),
+                            strategy: group_strategy_name(strategy).to_string(),
+                            generation: pin.generation,
+                            created_at_ms: pin.created_at_ms,
+                            source: pin.source.as_str().to_string(),
+                        },
+                    ),
+                    BatchOp::Delete(GROUP_MANUAL.name(), group.to_string()),
+                ])
+                .await
+            {
+                selector.restore_pin_after_failed_commit(previous_pin, previous_pick);
+                tracing::error!(
+                    target: "group::pin",
+                    group,
+                    node,
+                    error = %error,
+                    "failed to persist group pin; runtime state rolled back"
+                );
+                return false;
             }
         }
+        self.node_revision.fetch_add(1, Ordering::Release);
+        true
+    }
+
+    /// 兼容旧内部调用，来源按 Clash API 处理。
+    pub async fn set_group_manual(&self, group: &str, node: &str) {
+        let _ = self.set_group_pin(group, node, PinSource::ClashApi).await;
+    }
+
+    pub async fn clear_group_pin(&self, group: &str) -> bool {
+        let _commit = self.group_pin_lock.lock().await;
+        let selector = {
+            let groups = self.groups.read();
+            let Some(selector) = groups.get(group) else {
+                return false;
+            };
+            selector.clone()
+        };
         if let Some(store) = &self.store {
-            let _ = store
-                .write_batch(&[core_store::store::BatchOp::PutGroupManual(
-                    group.to_string(),
-                    node.to_string(),
-                )])
-                .await;
+            if let Err(error) = store
+                .write_batch(&[
+                    BatchOp::Delete(GROUP_PIN.name(), group.to_string()),
+                    BatchOp::Delete(GROUP_MANUAL.name(), group.to_string()),
+                ])
+                .await
+            {
+                tracing::error!(
+                    target: "group::pin",
+                    group,
+                    error = %error,
+                    "failed to delete persisted group pin; runtime state kept"
+                );
+                return false;
+            }
         }
+        let existed = selector.clear_pin().is_some();
+        if existed {
+            self.node_revision.fetch_add(1, Ordering::Release);
+        }
+        true
+    }
+
+    /// 完成一次手动 Clash 组测速，并在世代仍一致时解除自动策略 pin。
+    pub async fn complete_group_manual_probe(
+        &self,
+        group: &str,
+        token: ManualProbeToken,
+        any_success: bool,
+    ) -> bool {
+        let _commit = self.group_pin_lock.lock().await;
+        let Some(selector) = self.groups.read().get(group).cloned() else {
+            return false;
+        };
+        let previous_pin = selector.current_pin();
+        let previous_pick = selector.last_pick();
+        let released = selector.complete_manual_probe(token, any_success);
+        if !released {
+            return false;
+        }
+        if let Some(store) = &self.store {
+            if let Err(error) = store
+                .write_batch(&[
+                    BatchOp::Delete(GROUP_PIN.name(), group.to_string()),
+                    BatchOp::Delete(GROUP_MANUAL.name(), group.to_string()),
+                ])
+                .await
+            {
+                selector.restore_pin_after_failed_commit(previous_pin, previous_pick);
+                tracing::error!(
+                    target: "group::pin",
+                    group,
+                    error = %error,
+                    "failed to persist probe unlock; group pin restored"
+                );
+                return false;
+            }
+        }
+        self.node_revision.fetch_add(1, Ordering::Release);
+        true
     }
 
     /// 优雅停止：把 Smart writer 的内存数据 flush 到磁盘。
@@ -526,6 +661,7 @@ impl Runtime {
         let plan_map = self.plan.groups.clone();
         let mut groups = self.groups.write();
         let mut updated_groups = 0usize;
+        let mut updated_selectors = Vec::new();
         for (name, base_plan) in plan_map {
             if base_plan
                 .members
@@ -548,9 +684,9 @@ impl Runtime {
                         new_members.push(m.clone());
                     }
                 }
-                let (old_options, old_manual) = groups
+                let (old_options, old_pin) = groups
                     .get(&name)
-                    .map(|g| (g.options(), g.current_manual()))
+                    .map(|g| (g.options(), g.current_pin()))
                     .unwrap_or_default();
                 let mut updated = base_plan.clone();
                 updated.members = new_members;
@@ -558,13 +694,23 @@ impl Runtime {
                     updated.clone(),
                     old_options,
                 ));
-                if let Some(manual) = old_manual {
-                    if updated.members.iter().any(|m| m == &manual) {
-                        selector.set_manual(manual);
-                    }
+                if let Some(pin) = old_pin {
+                    // provider 暂时移除固定节点时仍保存用户意图，之后节点重新
+                    // 出现即可自动恢复。
+                    selector.restore_pin(pin);
                 }
-                groups.insert(name.clone(), selector);
+                groups.insert(name.clone(), selector.clone());
+                updated_selectors.push(selector);
                 updated_groups += 1;
+            }
+        }
+        drop(groups);
+        if let Some(tester) = self.urltest.read().clone() {
+            tester.remove_nodes(removed_names.iter().map(String::as_str));
+            for selector in updated_selectors {
+                // 丢弃旧成员快照。活跃组的下一次真实选路会用新 selector
+                // 立即重建计划，闲置组保持零后台开销。
+                tester.remove_group_schedule(selector.name());
             }
         }
         self.node_revision.fetch_add(1, Ordering::Release);
@@ -666,21 +812,58 @@ impl Runtime {
         let tester = self.urltest.read().clone();
         let registry = self.outbounds.read();
         let pick = if ctx.network == NetworkKind::Udp {
-            g.pick_eligible(&meta, &self.smart, tester.as_ref(), |name| {
-                registry
-                    .get(name)
-                    .map(|ob| ob.capabilities().udp)
-                    .unwrap_or(false)
-            })
-            .or_else(|| g.pick(&meta, &self.smart, tester.as_ref()))
+            g.pick_eligible_with_protocol(
+                &meta,
+                &self.smart,
+                tester.as_ref(),
+                |name| {
+                    registry
+                        .get(name)
+                        .map(|ob| ob.capabilities().udp)
+                        .unwrap_or(false)
+                },
+                |name| {
+                    registry
+                        .get(name)
+                        .map(|outbound| outbound.protocol().to_string())
+                        .unwrap_or_default()
+                },
+            )
         } else {
-            g.pick(&meta, &self.smart, tester.as_ref())
+            g.pick_eligible_with_protocol(
+                &meta,
+                &self.smart,
+                tester.as_ref(),
+                |_| true,
+                |name| {
+                    registry
+                        .get(name)
+                        .map(|outbound| outbound.protocol().to_string())
+                        .unwrap_or_default()
+                },
+            )
         };
         if let Some(name) = pick {
             if let Some(ob) = registry.get(&name) {
                 return (name, ob);
             }
             warn!(target: "route", node = %name, "节点未注册，阻断流量避免回退 DIRECT");
+        } else if ctx.network == NetworkKind::Udp {
+            // 没有任何 UDP 可用成员时返回组内第一个已注册成员作为错误载体。
+            // dial_udp 会在真正拨号前检查 capabilities 并返回 Unsupported，
+            // 既不产生流量泄漏，也能保留具体节点名和协议，避免伪装成 BLOCK。
+            if let Some((name, outbound)) = g
+                .filtered_members(|name| {
+                    registry
+                        .get(name)
+                        .map(|outbound| outbound.protocol().to_string())
+                        .unwrap_or_default()
+                })
+                .into_iter()
+                .find_map(|name| registry.get(&name).map(|outbound| (name, outbound)))
+            {
+                return (name, outbound);
+            }
         } else if g.has_unresolved_feed_placeholders() {
             warn!(target: "route", group, "订阅节点尚未加载或为空，阻断流量避免回退 DIRECT");
         }
@@ -834,6 +1017,9 @@ impl Runtime {
                             let tester = self.urltest.read().clone();
                             let err_str = e.to_string();
                             let g_name = g.name().to_string();
+                            if let Some(tester) = tester.as_ref() {
+                                g.mark_member_failed(&pick.label, tester, &err_str);
+                            }
                             g.on_dial_failed(&err_str, move || {
                                 // 健康检查最小动作：清 fast-pick 缓存。
                                 // 真实重测延迟到下一次 spawn_periodic round（避免 dial 热路径阻塞）。
@@ -1026,6 +1212,10 @@ impl Runtime {
                 network: "udp",
                 dial_id,
             };
+            let group_for_event = match &pick.decision {
+                RouteDecision::Group(group) => Some(group.clone()),
+                _ => None,
+            };
             match pick.outbound.dial_udp(dial_ctx).await {
                 Ok(socket) => {
                     let elapsed = started.elapsed();
@@ -1045,6 +1235,11 @@ impl Runtime {
                     );
                     if pick.label != "DIRECT" && pick.label != "BLOCK" {
                         self.smart.record_success(&pick.label, elapsed);
+                    }
+                    if let Some(group) = &group_for_event {
+                        if let Some(selector) = self.groups.read().get(group) {
+                            selector.on_dial_success();
+                        }
                     }
                     return Ok(UdpDialResult {
                         socket,
@@ -1071,6 +1266,21 @@ impl Runtime {
                     );
                     if pick.label != "DIRECT" && pick.label != "BLOCK" {
                         self.smart.record_failure(&pick.label, e.to_string());
+                    }
+                    if let Some(group) = &group_for_event {
+                        if let Some(selector) = self.groups.read().get(group).cloned() {
+                            let tester = self.urltest.read().clone();
+                            let error = e.to_string();
+                            let group_name = selector.name().to_string();
+                            if let Some(tester) = tester.as_ref() {
+                                selector.mark_member_failed(&pick.label, tester, &error);
+                            }
+                            selector.on_dial_failed(&error, move || {
+                                if let Some(tester) = tester.clone() {
+                                    tester.invalidate_fast_pick(&group_name);
+                                }
+                            });
+                        }
                     }
                     if !should_retry_dial(&pick, &e, NetworkKind::Udp, attempt) {
                         return Err(e);
@@ -1220,6 +1430,17 @@ fn initial_node_info(plan: &RuntimePlan) -> BTreeMap<String, RuntimeNodeInfo> {
             )
         })
         .collect()
+}
+
+fn group_strategy_name(strategy: ChooseStrategy) -> &'static str {
+    match strategy {
+        ChooseStrategy::Manual => "manual",
+        ChooseStrategy::Smart => "smart",
+        ChooseStrategy::Fast => "fast",
+        ChooseStrategy::Stable => "stable",
+        ChooseStrategy::Spread => "spread",
+        ChooseStrategy::Chain => "chain",
+    }
 }
 
 fn infer_provider_from_name(
@@ -1766,6 +1987,70 @@ route:
         assert_eq!(ips, vec!["9.9.9.9".parse::<IpAddr>().unwrap()]);
     }
 
+    #[tokio::test]
+    async fn group_pin_survives_runtime_and_store_reopen() {
+        const CONFIG: &str = r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+nodes:
+  - "direct://0.0.0.0:0#node-a"
+  - "direct://0.0.0.0:0#node-b"
+groups:
+  main:
+    choose: fast
+    use: [nodes]
+route:
+  preset: global
+  final: main
+"#;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.db");
+        let store = core_store::Store::open(&path).await.unwrap();
+        let runtime = Runtime::build_with_store(load_plan(CONFIG), Some(store.clone()))
+            .await
+            .unwrap();
+
+        assert!(
+            runtime
+                .set_group_pin("main", "node-b", PinSource::NativeApi)
+                .await
+        );
+        let written = store
+            .get_json::<GroupPinBlob>(GROUP_PIN, "main")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(written.node, "node-b");
+        assert_eq!(written.strategy, "fast");
+        assert_eq!(written.source, "native_api");
+        let generation = written.generation;
+        drop(runtime);
+        drop(store);
+
+        let reopened = core_store::Store::open(&path).await.unwrap();
+        let restored = Runtime::build_with_store(load_plan(CONFIG), Some(reopened))
+            .await
+            .unwrap();
+        let pin = restored
+            .groups
+            .read()
+            .get("main")
+            .unwrap()
+            .current_pin()
+            .unwrap();
+        assert_eq!(pin.node, "node-b");
+        assert_eq!(pin.generation, generation);
+        assert_eq!(pin.source, PinSource::Restored);
+        assert_eq!(
+            restored
+                .pick_outbound("example.com", 443, NetworkKind::Tcp)
+                .label,
+            "node-b"
+        );
+    }
+
     #[test]
     fn runtime_leaves_outbound_fwmark_disabled_when_not_configured() {
         let plan = load_plan(
@@ -1935,6 +2220,80 @@ route:
         assert_eq!(snapshots[0].node.name, "provider-a/node-1");
         assert_eq!(snapshots[0].node.host, "203.0.113.10");
         assert_eq!(runtime.node_revision(), 1);
+    }
+
+    #[tokio::test]
+    async fn provider_refresh_preserves_pin_across_temporary_node_removal() {
+        let plan = load_plan(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+feeds:
+  provider-a: "https://example.invalid/sub.yaml"
+groups:
+  main:
+    choose: fast
+    use: [provider-a]
+route:
+  preset: global
+  final: main
+"#,
+        );
+        let runtime = Runtime::build(plan).unwrap();
+        let node = |name: &str| {
+            core_config::node_uri::ParsedNode::new(
+                name,
+                core_config::node_uri::NodeProtocol::Direct,
+                "203.0.113.10",
+                443,
+            )
+        };
+        runtime
+            .apply_feed_nodes("provider-a", vec![node("node-a"), node("node-b")])
+            .unwrap();
+        assert!(
+            runtime
+                .set_group_pin("main", "node-b", PinSource::ClashApi)
+                .await
+        );
+        assert_eq!(
+            runtime
+                .pick_outbound("example.com", 443, NetworkKind::Tcp)
+                .label,
+            "node-b"
+        );
+
+        runtime
+            .apply_feed_nodes("provider-a", vec![node("node-a")])
+            .unwrap();
+        assert_eq!(
+            runtime
+                .groups
+                .read()
+                .get("main")
+                .unwrap()
+                .current_manual()
+                .as_deref(),
+            Some("node-b")
+        );
+        assert_eq!(
+            runtime
+                .pick_outbound("example.com", 443, NetworkKind::Tcp)
+                .label,
+            "node-a"
+        );
+
+        runtime
+            .apply_feed_nodes("provider-a", vec![node("node-a"), node("node-b")])
+            .unwrap();
+        assert_eq!(
+            runtime
+                .pick_outbound("example.com", 443, NetworkKind::Tcp)
+                .label,
+            "node-b"
+        );
     }
 
     #[test]

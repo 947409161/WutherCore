@@ -44,14 +44,7 @@ pub fn apply_defaults(cfg: &mut UserConfig) {
     if cfg.groups.is_empty() {
         let mut g = GroupSpec {
             choose: ChooseStrategy::Smart,
-            r#use: vec![],
-            prefer: vec![],
-            avoid: vec![],
-            check: None,
-            sticky: None,
-            path: vec![],
-            hidden: false,
-            icon: String::new(),
+            ..GroupSpec::default()
         };
         // 默认引用所有 feeds 与 nodes
         for k in cfg.feeds.keys() {

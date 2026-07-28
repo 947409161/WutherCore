@@ -4240,14 +4240,97 @@ pub struct GroupSpec {
     pub choose: ChooseStrategy,
     #[serde(default)]
     pub r#use: Vec<String>,
+    /// 节点名称软偏好。Fast 在 tolerance 内优先，Stable 提升检查层级，
+    /// Smart 加入评分。
     #[serde(default)]
     pub prefer: Vec<String>,
+    /// 自动策略的降级候选；正常候选全部不可用时才兜底。
     #[serde(default)]
     pub avoid: Vec<String>,
+    /// 组级 HTTP/HTTPS 健康检查 URL。
     #[serde(default)]
     pub check: Option<String>,
+    /// 健康检查期望状态码，兼容 Mihomo 的 `expected-status` 表达式。
+    #[serde(
+        default,
+        rename = "expected-status",
+        alias = "expected_status",
+        alias = "expectedStatus"
+    )]
+    pub expected_status: String,
+    /// 自动探活间隔。组在 `idle-timeout` 内没有被使用时会自动停表。
+    #[serde(default = "default_group_interval", with = "humantime_serde")]
+    pub interval: Duration,
+    /// 未被选路使用多久后停止周期探活。
+    #[serde(
+        default = "default_group_idle_timeout",
+        with = "humantime_serde",
+        rename = "idle-timeout",
+        alias = "idle_timeout"
+    )]
+    pub idle_timeout: Duration,
+    /// Fast/Smart 切换迟滞，单位毫秒。
+    #[serde(default = "default_group_tolerance")]
+    pub tolerance: u32,
+    /// 是否使用去除连接建立噪声的统一延迟。
+    #[serde(
+        default,
+        rename = "unified-delay",
+        alias = "unified_delay",
+        alias = "unifiedDelay"
+    )]
+    pub unified_delay: Option<bool>,
+    /// Spread 的分配算法：consistent-hashing / round-robin / sticky-sessions。
+    #[serde(default = "default_group_lb_strategy")]
+    pub strategy: String,
+    /// 组内节点名包含过滤，多条表达式用反引号分隔。
+    #[serde(default)]
+    pub filter: String,
+    /// 组内节点名排除过滤。
+    #[serde(
+        default,
+        rename = "exclude-filter",
+        alias = "exclude_filter",
+        alias = "excludeFilter"
+    )]
+    pub exclude_filter: String,
+    /// 组内协议类型排除过滤，使用 `|` 分隔。
+    #[serde(
+        default,
+        rename = "exclude-type",
+        alias = "exclude_type",
+        alias = "excludeType"
+    )]
+    pub exclude_type: String,
+    /// 连续拨号失败后触发一次按需健康检查的阈值。
+    #[serde(
+        default = "default_group_max_failed_times",
+        rename = "max-failed-times",
+        alias = "max_failed_times",
+        alias = "maxFailedTimes"
+    )]
+    pub max_failed_times: u32,
+    /// 连续拨号失败统计窗口。
+    #[serde(
+        default = "default_group_test_timeout",
+        with = "humantime_serde",
+        rename = "test-timeout",
+        alias = "test_timeout",
+        alias = "testTimeout"
+    )]
+    pub test_timeout: Duration,
+    #[serde(
+        default,
+        rename = "disable-udp",
+        alias = "disable_udp",
+        alias = "disableUdp"
+    )]
+    pub disable_udp: bool,
+    /// Smart 粘性作用域覆盖：off、site 或 session；省略时继承全局配置。
     #[serde(default)]
     pub sticky: Option<String>,
+    /// 预留的 chain 多跳节点顺序。当前 `choose: chain` 在编译期拒绝，
+    /// 不会把该列表误当成文件路径或静默执行第一跳。
     #[serde(default)]
     pub path: Vec<String>,
     /// 是否在支持该字段的 Clash dashboard 中隐藏策略组。
@@ -4257,6 +4340,34 @@ pub struct GroupSpec {
     /// Base64 图像。Base64 写法在编译阶段统一为 data URI。
     #[serde(default)]
     pub icon: String,
+}
+
+impl Default for GroupSpec {
+    fn default() -> Self {
+        Self {
+            choose: default_choose(),
+            r#use: Vec::new(),
+            prefer: Vec::new(),
+            avoid: Vec::new(),
+            check: None,
+            expected_status: String::new(),
+            interval: default_group_interval(),
+            idle_timeout: default_group_idle_timeout(),
+            tolerance: default_group_tolerance(),
+            unified_delay: None,
+            strategy: default_group_lb_strategy(),
+            filter: String::new(),
+            exclude_filter: String::new(),
+            exclude_type: String::new(),
+            max_failed_times: default_group_max_failed_times(),
+            test_timeout: default_group_test_timeout(),
+            disable_udp: false,
+            sticky: None,
+            path: Vec::new(),
+            hidden: false,
+            icon: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -5615,6 +5726,30 @@ fn default_feed_via() -> String {
 }
 fn default_choose() -> ChooseStrategy {
     ChooseStrategy::Smart
+}
+
+fn default_group_interval() -> Duration {
+    Duration::from_secs(60)
+}
+
+fn default_group_idle_timeout() -> Duration {
+    Duration::from_secs(10 * 60)
+}
+
+fn default_group_tolerance() -> u32 {
+    50
+}
+
+fn default_group_lb_strategy() -> String {
+    "consistent-hashing".to_string()
+}
+
+fn default_group_max_failed_times() -> u32 {
+    5
+}
+
+fn default_group_test_timeout() -> Duration {
+    Duration::from_secs(5)
 }
 fn default_route_preset() -> String {
     "cn_smart".into()

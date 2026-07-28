@@ -22,38 +22,116 @@ groups:
     prefer: [HK, JP, SG]
     avoid: [expired, traffic]
     check: https://www.gstatic.com/generate_204
-    sticky: site
+    expected-status: 200-299
+    interval: 30s
+    idle-timeout: 5m
+    tolerance: 50
+    unified-delay: true
+    filter: "^(HK|JP|SG)"
+    exclude-filter: "到期|流量"
+    exclude-type: "direct|http"
+    max-failed-times: 3
+    test-timeout: 5s
 
   quality:
-    choose: stable
+    choose: smart
     use: [primary]
     prefer: [premium]
+    avoid: [expired]
     check: https://www.gstatic.com/generate_204
+    sticky: site
 
   manual:
     choose: manual
     use: [nodes, primary]
+    hidden: false
+    icon: "base64:iVBORw0KGgoAAAANSUhEUg..."
 
   spread:
     choose: spread
     use: [primary]
     avoid: [trial]
+    strategy: sticky-sessions
+    disable-udp: false
 ```
 
 字段含义：
 
 | 字段 | 作用 |
 | --- | --- |
-| `choose` | `manual`、`smart`、`fast`、`stable`、`spread` 或 `chain` |
+| `choose` | `manual`、`smart`、`fast`、`stable`、`spread`。`chain` 仍在解析枚举中，但当前会在编译期拒绝 |
 | `use` | 候选来源，可引用 feed 名、保留来源 `nodes` 或具体节点 |
-| `prefer` | 优先名称模式 |
-| `avoid` | 排除或降级名称模式 |
-| `check` | 健康检查 URL |
-| `sticky` | 保持当前可用节点，减少频繁切换 |
-| `path` | 策略状态持久化路径 |
+| `prefer` | 名称包含匹配。Fast 在延迟差不超过 `tolerance` 时优先，Stable 先检查优先节点，Smart 作为评分加成 |
+| `avoid` | 自动策略的降级候选。其它候选全部不可用时才兜底，Smart 在所有候选都命中时恢复全量评分 |
+| `check` | HTTP 或 HTTPS 健康检查 URL。探测通过任意支持 TCP 的出站适配器执行，不限定节点协议 |
+| `expected-status` | 成功状态码表达式，例如 `200-299/401/403`。空值接受任意有效 HTTP 状态 |
+| `interval` | 活跃组的探测间隔，最小 `1s` |
+| `idle-timeout` | 组多久没有参与真实选路后停止周期探测，必须不小于 `interval` |
+| `tolerance` | Fast 的切换迟滞，单位毫秒 |
+| `unified-delay` | 覆盖全局统一延迟。启用后在同一 TCP/TLS 连接上完成第二次请求，以稳态响应耗时作为结果 |
+| `strategy` | Spread 算法：`consistent-hashing`、`round-robin`、`sticky-sessions` |
+| `filter` | 只保留匹配节点名的正则。多条正则用反引号分隔 |
+| `exclude-filter` | 排除匹配节点名的正则。多条正则用反引号分隔 |
+| `exclude-type` | 排除协议名，使用 `|` 分隔 |
+| `max-failed-times` | 在 `test-timeout` 窗口内达到该拨号失败次数后触发按需探测 |
+| `test-timeout` | 连续拨号失败的统计窗口，也是按需探测的超时上限 |
+| `disable-udp` | 从选择入口拒绝该组的 UDP，不只影响 API 展示 |
+| `sticky` | Smart 的组级覆盖：`off`、`site`、`session`。省略时继承顶层 `smart.sticky` |
+| `hidden` | 在支持该字段的 Clash Dashboard 中隐藏 |
+| `icon` | URL、路径、data URI、`base64:` 前缀或原始 Base64 图像。Base64 会归一化为 data URI |
 
-`fast` 偏向最低延迟，`stable` 偏向连续可用，`spread` 在可用候选间分散选择，
-`smart` 使用 Smart 子系统的学习结果，`manual` 使用持久化或 API 选择。
+`fast` 使用 URLTest 延迟和迟滞选择。`stable` 按优先层级选第一个存活节点。
+`spread` 只在存活候选间分配。`smart` 综合 P50、P90、抖动、成功率、退化基线、
+被动吞吐、活跃连接、站点记忆和冷却状态。`manual` 完全服从用户选择。
+
+### Pin 固定节点
+
+Clash 兼容接口对 Manual、Smart、Fast、Stable 和 Spread 使用同一套 pin 状态：
+
+```bash
+curl -X PUT \
+  -H "Content-Type: application/json" \
+  -d '{"name":"HK-01"}' \
+  http://127.0.0.1:9090/proxies/latency
+```
+
+pin 与策略组名一起写入 `database.path` 指定的 Turso 数据库，核心重启后恢复。
+API 只有在数据库提交成功后才返回成功。响应中的 `fixed` 是节点名，`pin` 还包含
+`generation`、`createdAt`、`source`、`persistent` 和 `available`。
+
+Manual 的 pin 一直生效，直到显式清除。自动策略的 pin 是用户优先级：节点存活时
+强制使用，节点失活时运行时临时故障转移，但数据库中的 pin 不删除；节点恢复后会
+继续使用。
+
+对自动策略调用组测速会在至少一个节点测试成功后解除测速开始时看到的 pin：
+
+```bash
+curl \
+  "http://127.0.0.1:9090/group/latency/delay?url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout=5000"
+```
+
+解锁使用 pin 世代校验。测速过程中发生的新选择不会被旧测速结果清除。全部测试
+失败时也不会清除。解锁成功后立即根据刚写入的健康数据恢复自动选择，`now` 与
+下一条真实流量一致。Manual 组测速只更新健康历史，不解除选择。
+
+可以使用以下任一方式清除：
+
+```bash
+curl -X DELETE http://127.0.0.1:9090/proxies/latency
+curl -X PUT -H "Content-Type: application/json" -d '{"name":""}' \
+  http://127.0.0.1:9090/proxies/latency
+```
+
+### URLTest 调度
+
+URLTest 只调度参与过真实选路且仍在 `idle-timeout` 内的组。启动时不会扫描所有
+订阅节点。批量探测使用惰性有界并发，同一节点和 URL 的并发请求会合并；失败后
+按 5 秒起步指数退避。多个组共享节点时使用最短的请求间隔。订阅删除节点后对应
+探测状态会立即回收，每个节点最多保留 16 个测速 URL 的历史。
+
+HTTP 响应头会完整读取，最大 32 KiB，IPv6 authority、查询参数、HTTP/1.0 关闭
+语义和 HTTP/1.1 keep-alive 都会正确处理。HTTPS 固定协商 HTTP/1.1，避免用
+HTTP/1.1 请求误连到 HTTP/2。历史同时暴露连接、TLS 握手、响应和统一延迟字段。
 
 `chain` 虽然保留在枚举中，但当前运行计划明确未实现，`check` 会失败。多跳出站应
 使用节点的 `streamSettings.sockopt.dialerProxy`，并接受其无环约束。

@@ -19,9 +19,9 @@ pub mod watchdog;
 
 pub use connections::{
     ConnectionAccounting, ConnectionEntry, ConnectionGuard, ConnectionInfo,
-    ConnectionManagerSnapshot, ConnectionMeta, ConnectionSnapshot, ConnectionSummary,
-    ConnectionTable, LongLivedEntry, RateSample, StringList, log_connection_summary,
-    string_list_from,
+    ConnectionManagerSnapshot, ConnectionMeta, ConnectionObserver, ConnectionSnapshot,
+    ConnectionSummary, ConnectionTable, LongLivedEntry, RateSample, StringList,
+    log_connection_summary, string_list_from,
 };
 pub use copy_counted::{copy_bidirectional_counted, copy_bidirectional_tracked};
 pub use log_bus::{LogBus, LogEvent};

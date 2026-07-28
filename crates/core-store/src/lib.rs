@@ -15,7 +15,8 @@
 //! | `smart_domain_best` | `group\|etld` | `DomainBestBlob` | 域名→最佳节点缓存 |
 //! | `smart_negative` | `node_name` | `NegativeBlob` | 失败节点冷却 |
 //! | `smart_pin` | `group\|host` | `node_name`（字符串） | 用户固定 |
-//! | `group_manual` | `group` | `node_name` | manual 分组当前选择 |
+//! | `group_pin` | `group` | `GroupPinBlob` | 全策略组持久化固定选择 |
+//! | `group_manual` | `group` | `node_name` | 旧版兼容读取 |
 //! | `feed_meta` | `feed_name` | `FeedMetaBlob` | 订阅最近抓取元数据 |
 //! | `traffic_totals` | `dimension + label` | `TrafficTotalBlob` | 任意精度持久流量汇总 |
 //! | `kv_meta` | 任意 key | bytes | 通用元数据/版本号 |
@@ -32,7 +33,7 @@ pub mod store;
 
 pub use async_writer::{AsyncWriter, WriteOp};
 pub use blobs::{
-    DnsCacheBlob, DomainBestBlob, FeedMetaBlob, HistoryEntry, NegativeBlob, NodeStatsBlob,
-    TrafficTotalBlob,
+    DnsCacheBlob, DomainBestBlob, FeedMetaBlob, GroupPinBlob, HistoryEntry, NegativeBlob,
+    NodeStatsBlob, TrafficTotalBlob,
 };
 pub use store::{MultiprocessWal, Store, StoreError, StoreOptions};

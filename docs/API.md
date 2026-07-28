@@ -38,7 +38,8 @@ x-api-secret: <secret>
 WebSocket/SSE 因浏览器协议限制，可使用 `?token=<secret>`。普通 GET/POST 不接受 query token，避免凭据进入访问日志和 Referer。
 
 Clash 兼容 `GET /configs` 的 `authentication` 字段只返回用户名列表，不回传 Mixed 入站密码。  
-`PUT /configs` 的 `mode`（`rule` / `global` / `direct`）会真正改变选路；`log-level` 更新运行时视图。  
+`PATCH /configs` 的 `mode`（`rule` / `global` / `direct`）会真正改变选路；
+`unified-delay` 会立即改变未被组级配置覆盖的 URLTest；`log-level` 更新运行时视图。
 `allow-lan` / `tun.enable` 不能热切换：值与启动配置不同时返回 `501`，避免 dashboard 假安全控制。
 
 以下路径不要求密钥：
@@ -109,6 +110,21 @@ curl \
 `ui.api.clash-compat: true` 时，服务会合并 Clash/Mihomo 兼容路由，供现有 Dashboard 查询版本、配置、代理、规则、连接、日志与流量，并执行部分控制操作。
 
 兼容目标是常见 Dashboard 工作流，不承诺实现上游项目的每个私有或实验接口。集成前应针对实际 Dashboard 版本执行冒烟测试。
+
+### 策略组 pin
+
+| 方法 | 路径 | 语义 |
+| --- | --- | --- |
+| `PUT` | `/proxies/:group` | 请求体 `{"name":"节点名"}`，为任意已实现策略组设置持久 pin |
+| `DELETE` | `/proxies/:group` | 清除持久 pin |
+| `GET` | `/group/:group/delay` | 并发测速；自动组至少一个节点成功后按世代解除旧 pin，Manual 不解除 |
+
+策略组 JSON 保留 Mihomo 常用的 `fixed` 字段，并增加向后兼容的 `pin` 对象。
+数据库提交失败会返回 `500`，不会只改内存。自动组的固定节点失活时会临时回退，
+pin 本身继续保留。测速解锁后会立即刷新 `now`。
+
+`GET /proxies/:name/delay` 只测试单节点，不改变策略组 pin。只有
+`GET /group/:group/delay` 具有自动组测速解锁语义。
 
 ## 服务端保护
 

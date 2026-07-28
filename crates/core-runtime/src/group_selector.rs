@@ -1,4 +1,4 @@
-//! 策略组 —— 完整对齐 mihomo `adapter/outboundgroup/*.go` 的 7 种策略：
+//! 策略组运行时。
 //!
 //! | mihomo type           | WutherCore ChooseStrategy        | 行为                                                 |
 //! |-----------------------|--------------------------------|------------------------------------------------------|
@@ -6,9 +6,9 @@
 //! | `url-test`            | `Smart` / `Fast`               | URLTest 最低延迟 + tolerance + singledo              |
 //! | `fallback`            | `Stable`                       | 顺序找首个 alive；fixed 选择优先                     |
 //! | `load-balance`        | `Spread`                       | consistent-hashing / round-robin / sticky-sessions   |
-//! | `relay` (chain)       | `Chain`                        | 按 path 顺序拼链                                     |
+//! | `relay` (chain)       | `Chain`                        | 配置编译期拒绝，避免静默退化为单跳                   |
 //!
-//! ## 关键能力（与 mihomo 等价）
+//! ## 关键能力
 //!
 //! * `filter` / `exclude_filter` 正则数组（多条用 backtick 分隔）
 //! * `exclude_type` 协议黑名单（`http|https`）
@@ -20,18 +20,23 @@
 //!   `{ type, now, all, testUrl, expectedStatus, fixed, hidden, icon, strategy? }`
 
 use std::{
-    collections::HashMap,
+    borrow::Cow,
     hash::{Hash, Hasher},
+    num::NonZeroUsize,
     sync::{
         Arc,
-        atomic::{AtomicI32, AtomicUsize, Ordering},
+        atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use ahash::AHasher;
-use core_config::{model::ChooseStrategy, runtime_plan::GroupPlan};
+use core_config::{
+    model::{ChooseStrategy, SmartSticky},
+    runtime_plan::GroupPlan,
+};
 use core_smart::{SmartContext, SmartSelector};
+use lru::LruCache;
 use parking_lot::{Mutex, RwLock};
 use regex::Regex;
 use tracing::debug;
@@ -86,15 +91,12 @@ impl FlowMeta {
     }
 }
 
-/// 极简 eTLD+1：取最后两段（`.cn` / `.uk` 等二级公共后缀这里不展开，与 mihomo
-/// 在没有 publicsuffix 数据库的情况下行为略有差异，但对 LB hash 不影响命中）。
 fn etld_plus_one(host: &str) -> String {
-    let h = host.trim_end_matches('.');
-    let parts: Vec<&str> = h.rsplitn(3, '.').collect();
-    if parts.len() <= 2 {
-        return h.to_string();
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return host;
     }
-    format!("{}.{}", parts[1], parts[0])
+    psl::domain_str(&host).map(str::to_owned).unwrap_or(host)
 }
 
 /* ============================================================
@@ -113,6 +115,12 @@ pub struct GroupOptions {
     pub lb_strategy: LbStrategy,
     /// URLTest tolerance（毫秒）
     pub tolerance: u32,
+    /// 活跃组的健康检查间隔。
+    pub interval: Duration,
+    /// 组无流量后停止周期探活的时间。
+    pub idle_timeout: Duration,
+    /// None 表示继承全局 unified-delay。
+    pub unified_delay: Option<bool>,
     /// 节点名 filter 正则；多条用 backtick "`" 分隔
     pub filter: String,
     /// 节点名 exclude_filter 正则
@@ -137,6 +145,9 @@ impl Default for GroupOptions {
             expected_status: String::new(),
             lb_strategy: LbStrategy::ConsistentHashing,
             tolerance: 50,
+            interval: Duration::from_secs(60),
+            idle_timeout: Duration::from_secs(10 * 60),
+            unified_delay: None,
             filter: String::new(),
             exclude_filter: String::new(),
             exclude_type: String::new(),
@@ -195,38 +206,30 @@ struct LbState {
 
 #[derive(Debug)]
 struct StickyLru {
-    cap: usize,
     ttl: Duration,
-    map: HashMap<u64, (usize, Instant)>,
+    map: LruCache<u64, (usize, Instant)>,
 }
 
 impl StickyLru {
     fn new(cap: usize, ttl: Duration) -> Self {
         Self {
-            cap,
             ttl,
-            map: HashMap::new(),
+            map: LruCache::new(NonZeroUsize::new(cap.max(1)).expect("non-zero lru capacity")),
         }
     }
     fn get(&mut self, k: u64) -> Option<usize> {
         let now = Instant::now();
         if let Some((idx, when)) = self.map.get(&k).copied() {
             if now.duration_since(when) < self.ttl {
-                self.map.insert(k, (idx, now));
+                self.map.put(k, (idx, now));
                 return Some(idx);
             }
-            self.map.remove(&k);
+            self.map.pop(&k);
         }
         None
     }
     fn put(&mut self, k: u64, idx: usize) {
-        if self.map.len() >= self.cap {
-            // 简单回收：删一个最老的。
-            if let Some((&oldk, _)) = self.map.iter().min_by_key(|(_, (_, w))| *w) {
-                self.map.remove(&oldk);
-            }
-        }
-        self.map.insert(k, (idx, Instant::now()));
+        self.map.put(k, (idx, Instant::now()));
     }
 }
 
@@ -251,9 +254,11 @@ pub struct GroupSelector {
     filter_regs: RwLock<Vec<Regex>>,
     exclude_filter_regs: RwLock<Vec<Regex>>,
     exclude_type_set: RwLock<Vec<String>>,
-    /// `select` / `fallback` / `url-test` 都用得上的"用户固定选择"；
-    /// 与 mihomo `selected` 字段同语义。
-    manual_pick: RwLock<Option<String>>,
+    health_revision: AtomicU64,
+    /// 所有组类型共享的用户固定选择。
+    pin: RwLock<Option<GroupPin>>,
+    /// 下一个 pin 世代。独立于时间，避免同毫秒更新产生 ABA。
+    pin_generation: AtomicU64,
     /// 失败窗口
     failure: FailureWindow,
     /// LB 状态
@@ -265,9 +270,21 @@ pub struct GroupSelector {
 impl GroupSelector {
     pub fn new(plan: GroupPlan) -> Self {
         let opts = GroupOptions {
+            url: plan.check.clone(),
+            expected_status: plan.expected_status.clone(),
+            lb_strategy: LbStrategy::parse(&plan.strategy).unwrap_or(LbStrategy::ConsistentHashing),
+            tolerance: plan.tolerance,
+            interval: plan.interval,
+            idle_timeout: plan.idle_timeout,
+            unified_delay: plan.unified_delay,
+            filter: plan.filter.clone(),
+            exclude_filter: plan.exclude_filter.clone(),
+            exclude_type: plan.exclude_type.clone(),
+            max_failed_times: plan.max_failed_times,
+            test_timeout_ms: plan.test_timeout.as_millis().min(u64::MAX as u128) as u64,
+            disable_udp: plan.disable_udp,
             hidden: plan.hidden,
             icon: plan.icon.clone(),
-            ..GroupOptions::default()
         };
         Self::with_options(plan, opts)
     }
@@ -279,7 +296,9 @@ impl GroupSelector {
             filter_regs: RwLock::new(Vec::new()),
             exclude_filter_regs: RwLock::new(Vec::new()),
             exclude_type_set: RwLock::new(Vec::new()),
-            manual_pick: RwLock::new(None),
+            health_revision: AtomicU64::new(0),
+            pin: RwLock::new(None),
+            pin_generation: AtomicU64::new(0),
             failure: FailureWindow::default(),
             lb: LbState::default(),
             last_pick: RwLock::new(None),
@@ -317,13 +336,15 @@ impl GroupSelector {
         *self.filter_regs.write() = filter_regs;
         *self.exclude_filter_regs.write() = exclude_regs;
         *self.exclude_type_set.write() = etypes;
+        self.health_revision
+            .store(group_health_revision(&self.plan, &opts), Ordering::Release);
         *self.opts.write() = opts;
     }
 
     /// 应用 filter / exclude_filter / exclude_type 后的成员快照。
     /// `protocol_of` 闭包用于查询 outbound 协议名（运行时有 OutboundRegistry）；
     /// 测试场景可以传 `|_| ""`。
-    pub fn filtered_members(&self, protocol_of: impl Fn(&str) -> &str) -> Vec<String> {
+    pub fn filtered_members(&self, protocol_of: impl Fn(&str) -> String) -> Vec<String> {
         let filt = self.filter_regs.read();
         let excl = self.exclude_filter_regs.read();
         let etypes = self.exclude_type_set.read();
@@ -359,21 +380,89 @@ impl GroupSelector {
         self.plan.members.iter().any(|m| is_feed_placeholder(m))
     }
 
+    pub fn set_pin(&self, node: impl Into<String>, source: PinSource) -> GroupPin {
+        let node = node.into();
+        let generation = self.pin_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let pin = GroupPin {
+            node: node.clone(),
+            generation,
+            created_at_ms: now_ms(),
+            source,
+        };
+        *self.last_pick.write() = Some(node);
+        *self.pin.write() = Some(pin.clone());
+        pin
+    }
+
+    pub fn restore_pin(&self, mut pin: GroupPin) {
+        pin.source = PinSource::Restored;
+        self.pin_generation
+            .fetch_max(pin.generation, Ordering::AcqRel);
+        *self.last_pick.write() = Some(pin.node.clone());
+        *self.pin.write() = Some(pin);
+    }
+
+    /// 清除当前固定选择。`last_pick` 保留，自动策略下一次选点会以它作为
+    /// 迟滞参考，但不会继续强制路由到该节点。
+    pub fn clear_pin(&self) -> Option<GroupPin> {
+        self.pin.write().take()
+    }
+
+    pub fn current_pin(&self) -> Option<GroupPin> {
+        self.pin.read().clone()
+    }
+
+    pub(crate) fn restore_pin_after_failed_commit(
+        &self,
+        pin: Option<GroupPin>,
+        last_pick: Option<String>,
+    ) {
+        *self.pin.write() = pin;
+        *self.last_pick.write() = last_pick;
+    }
+
+    /// 兼容旧内部调用。新代码应使用 [`Self::set_pin`]。
     pub fn set_manual(&self, node: impl Into<String>) {
-        let n = node.into();
-        *self.last_pick.write() = Some(n.clone());
-        *self.manual_pick.write() = Some(n);
+        self.set_pin(node, PinSource::Restored);
     }
-    /// 清除当前固定选择 —— 与 mihomo `PUT /proxies/<group> {"name":""}` 等价。
-    /// `last_pick` 保留以便下次 pick 仍能给出一个稳定的"近期成员"参考。
+
     pub fn clear_manual(&self) {
-        *self.manual_pick.write() = None;
+        self.clear_pin();
     }
+
     pub fn current_manual(&self) -> Option<String> {
-        self.manual_pick.read().clone()
+        self.current_pin().map(|pin| pin.node)
     }
+
     pub fn last_pick(&self) -> Option<String> {
         self.last_pick.read().clone()
+    }
+
+    pub fn begin_manual_probe(&self) -> ManualProbeToken {
+        ManualProbeToken {
+            generation: self.pin.read().as_ref().map(|pin| pin.generation),
+            // Selector 的测速只刷新健康状态，不改变用户的持久选择。
+            release_after_success: !matches!(self.plan.choose, ChooseStrategy::Manual),
+        }
+    }
+
+    /// 在一次 Clash 手动组测速成功后解除自动策略的旧 pin。
+    ///
+    /// 返回 true 表示确实发生了解锁。至少有一个候选探活成功才允许解锁，
+    /// 避免网络整体中断时丢掉用户意图。
+    pub fn complete_manual_probe(&self, token: ManualProbeToken, any_success: bool) -> bool {
+        if !any_success || !token.release_after_success {
+            return false;
+        }
+        let Some(generation) = token.generation else {
+            return false;
+        };
+        let mut pin = self.pin.write();
+        if pin.as_ref().map(|pin| pin.generation) != Some(generation) {
+            return false;
+        }
+        pin.take();
+        true
     }
 
     /* ====================================================================
@@ -401,7 +490,26 @@ impl GroupSelector {
         tester: Option<&Arc<UrlTester>>,
         eligible: impl Fn(&str) -> bool,
     ) -> Option<String> {
-        let mut members = self.filtered_members(|_| "");
+        self.pick_eligible_with_protocol(meta, smart, tester, eligible, |_| String::new())
+    }
+
+    pub fn pick_eligible_with_protocol(
+        &self,
+        meta: &FlowMeta,
+        smart: &Arc<SmartSelector>,
+        tester: Option<&Arc<UrlTester>>,
+        eligible: impl Fn(&str) -> bool,
+        protocol_of: impl Fn(&str) -> String,
+    ) -> Option<String> {
+        if meta.network == "udp" && self.opts.read().disable_udp {
+            tracing::debug!(
+                target: "group::pick",
+                group = %self.plan.name,
+                "UDP rejected by group disable-udp"
+            );
+            return None;
+        }
+        let mut members = self.filtered_members(protocol_of);
         let unresolved_feeds = members.iter().filter(|m| is_feed_placeholder(m)).count();
         if unresolved_feeds > 0 {
             members.retain(|m| !is_feed_placeholder(m));
@@ -426,15 +534,30 @@ impl GroupSelector {
                 .map(|t| t.current_config().default_url)
                 .unwrap_or_default()
         });
+        if let Some(tester) = tester {
+            let opts = self.opts.read().clone();
+            tester.activate_group(
+                self.name(),
+                self.health_revision.load(Ordering::Acquire),
+                &members,
+                &url,
+                &opts.expected_status,
+                opts.unified_delay,
+                opts.interval,
+                opts.idle_timeout,
+            );
+        }
         let started = std::time::Instant::now();
-        let chosen = match self.plan.choose {
-            ChooseStrategy::Manual => self.pick_manual(&members, &url, tester.map(|t| t.as_ref())),
-            ChooseStrategy::Smart => self.pick_smart(meta, &members, smart),
-            ChooseStrategy::Fast => self.pick_url_test(&members, &url, tester),
-            ChooseStrategy::Stable => self.pick_fallback(&members, &url, tester),
-            ChooseStrategy::Spread => self.pick_load_balance(meta, &members, &url, tester),
-            ChooseStrategy::Chain => self.pick_chain(&members),
-        };
+        let chosen = self
+            .pick_pin(&members, &url, tester.map(|tester| tester.as_ref()))
+            .or_else(|| match self.plan.choose {
+                ChooseStrategy::Manual => self.pick_manual(&members),
+                ChooseStrategy::Smart => self.pick_smart(meta, &members, smart),
+                ChooseStrategy::Fast => self.pick_url_test(&members, &url, tester),
+                ChooseStrategy::Stable => self.pick_fallback(&members, &url, tester),
+                ChooseStrategy::Spread => self.pick_load_balance(meta, &members, &url, tester),
+                ChooseStrategy::Chain => self.pick_chain(&members),
+            });
         match &chosen {
             Some(n) => tracing::debug!(
                 target: "group::pick",
@@ -443,7 +566,7 @@ impl GroupSelector {
                 host = %meta.host,
                 candidates = members.len(),
                 picked = %n,
-                fixed = ?self.manual_pick.read(),
+                fixed = ?self.current_manual(),
                 elapsed_us = started.elapsed().as_micros() as u64,
                 "decided",
             ),
@@ -457,7 +580,10 @@ impl GroupSelector {
             ),
         }
         if let Some(ref n) = chosen {
-            *self.last_pick.write() = Some(n.clone());
+            let needs_update = self.last_pick.read().as_deref() != Some(n.as_str());
+            if needs_update {
+                *self.last_pick.write() = Some(n.clone());
+            }
         }
         chosen
     }
@@ -477,21 +603,59 @@ impl GroupSelector {
     Selector / Manual —— mihomo selector.go
     ==================================================================== */
 
-    fn pick_manual(
+    fn pick_pin(
         &self,
         members: &[String],
         url: &str,
         tester: Option<&UrlTester>,
     ) -> Option<String> {
-        // 1. 用户固定选了一个 → 在过滤后的成员里查它是否仍然存在。
-        if let Some(p) = self.manual_pick.read().clone() {
-            if members.iter().any(|m| m == &p) {
-                // alive 校验：与 mihomo selector.go 一致，找不到 alive 也用它。
-                let _ = (url, tester);
-                return Some(p);
-            }
+        let pin = self.pin.read().clone()?;
+        if !members.iter().any(|member| member == &pin.node) {
+            // provider 暂时移除节点时保留 pin 意图；节点重新出现后会自动恢复。
+            return None;
         }
-        // 2. 没设 / 已失效 → 取第一个（mihomo `proxies[0]`）。
+        if matches!(self.plan.choose, ChooseStrategy::Manual)
+            || tester
+                .map(|tester| tester.alive_for_url(&pin.node, url))
+                .unwrap_or(true)
+        {
+            return Some(pin.node);
+        }
+        // 自动策略固定节点失活时只做运行时故障转移，不删除持久 pin。
+        None
+    }
+
+    /// 启动与 provider 刷新时预热一次组健康计划。
+    pub fn activate_health(&self, tester: &Arc<UrlTester>) {
+        self.activate_health_with_protocol(tester, |_| String::new());
+    }
+
+    /// 使用真实 outbound 协议过滤后预热健康计划，确保 `exclude-type` 不会为
+    /// 已排除的海量节点创建无效探测。
+    pub fn activate_health_with_protocol(
+        &self,
+        tester: &Arc<UrlTester>,
+        protocol_of: impl Fn(&str) -> String,
+    ) {
+        let members = self.filtered_members(protocol_of);
+        let opts = self.opts.read().clone();
+        let url = opts
+            .url
+            .clone()
+            .unwrap_or_else(|| tester.current_config().default_url);
+        tester.activate_group(
+            self.name(),
+            self.health_revision.load(Ordering::Acquire),
+            &members,
+            &url,
+            &opts.expected_status,
+            opts.unified_delay,
+            opts.interval,
+            opts.idle_timeout,
+        );
+    }
+
+    fn pick_manual(&self, members: &[String]) -> Option<String> {
         members.first().cloned()
     }
 
@@ -507,16 +671,37 @@ impl GroupSelector {
     ) -> Option<String> {
         let opts = self.opts.read();
         let tol = opts.tolerance;
-        // fixed selected：与 mihomo `selected` 完全一致 —— 只要 alive，就忠于它。
-        if let Some(s) = self.manual_pick.read().clone() {
-            if members.iter().any(|m| m == &s) {
-                if tester.map(|t| t.alive_for_url(&s, url)).unwrap_or(true) {
-                    return Some(s);
-                }
-            }
-        }
         if let Some(t) = tester {
-            if let Some(p) = t.pick_fast(self.name(), members, url, tol) {
+            let primary = self.non_avoided_members(members, url, Some(t));
+            let candidates: Cow<'_, [String]> = if self.plan.prefer.is_empty() {
+                primary
+            } else {
+                let fastest = primary
+                    .iter()
+                    .map(|node| t.last_delay_for_url(node, url))
+                    .filter(|delay| *delay != crate::health::DEAD_DELAY)
+                    .min();
+                let preferred: Vec<String> = primary
+                    .iter()
+                    .filter(|node| self.is_preferred(node))
+                    .cloned()
+                    .collect();
+                let preferred_fastest = preferred
+                    .iter()
+                    .map(|node| t.last_delay_for_url(node, url))
+                    .filter(|delay| *delay != crate::health::DEAD_DELAY)
+                    .min();
+                if matches!(
+                    (fastest, preferred_fastest),
+                    (Some(fastest), Some(preferred))
+                        if preferred <= fastest.saturating_add(tol)
+                ) {
+                    Cow::Owned(preferred)
+                } else {
+                    primary
+                }
+            };
+            if let Some(p) = t.pick_fast(self.name(), candidates.as_ref(), url, tol) {
                 return Some(p);
             }
         }
@@ -534,25 +719,23 @@ impl GroupSelector {
         url: &str,
         tester: Option<&Arc<UrlTester>>,
     ) -> Option<String> {
-        // selected fixed：只要 alive 就用它；dead 则清掉 fixed 让顺序找
-        // ⚠️ 必须先 let-bind 让 read guard 在语句结束时立刻释放 —— Rust 2021 下
-        //   `if let Some(s) = self.manual_pick.read().clone() { ... }` 的临时
-        //   RwLockReadGuard 会存活到 if-let body 结束；body 内 `self.manual_pick.write()`
-        //   就会同线程死锁 parking_lot 的 RwLock。
-        let manual_now: Option<String> = self.manual_pick.read().clone();
-        if let Some(s) = manual_now {
-            if members.iter().any(|m| m == &s) {
-                if tester.map(|t| t.alive_for_url(&s, url)).unwrap_or(true) {
-                    return Some(s);
+        // prefer 是稳定优先级，avoid 只在其它候选全部失活时兜底。
+        for tier in 0..3 {
+            for member in members {
+                let preferred = self.is_preferred(member);
+                let avoided = self.is_avoided(member);
+                let in_tier = match tier {
+                    0 => preferred && !avoided,
+                    1 => !preferred && !avoided,
+                    _ => avoided,
+                };
+                if in_tier
+                    && tester
+                        .map(|tester| tester.alive_for_url(member, url))
+                        .unwrap_or(true)
+                {
+                    return Some(member.clone());
                 }
-                // dead → 释放 fixed（此时 read guard 已 drop，write 不会死锁）
-                *self.manual_pick.write() = None;
-            }
-        }
-        // 顺序找首个 alive
-        for m in members {
-            if tester.map(|t| t.alive_for_url(m, url)).unwrap_or(true) {
-                return Some(m.clone());
             }
         }
         members.first().cloned()
@@ -569,11 +752,54 @@ impl GroupSelector {
         url: &str,
         tester: Option<&Arc<UrlTester>>,
     ) -> Option<String> {
+        let candidates = self.non_avoided_members(members, url, tester.map(Arc::as_ref));
         let strat = self.opts.read().lb_strategy;
         match strat {
-            LbStrategy::ConsistentHashing => self.lb_consistent_hashing(meta, members, url, tester),
-            LbStrategy::RoundRobin => self.lb_round_robin(members, url, tester),
-            LbStrategy::StickySessions => self.lb_sticky(meta, members, url, tester),
+            LbStrategy::ConsistentHashing => {
+                self.lb_consistent_hashing(meta, candidates.as_ref(), url, tester)
+            }
+            LbStrategy::RoundRobin => self.lb_round_robin(candidates.as_ref(), url, tester),
+            LbStrategy::StickySessions => self.lb_sticky(meta, candidates.as_ref(), url, tester),
+        }
+    }
+
+    fn is_preferred(&self, node: &str) -> bool {
+        self.plan
+            .prefer
+            .iter()
+            .any(|pattern| !pattern.is_empty() && node.contains(pattern))
+    }
+
+    fn is_avoided(&self, node: &str) -> bool {
+        self.plan
+            .avoid
+            .iter()
+            .any(|pattern| !pattern.is_empty() && node.contains(pattern))
+    }
+
+    fn non_avoided_members<'a>(
+        &self,
+        members: &'a [String],
+        url: &str,
+        tester: Option<&UrlTester>,
+    ) -> Cow<'a, [String]> {
+        if self.plan.avoid.is_empty() {
+            return Cow::Borrowed(members);
+        }
+        let primary: Vec<String> = members
+            .iter()
+            .filter(|member| !self.is_avoided(member))
+            .filter(|member| {
+                tester
+                    .map(|tester| tester.alive_for_url(member, url))
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        if primary.is_empty() {
+            Cow::Borrowed(members)
+        } else {
+            Cow::Owned(primary)
         }
     }
 
@@ -677,13 +903,33 @@ impl GroupSelector {
         members: &[String],
         smart: &Arc<SmartSelector>,
     ) -> Option<String> {
+        let sticky = self.plan.sticky.as_deref().and_then(|sticky| match sticky {
+            "off" => Some(SmartSticky::Off),
+            "site" => Some(SmartSticky::Site),
+            "session" => Some(SmartSticky::Session),
+            _ => None,
+        });
+        let session_key = matches!(sticky, Some(SmartSticky::Session)).then(|| {
+            format!(
+                "{}|{}|{}|{}",
+                meta.src_ip
+                    .map(|address| address.to_string())
+                    .unwrap_or_default(),
+                meta.host,
+                meta.port,
+                meta.network
+            )
+        });
         let ctx = SmartContext {
             group: self.plan.name.clone(),
             host: meta.host.clone(),
             prefer: self.plan.prefer.clone(),
             avoid: self.plan.avoid.clone(),
+            current: self.last_pick(),
+            sticky,
+            session_key,
         };
-        Some(smart.choose(&ctx, members).node)
+        Some(smart.choose_node(&ctx, members))
     }
 
     /* ====================================================================
@@ -761,6 +1007,56 @@ impl GroupSelector {
         tester.invalidate_fast_pick(self.name());
     }
 
+    pub fn mark_member_failed(&self, node: &str, tester: &Arc<UrlTester>, error: &str) {
+        let url = self
+            .opts
+            .read()
+            .url
+            .clone()
+            .unwrap_or_else(|| tester.current_config().default_url);
+        tester.mark_runtime_failure(node, &url, error);
+        tester.invalidate_fast_pick(self.name());
+    }
+
+    /// Clash 手动组测速解除自动 pin 后，立即用刚写入的健康数据恢复自动选择，
+    /// 使 API 的 `now` 与下一条真实流量保持一致。
+    pub fn reselect_after_manual_probe(
+        &self,
+        members: &[String],
+        tested_url: &str,
+        smart: &Arc<SmartSelector>,
+        tester: &Arc<UrlTester>,
+    ) -> Option<String> {
+        if matches!(self.plan.choose, ChooseStrategy::Manual) || self.current_pin().is_some() {
+            return self.last_pick();
+        }
+        let (host, port) = url::Url::parse(tested_url)
+            .ok()
+            .map(|url| {
+                (
+                    url.host_str().unwrap_or_default().to_owned(),
+                    url.port_or_known_default().unwrap_or(443),
+                )
+            })
+            .unwrap_or_default();
+        let meta = FlowMeta::for_host(host, port, "tcp");
+        tester.invalidate_fast_pick(self.name());
+        let selected = match self.plan.choose {
+            ChooseStrategy::Manual => None,
+            ChooseStrategy::Smart => self.pick_smart(&meta, members, smart),
+            ChooseStrategy::Fast => self.pick_url_test(members, tested_url, Some(tester)),
+            ChooseStrategy::Stable => self.pick_fallback(members, tested_url, Some(tester)),
+            ChooseStrategy::Spread => {
+                self.pick_load_balance(&meta, members, tested_url, Some(tester))
+            }
+            ChooseStrategy::Chain => self.pick_chain(members),
+        };
+        if let Some(node) = selected.as_ref() {
+            *self.last_pick.write() = Some(node.clone());
+        }
+        selected
+    }
+
     /* ====================================================================
     Dashboard JSON —— 对齐 Clash `/proxies/:name` 字段
     ==================================================================== */
@@ -769,7 +1065,7 @@ impl GroupSelector {
         let opts = self.opts.read();
         let strategy = match self.plan.choose {
             ChooseStrategy::Manual => "Selector",
-            ChooseStrategy::Smart => "URLTest",
+            ChooseStrategy::Smart => "Smart",
             ChooseStrategy::Fast => "URLTest",
             ChooseStrategy::Stable => "Fallback",
             ChooseStrategy::Spread => "LoadBalance",
@@ -779,8 +1075,11 @@ impl GroupSelector {
             .last_pick
             .read()
             .clone()
-            .or_else(|| self.manual_pick.read().clone())
+            .filter(|node| self.plan.members.iter().any(|member| member == node))
+            .or_else(|| self.current_manual())
+            .filter(|node| self.plan.members.iter().any(|member| member == node))
             .unwrap_or_else(|| self.plan.members.first().cloned().unwrap_or_default());
+        let pin = self.current_pin();
         let mut body = serde_json::json!({
             "type": strategy,
             "name": self.plan.name,
@@ -792,7 +1091,15 @@ impl GroupSelector {
             "extra": {},
             "hidden": opts.hidden,
             "icon": opts.icon,
-            "fixed": self.manual_pick.read().clone().unwrap_or_default(),
+            "fixed": pin.as_ref().map(|pin| pin.node.clone()).unwrap_or_default(),
+            "pin": pin.as_ref().map(|pin| serde_json::json!({
+                "node": pin.node,
+                "generation": pin.generation,
+                "createdAt": pin.created_at_ms,
+                "source": pin.source.as_str(),
+                "persistent": true,
+                "available": self.plan.members.iter().any(|member| member == &pin.node),
+            })),
             "expectedStatus": opts.expected_status,
             "testUrl": opts.url.clone().unwrap_or_default(),
         });
@@ -869,6 +1176,18 @@ mod tests {
             prefer: vec![],
             avoid: vec![],
             check: None,
+            expected_status: String::new(),
+            interval: Duration::from_secs(60),
+            idle_timeout: Duration::from_secs(600),
+            tolerance: 50,
+            unified_delay: None,
+            strategy: "consistent-hashing".into(),
+            filter: String::new(),
+            exclude_filter: String::new(),
+            exclude_type: String::new(),
+            max_failed_times: 5,
+            test_timeout: Duration::from_secs(5),
+            disable_udp: false,
             sticky: None,
             path: vec![],
             hidden: false,
@@ -949,7 +1268,58 @@ mod tests {
     }
 
     #[test]
-    fn fallback_fixed_dead_clears_to_resume_search() {
+    fn stable_honors_prefer_and_uses_avoid_only_as_fallback() {
+        let mut group_plan = plan(ChooseStrategy::Stable, &["regular", "premium", "expired"]);
+        group_plan.prefer = vec!["premium".into()];
+        group_plan.avoid = vec!["expired".into()];
+        let g = GroupSelector::new(group_plan);
+        let s = smart();
+        let tester = UrlTester::new(crate::health::UrlTestConfig::default());
+        let url = tester.current_config().default_url;
+        for node in ["regular", "premium", "expired"] {
+            tester.ensure_stats(node, &url).record(50, true);
+        }
+        assert_eq!(
+            g.pick(&meta("x"), &s, Some(&tester)).as_deref(),
+            Some("premium")
+        );
+        tester.ensure_stats("premium", &url).record(0, false);
+        assert_eq!(
+            g.pick(&meta("x"), &s, Some(&tester)).as_deref(),
+            Some("regular")
+        );
+        tester.ensure_stats("regular", &url).record(0, false);
+        assert_eq!(
+            g.pick(&meta("x"), &s, Some(&tester)).as_deref(),
+            Some("expired")
+        );
+    }
+
+    #[test]
+    fn fast_prefer_wins_only_inside_tolerance() {
+        let mut group_plan = plan(ChooseStrategy::Fast, &["regular", "premium"]);
+        group_plan.prefer = vec!["premium".into()];
+        group_plan.tolerance = 50;
+        let g = GroupSelector::new(group_plan);
+        let s = smart();
+        let tester = UrlTester::new(crate::health::UrlTestConfig::default());
+        let url = tester.current_config().default_url;
+        tester.ensure_stats("regular", &url).record(100, true);
+        tester.ensure_stats("premium", &url).record(130, true);
+        assert_eq!(
+            g.pick(&meta("x"), &s, Some(&tester)).as_deref(),
+            Some("premium")
+        );
+        tester.invalidate_fast_pick("g");
+        tester.ensure_stats("premium", &url).record(200, true);
+        assert_eq!(
+            g.pick(&meta("x"), &s, Some(&tester)).as_deref(),
+            Some("regular")
+        );
+    }
+
+    #[test]
+    fn automatic_group_fails_over_without_losing_durable_pin() {
         let g = GroupSelector::new(plan(ChooseStrategy::Stable, &["a", "b"]));
         let s = smart();
         let tester = UrlTester::new(crate::health::UrlTestConfig::default());
@@ -959,8 +1329,73 @@ mod tests {
         g.set_manual("a");
         let pick = g.pick(&meta("x"), &s, Some(&tester)).unwrap();
         assert_eq!(pick, "b");
-        // fixed 已被清
-        assert!(g.current_manual().is_none());
+        assert_eq!(g.current_manual().as_deref(), Some("a"));
+
+        tester.ensure_stats("a", &url).record(80, true);
+        assert_eq!(g.pick(&meta("x"), &s, Some(&tester)).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn every_strategy_honors_a_live_pin() {
+        let tester = UrlTester::new(crate::health::UrlTestConfig::default());
+        let url = tester.current_config().default_url;
+        tester.ensure_stats("a", &url).record(20, true);
+        tester.ensure_stats("b", &url).record(10, true);
+        let s = smart();
+
+        for strategy in [
+            ChooseStrategy::Manual,
+            ChooseStrategy::Smart,
+            ChooseStrategy::Fast,
+            ChooseStrategy::Stable,
+            ChooseStrategy::Spread,
+            ChooseStrategy::Chain,
+        ] {
+            let g = GroupSelector::new(plan(strategy, &["a", "b"]));
+            g.set_pin("a", PinSource::ClashApi);
+            assert_eq!(
+                g.pick(&meta("x"), &s, Some(&tester)).as_deref(),
+                Some("a"),
+                "{strategy:?} ignored its pin"
+            );
+        }
+    }
+
+    #[test]
+    fn successful_manual_probe_unlocks_only_automatic_groups() {
+        for strategy in [
+            ChooseStrategy::Smart,
+            ChooseStrategy::Fast,
+            ChooseStrategy::Stable,
+            ChooseStrategy::Spread,
+            ChooseStrategy::Chain,
+        ] {
+            let g = GroupSelector::new(plan(strategy, &["a", "b"]));
+            g.set_pin("a", PinSource::ClashApi);
+            let token = g.begin_manual_probe();
+            assert!(g.complete_manual_probe(token, true), "{strategy:?}");
+            assert!(g.current_pin().is_none(), "{strategy:?}");
+        }
+
+        let manual = GroupSelector::new(plan(ChooseStrategy::Manual, &["a", "b"]));
+        manual.set_pin("a", PinSource::ClashApi);
+        let token = manual.begin_manual_probe();
+        assert!(!manual.complete_manual_probe(token, true));
+        assert_eq!(manual.current_manual().as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn failed_or_stale_manual_probe_never_clears_pin() {
+        let g = GroupSelector::new(plan(ChooseStrategy::Fast, &["a", "b"]));
+        g.set_pin("a", PinSource::ClashApi);
+        let failed = g.begin_manual_probe();
+        assert!(!g.complete_manual_probe(failed, false));
+        assert_eq!(g.current_manual().as_deref(), Some("a"));
+
+        let stale = g.begin_manual_probe();
+        let replacement = g.set_pin("b", PinSource::NativeApi);
+        assert!(!g.complete_manual_probe(stale, true));
+        assert_eq!(g.current_pin(), Some(replacement));
     }
 
     #[test]
@@ -999,6 +1434,20 @@ mod tests {
     }
 
     #[test]
+    fn disable_udp_is_enforced_by_the_selection_path() {
+        let g = GroupSelector::new(plan(ChooseStrategy::Manual, &["a"]));
+        g.set_options(GroupOptions {
+            disable_udp: true,
+            ..GroupOptions::default()
+        });
+        let s = smart();
+        let udp = FlowMeta::for_host("example.com", 53, "udp");
+        assert!(g.pick(&udp, &s, None).is_none());
+        let tcp = FlowMeta::for_host("example.com", 443, "tcp");
+        assert_eq!(g.pick(&tcp, &s, None).as_deref(), Some("a"));
+    }
+
+    #[test]
     fn loadbalance_sticky_returns_same_for_same_src_dst() {
         let g = GroupSelector::new(plan(ChooseStrategy::Spread, &["a", "b", "c", "d"]));
         g.set_options(GroupOptions {
@@ -1029,7 +1478,7 @@ mod tests {
             filter: "^HK".into(),
             ..GroupOptions::default()
         });
-        let mems = g.filtered_members(|_| "");
+        let mems = g.filtered_members(|_| String::new());
         assert_eq!(mems, vec!["HK-1".to_string()]);
     }
 
@@ -1040,7 +1489,7 @@ mod tests {
             exclude_filter: "JP".into(),
             ..GroupOptions::default()
         });
-        let mems = g.filtered_members(|_| "");
+        let mems = g.filtered_members(|_| String::new());
         assert_eq!(mems, vec!["HK-1".to_string(), "US-3".to_string()]);
     }
 
@@ -1051,7 +1500,13 @@ mod tests {
             exclude_type: "ss|http".into(),
             ..GroupOptions::default()
         });
-        let mems = g.filtered_members(|n| if n == "a" { "ss" } else { "vmess" });
+        let mems = g.filtered_members(|n| {
+            if n == "a" {
+                "ss".to_string()
+            } else {
+                "vmess".to_string()
+            }
+        });
         assert_eq!(mems, vec!["b".to_string()]);
     }
 
@@ -1062,7 +1517,7 @@ mod tests {
             filter: "^never_match$".into(),
             ..GroupOptions::default()
         });
-        let mems = g.filtered_members(|_| "");
+        let mems = g.filtered_members(|_| String::new());
         assert_eq!(mems, vec!["a".to_string(), "b".to_string()]);
     }
 
@@ -1143,4 +1598,72 @@ mod tests {
         assert_eq!(value["hidden"], true);
         assert_eq!(value["icon"], "data:image/png;base64,iVBORw0KGgo=");
     }
+}
+
+fn group_health_revision(plan: &GroupPlan, opts: &GroupOptions) -> u64 {
+    let mut hasher = AHasher::default();
+    plan.name.hash(&mut hasher);
+    plan.members.hash(&mut hasher);
+    opts.url.hash(&mut hasher);
+    opts.expected_status.hash(&mut hasher);
+    opts.unified_delay.hash(&mut hasher);
+    opts.interval.hash(&mut hasher);
+    opts.idle_timeout.hash(&mut hasher);
+    opts.filter.hash(&mut hasher);
+    opts.exclude_filter.hash(&mut hasher);
+    opts.exclude_type.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
+}
+
+/// API 固定节点的来源。来源只用于观测，不参与选择语义。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinSource {
+    ClashApi,
+    NativeApi,
+    Restored,
+}
+
+impl PinSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ClashApi => "clash_api",
+            Self::NativeApi => "native_api",
+            Self::Restored => "restored",
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "native_api" => Self::NativeApi,
+            "restored" => Self::Restored,
+            _ => Self::ClashApi,
+        }
+    }
+}
+
+/// 一个持久化 pin 的内存状态。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupPin {
+    pub node: String,
+    pub generation: u64,
+    pub created_at_ms: u64,
+    pub source: PinSource,
+}
+
+/// 手动组测速的并发令牌。
+///
+/// 测速完成时必须携带开始时看到的世代。用户在测速期间重新选择节点后，
+/// 旧令牌不能解除新的 pin。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManualProbeToken {
+    generation: Option<u64>,
+    release_after_success: bool,
 }

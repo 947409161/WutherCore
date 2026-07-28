@@ -22,6 +22,11 @@ pub const SMART_NODE_STATS: Table = Table::new("smart_node_stats");
 pub const SMART_DOMAIN_BEST: Table = Table::new("smart_domain_best");
 pub const SMART_NEGATIVE: Table = Table::new("smart_negative");
 pub const SMART_PIN: Table = Table::new("smart_pin");
+/// 策略组的用户固定选择。
+///
+/// 与旧的 `group_manual` 不同，这里保存完整的 pin 世代、来源和策略类型，
+/// 使自动策略的测速解锁可以抵御并发旧请求。旧命名空间只用于启动兼容读取。
+pub const GROUP_PIN: Table = Table::new("group_pin");
 pub const GROUP_MANUAL: Table = Table::new("group_manual");
 pub const FEED_META: Table = Table::new("feed_meta");
 pub const DNS_CACHE: Table = Table::new("dns_cache");
@@ -33,6 +38,7 @@ pub const ALL_TABLES: &[Table] = &[
     SMART_DOMAIN_BEST,
     SMART_NEGATIVE,
     SMART_PIN,
+    GROUP_PIN,
     GROUP_MANUAL,
     FEED_META,
     DNS_CACHE,
@@ -40,5 +46,5 @@ pub const ALL_TABLES: &[Table] = &[
     KV_META,
 ];
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 pub const SCHEMA_KEY: &str = "schema_version";

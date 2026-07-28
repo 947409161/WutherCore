@@ -4,6 +4,37 @@
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-07-29
+
+### Added
+
+- Manual、Smart、Fast、Stable 和 Spread 统一支持持久策略组 pin。Clash 与原生
+  API 暴露节点、世代、创建时间、来源和可用状态。
+- 策略组新增 `expected-status`、`interval`、`idle-timeout`、`tolerance`、
+  `unified-delay`、Spread `strategy`、节点与协议过滤、拨号失败阈值和 UDP 开关。
+- URLTest 历史新增连接、TLS 握手、响应和统一延迟分项，支持 IPv6 URL 和完整
+  HTTP 响应头。
+
+### Changed
+
+- 自动策略的 pin 节点失活时临时故障转移但保留用户意图。成功执行 Clash 组测速
+  后按 pin 世代解锁并立即恢复自动选择；失败测速和过期并发测速不会清除 pin。
+- URLTest 改为活跃组按需调度、闲置停止、惰性有界并发、同节点同 URL 合并、
+  最短共享间隔、失败指数退避和 provider 节点回收。启动不再扫描全部订阅节点。
+- Smart 选择改为线性热路径，综合 P50、P90、抖动、成功率、退化基线、被动吞吐、
+  活跃连接和站点或会话记忆。数据面流量统计使用原子累计和粗粒度时钟门。
+- Fast 在延迟差不超过 tolerance 时应用 `prefer`，Stable 使用优先层级，
+  自动策略只在正常候选不可用时使用 `avoid`。
+- 策略组 pin 的内存变更与 Turso 提交串行化。数据库失败会回滚运行时状态并由
+  API 返回错误。
+
+### Fixed
+
+- `disable-udp` 现在由真实选点入口执行，不再只影响 Clash API 展示。
+- 组级测速、历史和 `testUrl` 使用该组配置的 URL 与统一延迟覆盖。
+- Smart `sticky: session` 现在使用独立会话键，`site` 使用公共后缀列表计算可注册
+  域名。
+
 ## [0.3.3] - 2026-07-28
 
 ### Added
@@ -75,7 +106,8 @@
 - 高危依赖变更会阻止 Pull Request 合并；
 - CodeQL 初次扫描告警由 [Issue #9](https://github.com/MiChongs/WutherCore/issues/9) 跟踪，未批量忽略。
 
-[Unreleased]: https://github.com/MiChongs/WutherCore/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/MiChongs/WutherCore/compare/v0.3.5...HEAD
+[0.3.5]: https://github.com/MiChongs/WutherCore/compare/v0.3.4...v0.3.5
 [0.3.3]: https://github.com/MiChongs/WutherCore/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/MiChongs/WutherCore/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/MiChongs/WutherCore/compare/v0.3.1-rc.5...v0.3.1
