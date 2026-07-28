@@ -64,6 +64,7 @@ struct CacheState {
     bytes: Option<Bytes>,
     value: Option<Arc<Value>>,
     last_built: Instant,
+    revision: Option<u64>,
 }
 
 impl SnapshotCache {
@@ -77,6 +78,7 @@ impl SnapshotCache {
                 bytes: None,
                 value: None,
                 last_built: stale,
+                revision: None,
             }),
             build_lock: Mutex::new(()),
             ttl,
@@ -91,14 +93,33 @@ impl SnapshotCache {
     where
         F: FnOnce() -> Value,
     {
-        if let Some(e) = self.read_fresh() {
+        self.fetch_inner(None, build)
+    }
+
+    /// Version-aware variant used by runtime-derived snapshots.
+    ///
+    /// A revision change forces an immediate rebuild even when the TTL has not
+    /// expired. This keeps provider refreshes coherent across `/proxies`,
+    /// `/group` and `/providers/proxies`.
+    pub fn fetch_at<F>(&self, revision: u64, build: F) -> CacheEntry
+    where
+        F: FnOnce() -> Value,
+    {
+        self.fetch_inner(Some(revision), build)
+    }
+
+    fn fetch_inner<F>(&self, revision: Option<u64>, build: F) -> CacheEntry
+    where
+        F: FnOnce() -> Value,
+    {
+        if let Some(e) = self.read_fresh(revision) {
             self.hits.fetch_add(1, Ordering::Relaxed);
             return e;
         }
         // 等 build mutex —— 其它线程在 build 时这里阻塞。
         let _guard = self.build_lock.lock();
         // 二次检查
-        if let Some(e) = self.read_fresh() {
+        if let Some(e) = self.read_fresh(revision) {
             self.hits.fetch_add(1, Ordering::Relaxed);
             return e;
         }
@@ -113,6 +134,7 @@ impl SnapshotCache {
         s.bytes = Some(bytes.clone());
         s.value = Some(arc_value.clone());
         s.last_built = Instant::now();
+        s.revision = revision;
         CacheEntry {
             bytes,
             value: arc_value,
@@ -135,10 +157,24 @@ impl SnapshotCache {
         self.fetch(build).value
     }
 
-    fn read_fresh(&self) -> Option<CacheEntry> {
+    pub fn fetch_bytes_at<F>(&self, revision: u64, build: F) -> Bytes
+    where
+        F: FnOnce() -> Value,
+    {
+        self.fetch_at(revision, build).bytes
+    }
+
+    pub fn fetch_value_at<F>(&self, revision: u64, build: F) -> Arc<Value>
+    where
+        F: FnOnce() -> Value,
+    {
+        self.fetch_at(revision, build).value
+    }
+
+    fn read_fresh(&self, revision: Option<u64>) -> Option<CacheEntry> {
         let s = self.inner.read();
         if let (Some(b), Some(v)) = (&s.bytes, &s.value) {
-            if s.last_built.elapsed() < self.ttl {
+            if s.last_built.elapsed() < self.ttl && s.revision == revision {
                 return Some(CacheEntry {
                     bytes: b.clone(),
                     value: v.clone(),
@@ -153,6 +189,7 @@ impl SnapshotCache {
         let mut s = self.inner.write();
         s.bytes = None;
         s.value = None;
+        s.revision = None;
         s.last_built = Instant::now()
             .checked_sub(self.ttl)
             .and_then(|t| t.checked_sub(Duration::from_secs(1)))
@@ -244,6 +281,20 @@ mod tests {
             Value::String("v2".into())
         });
         assert_eq!(n.load(O::Relaxed), 2);
+    }
+
+    #[test]
+    fn revision_change_forces_rebuild_before_ttl_expiry() {
+        let cache = SnapshotCache::new(Duration::from_secs(60));
+        let first = cache.fetch_at(7, || serde_json::json!({"revision": 7}));
+        let cached = cache.fetch_at(7, || serde_json::json!({"revision": "stale"}));
+        let second = cache.fetch_at(8, || serde_json::json!({"revision": 8}));
+
+        assert_eq!(first.value["revision"], 7);
+        assert_eq!(cached.value["revision"], 7);
+        assert_eq!(second.value["revision"], 8);
+        assert_eq!(cache.builds(), 2);
+        assert_eq!(cache.hits(), 1);
     }
 
     #[test]

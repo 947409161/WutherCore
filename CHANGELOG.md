@@ -4,6 +4,15 @@
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-07-28
+
+### Fixed
+
+- provider 节点在激活后进入统一运行时快照，Clash `/proxies`，`/providers/proxies`，策略组成员和原生 `/nodes` 现在使用同一份有效节点数据。
+- provider 刷新会递增节点版本并立即重建 API 缓存，不再等待缓存 TTL，也不会继续显示已被订阅移除的旧节点。
+- provider 节点补全 Direct，Reject，Dns，Naive，Sudoku，TrustTunnel 和 Young 的 Clash 类型映射。
+- provider 激活失败时保留上一份运行时快照和状态，名称重复，静态节点冲突，策略组冲突及保留名称冲突会整批拒绝。
+
 ## [0.3.1] - 2026-07-28
 
 ### Security
@@ -42,5 +51,6 @@
 - 高危依赖变更会阻止 Pull Request 合并；
 - CodeQL 初次扫描告警由 [Issue #9](https://github.com/MiChongs/WutherCore/issues/9) 跟踪，未批量忽略。
 
-[Unreleased]: https://github.com/MiChongs/WutherCore/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/MiChongs/WutherCore/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/MiChongs/WutherCore/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/MiChongs/WutherCore/compare/v0.3.1-rc.5...v0.3.1

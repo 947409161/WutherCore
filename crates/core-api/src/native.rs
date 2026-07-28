@@ -97,10 +97,10 @@ async fn traffic(State(s): State<NativeState>) -> impl IntoResponse {
 async fn nodes(State(s): State<NativeState>) -> impl IntoResponse {
     let nodes: Vec<_> = s
         .runtime
-        .plan
-        .nodes
-        .iter()
-        .map(|n| {
+        .node_snapshots()
+        .into_iter()
+        .map(|snapshot| {
+            let n = snapshot.node;
             json!({
                 "name": n.name,
                 "protocol": n.protocol.as_str(),
@@ -108,6 +108,7 @@ async fn nodes(State(s): State<NativeState>) -> impl IntoResponse {
                 "port": n.port,
                 "tls": n.tls,
                 "transport": n.transport,
+                "provider": snapshot.provider,
             })
         })
         .collect();

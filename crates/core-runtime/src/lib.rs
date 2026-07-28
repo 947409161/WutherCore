@@ -13,7 +13,9 @@ pub mod int_ranges;
 pub mod listener_handler;
 
 pub use dns_listener::{DnsListener, DnsListenerError, parse_dns_listen_addr, spawn_dns_listener};
-pub use engine::{DialResult, RoutePick, Runtime, RuntimeError, UdpDialResult};
+pub use engine::{
+    DialResult, RoutePick, Runtime, RuntimeError, RuntimeNodeSnapshot, UdpDialResult,
+};
 pub use group_selector::{FlowMeta, GroupOptions, GroupSelector, LbStrategy};
 pub use health::{
     DEAD_DELAY, DelayError, FAST_PICK_TTL, HistoryEntry, NodeUrlStats, UrlTestConfig, UrlTestOpts,

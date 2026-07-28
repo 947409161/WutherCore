@@ -516,16 +516,24 @@ fn proxy_map_bytes(s: &NativeState) -> Bytes {
     // 闭包必须捕获 s by clone (NativeState: Clone 中只持 Arc 字段)，
     // FnOnce 调用所有权 OK。
     let s_for_build = s.clone();
-    s.caches
-        .proxy_map
-        .fetch_bytes(move || json!({"proxies": collect_proxy_map(&s_for_build)}))
+    s.runtime.inspect_node_state(|| {
+        let revision = s.runtime.node_revision();
+        s.caches.proxy_map.fetch_bytes_at(
+            revision,
+            move || json!({"proxies": collect_proxy_map(&s_for_build)}),
+        )
+    })
 }
 
 fn proxy_map_value(s: &NativeState) -> Arc<Value> {
     let s_for_build = s.clone();
-    s.caches
-        .proxy_map
-        .fetch_value(move || json!({"proxies": collect_proxy_map(&s_for_build)}))
+    s.runtime.inspect_node_state(|| {
+        let revision = s.runtime.node_revision();
+        s.caches.proxy_map.fetch_value_at(
+            revision,
+            move || json!({"proxies": collect_proxy_map(&s_for_build)}),
+        )
+    })
 }
 
 #[derive(Deserialize)]
@@ -893,7 +901,8 @@ fn collect_proxy_map(s: &NativeState) -> Map<String, Value> {
         proxies.insert(name.clone(), group_json(g, urltest, &default_url, runtime));
         let _ = (name, g); // silence unused if future refactor
     }
-    for n in &runtime.plan.nodes {
+    for snapshot in runtime.node_snapshots() {
+        let n = &snapshot.node;
         let history = history_for(&n.name);
         let delay = delay_from_history(&history);
         let alive = urltest.alive_for_url(&n.name, &default_url);
@@ -908,7 +917,7 @@ fn collect_proxy_map(s: &NativeState) -> Map<String, Value> {
                 extra_for(urltest, &n.name),
                 alive,
                 delay,
-                &runtime.node_provider(&n.name).unwrap_or_default(),
+                snapshot.provider.as_deref().unwrap_or_default(),
             ),
         );
     }
@@ -1146,11 +1155,15 @@ fn delay_from_history(history: &Value) -> u64 {
 
 fn map_proto(p: &str) -> &'static str {
     match p {
+        "direct" => "Direct",
+        "block" => "Reject",
+        "dns" => "Dns",
         "ss" => "Shadowsocks",
         "ssr" => "ShadowsocksR",
         "vmess" => "Vmess",
         "vless" => "Vless",
         "trojan" => "Trojan",
+        "naive" => "Naive",
         "hysteria" => "Hysteria",
         "hysteria2" => "Hysteria2",
         "tuic" => "Tuic",
@@ -1161,6 +1174,9 @@ fn map_proto(p: &str) -> &'static str {
         "anytls" => "AnyTLS",
         "snell" => "Snell",
         "mieru" => "Mieru",
+        "sudoku" => "Sudoku",
+        "trusttunnel" => "TrustTunnel",
+        "young" => "Young",
         _ => "Unknown",
     }
 }
@@ -1169,12 +1185,17 @@ fn map_proto(p: &str) -> &'static str {
 
 async fn providers_proxies(State(s): State<NativeState>) -> axum::response::Response {
     let s_for_build = s.clone();
-    let bytes = s.caches.providers_proxies.fetch_bytes(move || {
-        let mut providers = Map::new();
-        for (name, _f) in &s_for_build.runtime.plan.feeds {
-            providers.insert(name.clone(), provider_json(&s_for_build, name));
-        }
-        json!({"providers": providers})
+    let bytes = s.runtime.inspect_node_state(|| {
+        let revision = s.runtime.node_revision();
+        s.caches
+            .providers_proxies
+            .fetch_bytes_at(revision, move || {
+                let mut providers = Map::new();
+                for (name, _f) in &s_for_build.runtime.plan.feeds {
+                    providers.insert(name.clone(), provider_json(&s_for_build, name));
+                }
+                json!({"providers": providers})
+            })
     });
     json_bytes(bytes)
 }
@@ -1190,7 +1211,8 @@ async fn provider_proxy_one(
         )
             .into_response();
     }
-    Json(provider_json(&s, &name)).into_response()
+    let provider = s.runtime.inspect_node_state(|| provider_json(&s, &name));
+    Json(provider).into_response()
 }
 
 async fn provider_proxy_refresh(
@@ -1275,97 +1297,51 @@ async fn provider_proxy_node_healthcheck(
 }
 
 fn nodes_in_provider(s: &NativeState, name: &str) -> Vec<String> {
-    if let Some(mgr) = s.feeds.as_ref() {
-        if let Some(snap) = mgr.snapshot(name) {
-            return snap.into_iter().map(|n| n.name).collect();
-        }
-    }
     s.runtime
-        .plan
-        .nodes
-        .iter()
-        .filter(|n| {
-            n.name.starts_with(&format!("{}/", name)) || n.name.contains(&format!("[{}]", name))
-        })
-        .map(|n| n.name.clone())
+        .nodes_in_provider(name)
+        .into_iter()
+        .map(|snapshot| snapshot.node.name)
         .collect()
 }
 
 fn provider_json(s: &NativeState, name: &str) -> Value {
-    // 优先用 FeedManager.snapshot —— 可能比 plan.nodes 更新（订阅刷新过）。
+    // Runtime 的激活节点快照是唯一可信来源。FeedManager 可能已经解析出
+    // 新 payload，但 Runtime 会在组件缺失、名称冲突或节点构建失败时拒绝它；
+    // 控制面不能展示实际上无法被策略组选择和拨号的节点。
     let urltest = &s.urltest;
     let default_url = urltest.current_config().default_url;
-    let mut nodes: Vec<Value> = Vec::new();
-    if let Some(mgr) = s.feeds.as_ref() {
-        if let Some(snap) = mgr.snapshot(name) {
-            nodes = snap
-                .iter()
-                .map(|n| {
-                    let history = Value::Array(
-                        urltest
-                            .history(&n.name, &default_url)
-                            .into_iter()
-                            .map(|e| {
-                                json!({
-                                    "time": iso8601(e.time_ms / 1000),
-                                    "delay": e.delay_ms,
-                                })
-                            })
-                            .collect(),
-                    );
-                    let delay = delay_from_history(&history);
-                    node_proxy_json(
-                        s,
-                        &n.name,
-                        n.protocol.as_str(),
-                        Some(n),
-                        history,
-                        json!({}),
-                        urltest.alive_for_url(&n.name, &default_url),
-                        delay,
-                        name,
-                    )
-                })
-                .collect();
-        }
-    }
-    if nodes.is_empty() {
-        nodes = s
-            .runtime
-            .plan
-            .nodes
-            .iter()
-            .filter(|n| {
-                n.name.starts_with(&format!("{}/", name)) || n.name.contains(&format!("[{}]", name))
-            })
-            .map(|n| {
-                let history = Value::Array(
-                    urltest
-                        .history(&n.name, &default_url)
-                        .into_iter()
-                        .map(|e| {
-                            json!({
-                                "time": iso8601(e.time_ms / 1000),
-                                "delay": e.delay_ms,
-                            })
+    let nodes: Vec<Value> = s
+        .runtime
+        .nodes_in_provider(name)
+        .into_iter()
+        .map(|snapshot| {
+            let n = snapshot.node;
+            let history = Value::Array(
+                urltest
+                    .history(&n.name, &default_url)
+                    .into_iter()
+                    .map(|e| {
+                        json!({
+                            "time": iso8601(e.time_ms / 1000),
+                            "delay": e.delay_ms,
                         })
-                        .collect(),
-                );
-                let delay = delay_from_history(&history);
-                node_proxy_json(
-                    s,
-                    &n.name,
-                    n.protocol.as_str(),
-                    Some(n),
-                    history,
-                    json!({}),
-                    urltest.alive_for_url(&n.name, &default_url),
-                    delay,
-                    name,
-                )
-            })
-            .collect();
-    }
+                    })
+                    .collect(),
+            );
+            let delay = delay_from_history(&history);
+            node_proxy_json(
+                s,
+                &n.name,
+                n.protocol.as_str(),
+                Some(&n),
+                history,
+                json!({}),
+                urltest.alive_for_url(&n.name, &default_url),
+                delay,
+                name,
+            )
+        })
+        .collect();
     let status = s.feeds.as_ref().and_then(|m| m.status(name));
     let (last_ms, url, userinfo) = status
         .as_ref()
@@ -2155,5 +2131,37 @@ mod time_tests {
     fn delay_from_empty_history_is_zero() {
         let h = json!([]);
         assert_eq!(super::delay_from_history(&h), 0);
+    }
+
+    #[test]
+    fn maps_every_supported_runtime_protocol_to_a_clash_type() {
+        let mappings = [
+            ("direct", "Direct"),
+            ("block", "Reject"),
+            ("dns", "Dns"),
+            ("ss", "Shadowsocks"),
+            ("ssr", "ShadowsocksR"),
+            ("vmess", "Vmess"),
+            ("vless", "Vless"),
+            ("trojan", "Trojan"),
+            ("naive", "Naive"),
+            ("hysteria", "Hysteria"),
+            ("hysteria2", "Hysteria2"),
+            ("tuic", "Tuic"),
+            ("wireguard", "WireGuard"),
+            ("ssh", "Ssh"),
+            ("http", "Http"),
+            ("socks5", "Socks5"),
+            ("anytls", "AnyTLS"),
+            ("snell", "Snell"),
+            ("mieru", "Mieru"),
+            ("sudoku", "Sudoku"),
+            ("trusttunnel", "TrustTunnel"),
+            ("young", "Young"),
+        ];
+
+        for (protocol, clash_type) in mappings {
+            assert_eq!(map_proto(protocol), clash_type, "protocol={protocol}");
+        }
     }
 }

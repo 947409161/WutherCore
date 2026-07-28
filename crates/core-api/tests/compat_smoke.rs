@@ -18,7 +18,7 @@ use core_config::loader::load_from_str;
 use core_observe::ConnectionMeta;
 use core_runtime::{Runtime, UrlTester};
 use http_body_util::BodyExt;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tower::ServiceExt;
 
 const CFG: &str = r#"
@@ -317,6 +317,167 @@ async fn proxies_includes_global_and_direct() {
 }
 
 #[tokio::test]
+async fn provider_nodes_are_immediately_visible_in_proxy_group_and_native_apis() {
+    let cfg = r#"
+version: 1
+profile: desktop
+listen:
+  local: 7890
+feeds:
+  provider-a: "https://example.invalid/sub.yaml"
+groups:
+  main:
+    choose: manual
+    use: [provider-a]
+route:
+  preset: global
+  final: main
+"#;
+    let plan = load_from_str(cfg).unwrap();
+    let feeds = core_feeds::FeedManager::new(plan.feeds.clone(), None);
+    let runtime = Arc::new(Runtime::build(plan).unwrap());
+    let state = NativeState::for_tests(
+        runtime.clone(),
+        UrlTester::new(Default::default()),
+        Some(feeds),
+    );
+    let app = core_api::compat::router(state.clone());
+
+    // Warm both caches before the provider update. The runtime revision must
+    // invalidate them immediately, without waiting for the 250 ms TTL.
+    for uri in ["/proxies", "/providers/proxies"] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    runtime
+        .apply_feed_nodes(
+            "provider-a",
+            vec![core_config::node_uri::ParsedNode::new(
+                "ProviderNodeA",
+                core_config::node_uri::NodeProtocol::Direct,
+                "203.0.113.10",
+                10001,
+            )],
+        )
+        .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/proxies")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = body_json(response).await;
+    assert_eq!(body["proxies"]["ProviderNodeA"]["type"], "Direct");
+    assert_eq!(
+        body["proxies"]["ProviderNodeA"]["provider-name"],
+        "provider-a"
+    );
+    assert_eq!(body["proxies"]["main"]["all"], json!(["ProviderNodeA"]));
+    assert_eq!(body["proxies"]["main"]["now"], "ProviderNodeA");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/providers/proxies")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = body_json(response).await;
+    assert_eq!(
+        body["providers"]["provider-a"]["proxies"][0]["name"],
+        "ProviderNodeA"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/providers/proxies/provider-a")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = body_json(response).await;
+    assert_eq!(body["proxies"].as_array().unwrap().len(), 1);
+    assert_eq!(body["proxies"][0]["name"], "ProviderNodeA");
+    assert_eq!(body["proxies"][0]["provider-name"], "provider-a");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/proxies/main")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"ProviderNodeA"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    runtime
+        .apply_feed_nodes(
+            "provider-a",
+            vec![core_config::node_uri::ParsedNode::new(
+                "ProviderNodeB",
+                core_config::node_uri::NodeProtocol::Direct,
+                "203.0.113.20",
+                10002,
+            )],
+        )
+        .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/proxies")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = body_json(response).await;
+    assert!(body["proxies"].get("ProviderNodeA").is_none());
+    assert_eq!(body["proxies"]["ProviderNodeB"]["type"], "Direct");
+    assert_eq!(body["proxies"]["main"]["all"], json!(["ProviderNodeB"]));
+    assert_eq!(body["proxies"]["main"]["now"], "ProviderNodeB");
+
+    let native = core_api::native::router(state);
+    let response = native
+        .oneshot(
+            Request::builder()
+                .uri("/nodes")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = body_json(response).await;
+    assert_eq!(body["nodes"].as_array().unwrap().len(), 1);
+    assert_eq!(body["nodes"][0]["name"], "ProviderNodeB");
+    assert_eq!(body["nodes"][0]["provider"], "provider-a");
+
+    let pick = runtime.pick_outbound("example.com", 443, core_route::NetworkKind::Tcp);
+    assert_eq!(pick.label, "ProviderNodeB");
+}
+
+#[tokio::test]
 async fn configs_get_and_patch_round_trip() {
     let app = core_api::compat::router(build_state());
     // GET 默认值
@@ -381,10 +542,8 @@ listen:
   local: 7890
 nodes:
   - name: NodeNoUdp
-    protocol: vless
+    protocol: direct
     address: 1.2.3.4:443
-    login:
-      uuid: 11111111-1111-1111-1111-111111111111
     network:
       udp: false
       tfo: true
@@ -797,8 +956,8 @@ profile: desktop
 listen:
   local: 7890
 nodes:
-  - "ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@1.2.3.4:8388#NodeA"
-  - "ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@5.6.7.8:8388#NodeB"
+  - {name: NodeA, protocol: direct, address: "127.0.0.1:1"}
+  - {name: NodeB, protocol: direct, address: "127.0.0.1:2"}
 groups:
   picker:
     choose: manual
@@ -837,8 +996,8 @@ profile: desktop
 listen:
   local: 7890
 nodes:
-  - "ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@1.2.3.4:8388#NodeA"
-  - "ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@5.6.7.8:8388#NodeB"
+  - {name: NodeA, protocol: direct, address: "127.0.0.1:1"}
+  - {name: NodeB, protocol: direct, address: "127.0.0.1:2"}
 groups:
   picker:
     choose: manual

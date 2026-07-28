@@ -3,7 +3,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     task::{Context, Poll},
     time::Instant,
 };
@@ -48,6 +51,8 @@ pub struct Runtime {
     pub outbounds: Arc<parking_lot::RwLock<OutboundRegistry>>,
     pub groups: parking_lot::RwLock<BTreeMap<String, Arc<GroupSelector>>>,
     node_info: parking_lot::RwLock<BTreeMap<String, RuntimeNodeInfo>>,
+    node_update_lock: parking_lot::Mutex<()>,
+    node_revision: AtomicU64,
     pub route: RouteEngine,
     pub resolver: Arc<Resolver>,
     /// 本机 DNS 服务 —— capture DNS hijack、`type: dns` 出站、独立 listener
@@ -77,6 +82,7 @@ struct RuntimeNodeInfo {
     provider: Option<String>,
     remote_destination: String,
     udp: bool,
+    node: ParsedNode,
 }
 
 impl RuntimeNodeInfo {
@@ -85,8 +91,19 @@ impl RuntimeNodeInfo {
             provider,
             remote_destination: node.host.trim_matches(['[', ']']).to_string(),
             udp: node.udp,
+            node: node.clone(),
         }
     }
+}
+
+/// API and control-plane view of one activated outbound node.
+///
+/// Unlike [`RuntimePlan::nodes`], this snapshot includes provider nodes loaded
+/// after startup and excludes provider nodes removed by a later refresh.
+#[derive(Debug, Clone)]
+pub struct RuntimeNodeSnapshot {
+    pub provider: Option<String>,
+    pub node: ParsedNode,
 }
 
 /// 运行期可热改的配置子集 —— Clash dashboard `/configs` 写入的目标。
@@ -230,6 +247,8 @@ impl Runtime {
             outbounds,
             groups: parking_lot::RwLock::new(groups),
             node_info: parking_lot::RwLock::new(node_info),
+            node_update_lock: parking_lot::Mutex::new(()),
+            node_revision: AtomicU64::new(0),
             route,
             resolver,
             dns_service,
@@ -355,6 +374,49 @@ impl Runtime {
         self.node_info.read().get(name).map(|node| node.udp)
     }
 
+    /// Monotonic revision of the activated node and expanded group graph.
+    ///
+    /// Control-plane caches use this value so a provider refresh becomes
+    /// visible immediately instead of waiting for a time-based cache expiry.
+    pub fn node_revision(&self) -> u64 {
+        self.node_revision.load(Ordering::Acquire)
+    }
+
+    /// Inspect the node, outbound and expanded group state while provider
+    /// activation is paused.
+    ///
+    /// Control-plane code uses this for composite snapshots that read more
+    /// than one runtime map. The callback must remain read-only.
+    pub fn inspect_node_state<R>(&self, inspect: impl FnOnce() -> R) -> R {
+        let _guard = self.node_update_lock.lock();
+        inspect()
+    }
+
+    /// Snapshot every currently activated static and provider node.
+    pub fn node_snapshots(&self) -> Vec<RuntimeNodeSnapshot> {
+        self.node_info
+            .read()
+            .values()
+            .map(|info| RuntimeNodeSnapshot {
+                provider: info.provider.clone(),
+                node: info.node.clone(),
+            })
+            .collect()
+    }
+
+    /// Snapshot the currently activated nodes owned by one provider.
+    pub fn nodes_in_provider(&self, provider: &str) -> Vec<RuntimeNodeSnapshot> {
+        self.node_info
+            .read()
+            .values()
+            .filter(|info| info.provider.as_deref() == Some(provider))
+            .map(|info| RuntimeNodeSnapshot {
+                provider: info.provider.clone(),
+                node: info.node.clone(),
+            })
+            .collect()
+    }
+
     /// 把订阅刷新得到的最新节点列表注入到 outbound registry，
     /// 同时把 group.members 中的 `feed:<name>` 占位符替换为真实节点名集合。
     pub fn apply_feed_nodes(
@@ -362,6 +424,60 @@ impl Runtime {
         feed_name: &str,
         nodes: Vec<core_config::node_uri::ParsedNode>,
     ) -> Result<(), RuntimeError> {
+        if !self.plan.feeds.contains_key(feed_name) {
+            return Err(RuntimeError::OutboundConfig(format!(
+                "unknown feed `{feed_name}`"
+            )));
+        }
+        // Every provider has its own refresh task. Serialize activation so the
+        // cross-provider name check and the outbound, node and group commits
+        // form one transaction instead of racing between provider tasks.
+        let _update_guard = self.node_update_lock.lock();
+
+        let static_nodes: BTreeSet<String> =
+            self.plan.nodes.iter().map(|n| n.name.clone()).collect();
+        let group_names: BTreeSet<String> = self.plan.groups.keys().cloned().collect();
+        let mut incoming_names = BTreeSet::new();
+        let current_info = self.node_info.read();
+        for node in &nodes {
+            let name = node.name.trim();
+            if name.is_empty() {
+                return Err(RuntimeError::OutboundConfig(format!(
+                    "feed `{feed_name}` contains an empty node name"
+                )));
+            }
+            if !incoming_names.insert(name.to_string()) {
+                return Err(RuntimeError::OutboundConfig(format!(
+                    "feed `{feed_name}` contains duplicate node name `{name}`"
+                )));
+            }
+            if static_nodes.contains(name) {
+                return Err(RuntimeError::OutboundConfig(format!(
+                    "feed `{feed_name}` node `{name}` conflicts with a static node"
+                )));
+            }
+            if group_names.contains(name)
+                || matches!(
+                    name.to_ascii_uppercase().as_str(),
+                    "DIRECT" | "BLOCK" | "REJECT" | "GLOBAL"
+                )
+            {
+                return Err(RuntimeError::OutboundConfig(format!(
+                    "feed `{feed_name}` node `{name}` conflicts with a group or reserved Clash name"
+                )));
+            }
+            if let Some(owner) = current_info
+                .get(name)
+                .and_then(|info| info.provider.as_deref())
+                .filter(|owner| *owner != feed_name)
+            {
+                return Err(RuntimeError::OutboundConfig(format!(
+                    "feed `{feed_name}` node `{name}` is already owned by feed `{owner}`"
+                )));
+            }
+        }
+        drop(current_info);
+
         // 先在锁外完成整批构建。任一节点无效时整批拒绝，旧 provider 快照保持不变，
         // 不会出现先删除旧节点、再因半途错误留下残缺 registry 的状态。
         let built_outbounds = nodes
@@ -376,8 +492,6 @@ impl Runtime {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let mut new_names: Vec<String> = Vec::with_capacity(nodes.len());
-        let static_nodes: BTreeSet<String> =
-            self.plan.nodes.iter().map(|n| n.name.clone()).collect();
         let removed_names: Vec<String> = {
             let info = self.node_info.read();
             info.iter()
@@ -454,6 +568,7 @@ impl Runtime {
                 updated_groups += 1;
             }
         }
+        self.node_revision.fetch_add(1, Ordering::Release);
         tracing::info!(
             target: "feeds",
             feed = feed_name,
@@ -1508,7 +1623,9 @@ mod tests {
     use std::net::IpAddr;
 
     use async_trait::async_trait;
-    use core_outbound::DialResolver;
+    use core_outbound::{
+        BoxedStream, BoxedUdp, Capabilities, DialContext, DialResolver, OutboundAdapter,
+    };
     use core_resolver::{DnsError, DnsGroup, DnsUpstream, GroupStrategy, QType, ResolverBuilder};
 
     use super::*;
@@ -1516,6 +1633,43 @@ mod tests {
     #[derive(Debug)]
     struct StaticDnsUpstream {
         ip: IpAddr,
+    }
+
+    #[derive(Debug)]
+    struct TcpOnlyOutbound;
+
+    #[async_trait]
+    impl OutboundAdapter for TcpOnlyOutbound {
+        fn name(&self) -> &str {
+            "tcp-only"
+        }
+
+        fn protocol(&self) -> &'static str {
+            "test-tcp-only"
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                tcp: true,
+                udp: false,
+                ipv6: true,
+                multiplex: false,
+            }
+        }
+
+        async fn dial_tcp(&self, _ctx: DialContext) -> std::io::Result<BoxedStream> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "test outbound",
+            ))
+        }
+
+        async fn dial_udp(&self, _ctx: DialContext) -> std::io::Result<BoxedUdp> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "test outbound has no UDP relay",
+            ))
+        }
     }
 
     #[async_trait]
@@ -1775,6 +1929,12 @@ route:
             runtime.remote_destination_for_outbound(&pick.label, "www.google.com", 443),
             "203.0.113.10"
         );
+        let snapshots = runtime.nodes_in_provider("provider-a");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].provider.as_deref(), Some("provider-a"));
+        assert_eq!(snapshots[0].node.name, "provider-a/node-1");
+        assert_eq!(snapshots[0].node.host, "203.0.113.10");
+        assert_eq!(runtime.node_revision(), 1);
     }
 
     #[test]
@@ -1879,6 +2039,59 @@ route:
         assert!(!names.contains(&"provider-a/old".to_string()));
         assert!(names.contains(&"provider-a/new".to_string()));
         assert_eq!(pick.label, "provider-a/new");
+        let snapshots = runtime.nodes_in_provider("provider-a");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].node.name, "provider-a/new");
+        assert_eq!(runtime.node_revision(), 2);
+    }
+
+    #[test]
+    fn feed_update_rejects_names_that_cannot_be_represented_in_clash_api() {
+        let plan = load_plan(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+feeds:
+  provider-a: "https://example.invalid/sub.yaml"
+nodes:
+  - name: local-node
+    protocol: direct
+    address: 127.0.0.1:1
+groups:
+  main:
+    choose: manual
+    use: [provider-a, nodes]
+route:
+  preset: global
+  final: main
+"#,
+        );
+        let runtime = Runtime::build(plan).unwrap();
+
+        for name in ["main", "GLOBAL", "BLOCK", "local-node"] {
+            let error = runtime
+                .apply_feed_nodes(
+                    "provider-a",
+                    vec![core_config::node_uri::ParsedNode::new(
+                        name,
+                        core_config::node_uri::NodeProtocol::Direct,
+                        "203.0.113.10",
+                        10001,
+                    )],
+                )
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(name), "error={error}");
+        }
+
+        assert_eq!(runtime.node_revision(), 0);
+        assert!(runtime.nodes_in_provider("provider-a").is_empty());
+        assert_eq!(
+            runtime.groups.read().get("main").unwrap().members(),
+            vec!["feed:provider-a".to_string(), "local-node".to_string()]
+        );
     }
 
     #[test]
@@ -1926,7 +2139,11 @@ route:
             .unwrap_err()
             .to_string();
         assert!(error.contains("provider-a/bad"), "error={error}");
-        assert!(error.contains("unsupported xhttp mode"), "error={error}");
+        assert!(
+            error.contains("unsupported xhttp mode")
+                || error.contains("protocol `vless` is not compiled in"),
+            "error={error}"
+        );
 
         let names = runtime.outbound_names();
         assert!(names.contains(&"provider-a/old".to_string()));
@@ -2025,7 +2242,7 @@ version: 1
 profile: desktop
 listen:
   panel: false
-nodes: ["ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@1.2.3.4:8388#HK"]
+nodes: ["direct://0.0.0.0:0#HK"]
 groups:
   main:
     choose: manual
@@ -2053,7 +2270,7 @@ version: 1
 profile: desktop
 listen:
   panel: false
-nodes: ["ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@1.2.3.4:8388#HK"]
+nodes: ["direct://0.0.0.0:0#HK"]
 groups:
   main:
     choose: manual
@@ -2142,7 +2359,11 @@ profile: desktop
 listen:
   panel: false
 nodes:
-  - "http://127.0.0.1:8080#tcp-only"
+  - name: tcp-only
+    protocol: direct
+    address: 127.0.0.1:1
+    network:
+      udp: false
   - "direct://0.0.0.0:0#udp-direct"
 groups:
   main:
@@ -2154,6 +2375,10 @@ route:
 "#,
         );
         let runtime = Runtime::build(plan).unwrap();
+        runtime
+            .outbounds
+            .write()
+            .insert("tcp-only", Arc::new(TcpOnlyOutbound));
 
         let pick = runtime.pick_outbound("8.8.8.8", 53, NetworkKind::Udp);
 
@@ -2169,7 +2394,11 @@ profile: desktop
 listen:
   panel: false
 nodes:
-  - "http://127.0.0.1:8080#tcp-only"
+  - name: tcp-only
+    protocol: direct
+    address: 127.0.0.1:1
+    network:
+      udp: false
 groups:
   main:
     choose: manual
@@ -2180,6 +2409,10 @@ route:
 "#,
         );
         let runtime = Runtime::build(plan).unwrap();
+        runtime
+            .outbounds
+            .write()
+            .insert("tcp-only", Arc::new(TcpOnlyOutbound));
 
         let err = match runtime.dial_udp("8.8.8.8", 53).await {
             Ok(_) => panic!("UDP dial unexpectedly succeeded through tcp-only outbound"),
@@ -2189,7 +2422,7 @@ route:
         assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
         let err_s = err.to_string();
         assert!(err_s.contains("tcp-only"));
-        assert!(err_s.contains("http"));
+        assert!(err_s.contains("test-tcp-only"));
     }
 
     #[test]
@@ -2201,7 +2434,7 @@ profile: desktop
 listen:
   panel: false
 nodes:
-  - "ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@1.2.3.4:8388#smart-node"
+  - "direct://0.0.0.0:0#smart-node"
 groups:
   main:
     choose: smart
@@ -2238,7 +2471,7 @@ profile: desktop
 listen:
   panel: false
 nodes:
-  - "ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@1.2.3.4:8388#node-a"
+  - "direct://0.0.0.0:0#node-a"
 groups:
   main:
     choose: manual

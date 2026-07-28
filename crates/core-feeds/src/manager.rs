@@ -47,7 +47,11 @@ pub struct FeedUpdate {
 /// 节点接收方 —— 由 Runtime 实现，把新节点列表注册到 outbound + groups。
 #[async_trait]
 pub trait FeedSink: Send + Sync {
-    async fn on_update(&self, update: FeedUpdate);
+    /// Activate a parsed provider snapshot.
+    ///
+    /// The manager publishes its snapshot and status only after activation
+    /// succeeds, so API state cannot get ahead of the outbound and group graph.
+    async fn on_update(&self, update: &FeedUpdate) -> Result<(), String>;
 }
 
 /// 单个 feed 的运行时状态 —— 供 `/providers/proxies/:name` 等 API 查询。
@@ -247,17 +251,39 @@ impl FeedManager {
         loop {
             match self.refresh_once(&name, &detail, timeout).await {
                 Ok(update) => {
-                    info!(
-                        target: "feeds",
-                        name = %name,
-                        nodes = update.nodes.len(),
-                        bytes = update.raw_bytes,
-                        from_cache = update.from_cache,
-                        "feed refreshed"
-                    );
+                    let node_count = update.nodes.len();
+                    let raw_bytes = update.raw_bytes;
+                    let from_cache = update.from_cache;
                     let now_ms = now_ms();
-                    self.publish_update(&name, update, Some(now_ms), every)
-                        .await;
+                    match self
+                        .publish_update(&name, update, Some(now_ms), every)
+                        .await
+                    {
+                        Ok(()) => info!(
+                            target: "feeds",
+                            name = %name,
+                            nodes = node_count,
+                            bytes = raw_bytes,
+                            from_cache,
+                            "feed refreshed and activated"
+                        ),
+                        Err(error) => {
+                            warn!(
+                                target: "feeds",
+                                name = %name,
+                                nodes = node_count,
+                                %error,
+                                "feed activation rejected; keeping last active snapshot"
+                            );
+                            let last = self
+                                .statuses
+                                .read()
+                                .get(&name)
+                                .map(|status| status.last_refreshed_ms)
+                                .unwrap_or(0);
+                            self.update_next_due(&name, last, every);
+                        }
+                    }
                 }
                 Err(e) => {
                     warn!(target: "feeds", name = %name, error = %e, "feed refresh failed");
@@ -284,7 +310,11 @@ impl FeedManager {
         update: FeedUpdate,
         last_refreshed_ms_override: Option<u64>,
         every: Duration,
-    ) {
+    ) -> Result<(), String> {
+        let sink = { self.sink.read().clone() };
+        if let Some(sink) = sink {
+            sink.on_update(&update).await?;
+        }
         self.snapshots
             .write()
             .insert(name.to_string(), update.nodes.clone());
@@ -302,10 +332,7 @@ impl FeedManager {
                 s.userinfo = update.userinfo;
             }
         }
-        let sink = { self.sink.read().clone() };
-        if let Some(sink) = sink {
-            sink.on_update(update).await;
-        }
+        Ok(())
     }
 
     async fn publish_cache_snapshot_if_valid(
@@ -347,19 +374,30 @@ impl FeedManager {
             .and_then(|m| m.elapsed())
             .map(|elapsed| elapsed >= every)
             .unwrap_or(true);
-        self.publish_update(
-            name,
-            FeedUpdate {
-                name: name.to_string(),
-                nodes: nodes.clone(),
-                from_cache: true,
-                raw_bytes: raw.len(),
-                userinfo: None,
-            },
-            last_refreshed_ms,
-            every,
-        )
-        .await;
+        if let Err(error) = self
+            .publish_update(
+                name,
+                FeedUpdate {
+                    name: name.to_string(),
+                    nodes: nodes.clone(),
+                    from_cache: true,
+                    raw_bytes: raw.len(),
+                    userinfo: None,
+                },
+                last_refreshed_ms,
+                every,
+            )
+            .await
+        {
+            warn!(
+                target: "feeds",
+                name = %name,
+                phase,
+                %error,
+                "cached provider activation rejected; keeping runtime unchanged"
+            );
+            return false;
+        }
         info!(
             target: "feeds",
             name = %name,
@@ -634,8 +672,9 @@ mod tests {
         }
         #[async_trait]
         impl FeedSink for Capture {
-            async fn on_update(&self, u: FeedUpdate) {
-                let _ = self.tx.send(u).await;
+            async fn on_update(&self, update: &FeedUpdate) -> Result<(), String> {
+                let _ = self.tx.send(update.clone()).await;
+                Ok(())
             }
         }
         let (tx, mut rx) = tokio::sync::mpsc::channel::<FeedUpdate>(4);
@@ -711,5 +750,46 @@ mod tests {
         // forget 后 cache 应被清。
         assert!(cache.load("p").is_none(), "old cache should be forgotten");
         mgr.stop();
+    }
+
+    #[tokio::test]
+    async fn rejected_activation_does_not_publish_provider_snapshot_or_status() {
+        struct Reject;
+
+        #[async_trait]
+        impl FeedSink for Reject {
+            async fn on_update(&self, _update: &FeedUpdate) -> Result<(), String> {
+                Err("runtime rejected node graph".into())
+            }
+        }
+
+        let mut feeds = BTreeMap::new();
+        feeds.insert("p".to_string(), detail("https://example.invalid/sub", 3600));
+        let mgr = FeedManager::new(feeds, None);
+        mgr.set_sink(Arc::new(Reject));
+
+        let update = FeedUpdate {
+            name: "p".into(),
+            nodes: vec![ParsedNode::new(
+                "ProviderNode",
+                core_config::node_uri::NodeProtocol::Direct,
+                "203.0.113.10",
+                10001,
+            )],
+            from_cache: false,
+            raw_bytes: 128,
+            userinfo: None,
+        };
+        let error = mgr
+            .publish_update("p", update, Some(123), Duration::from_secs(3600))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, "runtime rejected node graph");
+        assert!(mgr.snapshot("p").is_none());
+        let status = mgr.status("p").unwrap();
+        assert_eq!(status.last_refreshed_ms, 0);
+        assert_eq!(status.last_node_count, 0);
+        assert_eq!(status.last_raw_bytes, 0);
     }
 }

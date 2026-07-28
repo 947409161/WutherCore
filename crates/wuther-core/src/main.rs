@@ -31,7 +31,7 @@ use core_outbound::proto::wireguard::{
 use core_ruleset::{RulesetManager, RulesetSpec, RulesetType};
 use core_runtime::{Runtime, UrlTestConfig, UrlTester};
 use core_store::Store;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::host_resources::listener_resource_claims;
 
@@ -1637,14 +1637,9 @@ struct RuntimeFeedSink {
 
 #[async_trait]
 impl FeedSink for RuntimeFeedSink {
-    async fn on_update(&self, update: FeedUpdate) {
-        if let Err(error) = self.runtime.apply_feed_nodes(&update.name, update.nodes) {
-            error!(
-                target: "feeds",
-                provider = %update.name,
-                %error,
-                "feed 节点配置无效，保留上一份可用快照"
-            );
-        }
+    async fn on_update(&self, update: &FeedUpdate) -> Result<(), String> {
+        self.runtime
+            .apply_feed_nodes(&update.name, update.nodes.clone())
+            .map_err(|error| error.to_string())
     }
 }
