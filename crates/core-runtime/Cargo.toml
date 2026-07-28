@@ -20,11 +20,15 @@ anyhow        = { workspace = true }
 thiserror     = { workspace = true }
 tracing       = { workspace = true }
 parking_lot   = { workspace = true }
+arc-swap      = { workspace = true }
+smallvec      = { workspace = true }
 serde         = { workspace = true }
 serde_json    = { workspace = true }
 dashmap       = { workspace = true }
 ahash         = { workspace = true }
 regex         = { workspace = true }
+globset       = { workspace = true }
+rand          = { workspace = true }
 once_cell     = { workspace = true }
 bytes         = { workspace = true }
 futures       = { workspace = true }

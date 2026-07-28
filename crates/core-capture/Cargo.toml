@@ -42,7 +42,7 @@ netstack-smoltcp = "0.2"
 futures = { workspace = true }
 # 跨平台 TUN/TAP 设备 —— 替代手写的 linux_tun_io / windows_tun_io / macos_tun_io。
 # 内置 GSO/GRO + batch I/O + vnet_hdr 处理，70.6 Gbps on Linux。
-tun-rs = { version = "2", features = ["async"] }
+tun-rs = { version = "2.8.8", features = ["async"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 nix      = { version = "0.31", features = ["net", "socket", "ioctl", "fs", "user"] }
