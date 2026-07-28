@@ -11,7 +11,7 @@ WutherCore 使用 Git 标签驱动 GitHub Actions 发版。工作流只接受已
 
 标签去掉前导 `v` 后，必须与 `Cargo.toml` 的 `[workspace.package].version` 完全一致。比如 `v0.4.0-rc.1` 对应 `version = "0.4.0-rc.1"`，不能只写 `0.4.0`。
 
-正式版本的标签提交还必须已经进入 `main`。预发布可以来自候选分支，但仍会执行完整 CI。
+正式版本的标签提交还必须已经进入 `main`。预发布可以来自候选分支。两种通道都要求标签提交已经通过 `Required CI`，Release 工作流直接复用该结果，不重复编译和检查。
 
 ## 发版前准备
 
@@ -56,15 +56,16 @@ git push origin v0.4.0
 发布前会依次执行：
 
 1. 校验标签格式、版本通道与 workspace 版本；
-2. 确认正式版提交属于 `main`；
-3. 在标签对应源码上运行格式、仓库完整性与 Linux workspace 校验；
-4. 调用统一的 Build Matrix，并行构建全部 9 个目标；Windows 和 macOS
+2. 确认正式版提交属于 `main`，并确认标签提交已有成功的 `Required CI`；
+3. 调用统一的 Build Matrix，并行构建全部 9 个目标；Windows 和 macOS
    产物会在对应架构的原生 runner 上执行冒烟验证；
-5. 将每个平台 ZIP 作为非嵌套 artifact 上传，再按 `wuther-core-$VERSION-*` 前缀收集全部 9 个产物；
-6. 生成 `SHA256SUMS`，再汇总为零压缩的 `release-assets` artifact；
-7. 下载并解包汇总产物，生成 GitHub Artifact Attestation；
-8. 使用 `.github/release.yml` 自动分类 Release Notes；
-9. 直接上传文件到 GitHub Release，并按照标签设置 Pre-release 或 Latest。
+4. 将每个平台 ZIP 作为非嵌套 artifact 上传，并只保留 1 天；
+5. 发布 job 按 `wuther-core-$VERSION-*` 前缀下载一次全部 9 个产物，校验数量并生成 `SHA256SUMS`；
+6. 生成 GitHub Artifact Attestation；
+7. 使用 `.github/release.yml` 自动分类 Release Notes；
+8. 直接上传文件到 GitHub Release，并按照标签设置 Pre-release 或 Latest。
+
+Release 不会再次调用完整 CI，也不会创建汇总 artifact 后重复上传和下载。正式版的质量门禁由标签提交已经通过的 `Required CI` 保证。
 
 正式发布不会覆盖已经发布的同名 Release。若首次发布在上传阶段中断，重新运行可以续传仍处于 Draft 状态的 Release；已发布的资产保持不可变。
 
@@ -112,7 +113,7 @@ gh attestation verify .\wuther-core-0.4.0-windows-amd64-msvc.zip --repo MiChongs
 
 在 GitHub Actions 的 `Release` 工作流中选择 `Run workflow`，填写一个已经存在的标签。通常保持 `channel = auto`；显式选择 `prerelease` 或 `release` 时，选择必须与标签格式一致，否则工作流会拒绝执行。
 
-手动运行用于恢复失败的 Draft Release，不用于绕过版本、标签或 CI 校验。
+手动运行用于恢复失败的 Draft Release，不用于绕过版本、标签或已有的 `Required CI` 校验。
 
 需要验证裁剪构建时，在 `CI` 或 `Build Matrix` 工作流中选择 `Run workflow`，
 并在 `tags` 中填写逗号分隔的组件标签，例如

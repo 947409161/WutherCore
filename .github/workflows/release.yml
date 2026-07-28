@@ -22,6 +22,7 @@ on:
 
 permissions:
   contents: read
+  checks: read
 
 concurrency:
   group: release-${{ inputs.tag || github.ref_name }}
@@ -82,6 +83,8 @@ jobs:
 
       - name: Verify version and source
         env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           RELEASE_VERSION: ${{ steps.metadata.outputs.version }}
           IS_PRERELEASE: ${{ steps.metadata.outputs.prerelease }}
         run: |
@@ -103,33 +106,38 @@ jobs:
             fi
           fi
 
-  quality:
-    name: Validate release tag
-    needs: prepare
-    uses: ./.github/workflows/ci.yml
-    with:
-      ref: ${{ needs.prepare.outputs.tag }}
-      validate-macos: false
+          commit_sha="$(git rev-parse HEAD)"
+          required_ci="$(
+            gh api "repos/$GH_REPO/commits/$commit_sha/check-runs?per_page=100" \
+              --jq '[.check_runs[] | select(.name == "Required CI" and .status == "completed" and .conclusion == "success") | .html_url][0] // ""'
+          )"
+          if [ -z "$required_ci" ]; then
+            echo "::error::Release commit $commit_sha has no successful Required CI check."
+            exit 1
+          fi
+          echo "Using verified Required CI: $required_ci"
 
   build:
     name: Build release artifacts
-    needs:
-      - prepare
-      - quality
+    needs: prepare
     uses: ./.github/workflows/build.yml
     with:
       ref: ${{ needs.prepare.outputs.tag }}
       version: ${{ needs.prepare.outputs.version }}
       platforms: all
-      retention-days: 14
+      retention-days: 1
 
-  collect:
-    name: Collect release assets
+  publish:
+    name: Publish GitHub release
     needs:
       - prepare
       - build
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
 
     steps:
       - name: Download release artifacts
@@ -148,8 +156,8 @@ jobs:
           shopt -s nullglob
 
           archives=(dist/wuther-core-"$RELEASE_VERSION"-*.zip)
-          if [ "${#archives[@]}" -ne 10 ]; then
-            echo "::error::Expected 10 release archives, found ${#archives[@]}."
+          if [ "${#archives[@]}" -ne 9 ]; then
+            echo "::error::Expected 9 release archives, found ${#archives[@]}."
             printf 'Found: %s\n' "${archives[@]:-none}"
             exit 1
           fi
@@ -160,37 +168,6 @@ jobs:
             | xargs -0 sha256sum > SHA256SUMS
           test -s SHA256SUMS
           cat SHA256SUMS
-
-      - name: Upload collected release assets
-        uses: actions/upload-artifact@v7.0.1
-        with:
-          name: release-assets
-          path: |
-            dist/*.zip
-            dist/SHA256SUMS
-          if-no-files-found: error
-          compression-level: 0
-          overwrite: true
-          retention-days: 14
-
-  publish:
-    name: Publish GitHub release
-    needs:
-      - prepare
-      - collect
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: write
-      id-token: write
-      attestations: write
-
-    steps:
-      - name: Download and decompress collected assets
-        uses: actions/download-artifact@v8.0.1
-        with:
-          name: release-assets
-          path: dist
 
       - name: Attest release artifacts
         uses: actions/attest-build-provenance@v4.1.1

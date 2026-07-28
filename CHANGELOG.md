@@ -16,6 +16,7 @@
 ### Changed
 
 - GitHub CI，Build Matrix 和 Release 的 macOS 自动构建仅保留 Apple Silicon，不再运行或发布 Intel macOS 产物。
+- Release 直接复用标签提交已经通过的 `Required CI`，不再重复运行完整 CI；产物只下载一次并直接校验、签名和发布，中间构建 artifact 仅保留 1 天。
 
 ## [0.3.1] - 2026-07-28
 
