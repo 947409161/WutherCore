@@ -455,8 +455,15 @@ pub fn assign_proxy_socket(ctx: SkLookupContext) -> u32 {
     let Some(config) = CONFIG.get(0) else {
         return SK_PASS;
     };
-    let shared = lookup.ingress_ifindex != config.loopback_ifindex;
-    if shared && unsafe { SHARED_INTERFACES.get(&lookup.ingress_ifindex).is_none() } {
+    // A map key must live in verifier-approved memory. In particular, Android
+    // kernels reject passing a pointer into `bpf_sk_lookup` directly to
+    // bpf_map_lookup_elem. The volatile scalar load prevents LLVM from folding
+    // this local back into `ctx + offsetof(ingress_ifindex)`, so taking its
+    // address below materializes the key on the eBPF stack.
+    let ingress_ifindex =
+        unsafe { core::ptr::read_volatile(core::ptr::addr_of!(lookup.ingress_ifindex)) };
+    let shared = ingress_ifindex != config.loopback_ifindex;
+    if shared && unsafe { SHARED_INTERFACES.get(&ingress_ifindex).is_none() } {
         increment(STAT_BYPASS_INGRESS);
         return SK_PASS;
     }
