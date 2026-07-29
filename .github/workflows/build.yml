@@ -62,7 +62,7 @@ env:
   # Minimum supported Android release. NSS and the Rust binary are both built
   # against it; raising it here raises the floor for published Android archives.
   ANDROID_API_LEVEL: "24"
-  ANDROID_NDK_VERSION: "r29"
+  ANDROID_NDK_VERSION: "29.0.14206865"
 
 jobs:
   prepare:
@@ -335,13 +335,25 @@ jobs:
         if: steps.components.outputs.ebpf == 'true'
         uses: ./.github/actions/setup-ebpf
 
-      - name: Setup Android NDK
+      - name: Resolve Android NDK
         id: ndk
-        uses: nttld/setup-ndk@v1.6.0
-        with:
-          ndk-version: ${{ env.ANDROID_NDK_VERSION }}
-          add-to-path: true
-          local-cache: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          ndk_path="${ANDROID_SDK_ROOT:?}/ndk/${ANDROID_NDK_VERSION}"
+          clang_path="$ndk_path/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+          if [ ! -x "$clang_path" ]; then
+            "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+              "ndk;$ANDROID_NDK_VERSION"
+          fi
+          test -x "$clang_path"
+          {
+            echo "ANDROID_NDK=$ndk_path"
+            echo "ANDROID_NDK_HOME=$ndk_path"
+            echo "ANDROID_NDK_ROOT=$ndk_path"
+          } >> "$GITHUB_ENV"
+          echo "$ndk_path/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+          echo "ndk-path=$ndk_path" >> "$GITHUB_OUTPUT"
 
       - name: Install cargo-ndk
         uses: taiki-e/install-action@v2.85.2
