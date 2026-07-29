@@ -98,11 +98,26 @@ runs:
       env:
         ROOT: ${{ steps.paths.outputs.root }}
         ALPINE_IMAGE: ${{ inputs.alpine-image }}
+        TARGET: ${{ inputs.target }}
       run: |
         set -euo pipefail
+
+        # rustc links the final binary against its own compiler-rt, which
+        # provides the relaxed/acquire/release outline-atomics helpers but not
+        # the _sync variants GCC emits. Without this, every NSS object that
+        # touches a refcount ends the link with `undefined reference to
+        # __aarch64_ldadd4_sync`. Inlining the atomics avoids the helpers
+        # entirely. Only aarch64 has outline atomics.
+        extra_cflags=""
+        case "$TARGET" in
+        aarch64-*) extra_cflags="-mno-outline-atomics" ;;
+        esac
+
         # Docker resolves the image for the runner's own architecture, so the
         # amd64 and arm64 musl jobs each get a native toolchain.
         docker run --rm \
+          -e CFLAGS="$extra_cflags" \
+          -e CXXFLAGS="$extra_cflags" \
           -v "$ROOT:/work" \
           -w /work \
           "$ALPINE_IMAGE" \

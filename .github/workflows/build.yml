@@ -464,16 +464,20 @@ jobs:
       # exactly as the Linux and macOS archives do.
       - name: Stage Windows runtime libraries
         if: steps.components.outputs.young == 'true'
-        shell: bash
+        shell: pwsh
         env:
           TARGET: ${{ matrix.platform.target }}
-        run: >-
-          python scripts/stage-runtime-libraries.py
-          --target "$TARGET"
-          --source "$NSS_DIR/../dist/Release/lib"
-          --require nss3.dll
-          --require nssutil3.dll
-          --require ssl3.dll
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # NSS_DIR is a native Windows path. Building the sibling dist path in
+          # bash would hand it to MSYS's path translation, which mangles it.
+          $libDir = Join-Path (Split-Path $env:NSS_DIR -Parent) 'dist\Release\lib'
+          python scripts/stage-runtime-libraries.py `
+            --target "$env:TARGET" `
+            --source "$libDir" `
+            --require nss3.dll `
+            --require nssutil3.dll `
+            --require ssl3.dll
 
       - name: Smoke-test Windows binary
         shell: pwsh
