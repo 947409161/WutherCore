@@ -172,9 +172,23 @@ runs:
         rm -rf "$TMPDIR"
         mkdir -p "$TMPDIR"
 
+        dump_nspr_config() {
+          status=$?
+          trap - EXIT
+          if ((status != 0)); then
+            echo "::group::NSPR configure diagnostics"
+            find "$TMPDIR" -type f -name config.log -print \
+              -exec tail -n 240 {} \; || true
+            echo "::endgroup::"
+          fi
+          exit "$status"
+        }
+        trap dump_nspr_config EXIT
+
         staging="$ROOT/staging"
         rm -rf "$staging"
         ./build-nss-android.sh "$ROOT" "$staging" "$toolchain_path" "$TOOLCHAIN" "$API_LEVEL"
+        trap - EXIT
 
         # build-nss-android.sh emits lib/*.a plus a single include/nss tree that
         # already merges the NSS public headers and the NSPR headers. Fan that
