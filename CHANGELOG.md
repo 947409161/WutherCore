@@ -4,6 +4,17 @@
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-07-29
+
+### Added
+
+- 发布归档在 Linux musl、Windows AMD64 与 Android 上新增 Young 组件。这三个目标
+  静态链接 Mozilla NSS，归档仍是单文件二进制；Linux GNU 与 macOS 沿用动态 NSS 并
+  在归档内携带运行库。Windows ARM64 因为没有可用的 NSS 构建链，仍不含 Young。
+- 在不支持 Young 的目标上显式请求 `with_young`（含 `standard`、`all_components`）
+  会让构建直接失败，不再静默产出缺少该组件的归档。发布前还会逐个校验归档内
+  `BUILD-COMPONENTS.txt` 记录的组件与该平台的预期一致。
+
 ### Changed
 
 - Linux 与 Android Root TUN 强制校验 `CAP_NET_ADMIN`，启用完整批量收发、
@@ -166,7 +177,8 @@
 - 高危依赖变更会阻止 Pull Request 合并；
 - CodeQL 初次扫描告警由 [Issue #9](https://github.com/MiChongs/WutherCore/issues/9) 跟踪，未批量忽略。
 
-[Unreleased]: https://github.com/MiChongs/WutherCore/compare/v0.3.6...HEAD
+[Unreleased]: https://github.com/MiChongs/WutherCore/compare/v0.3.7...HEAD
+[0.3.7]: https://github.com/MiChongs/WutherCore/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/MiChongs/WutherCore/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/MiChongs/WutherCore/compare/v0.3.4...v0.3.5
 [0.3.3]: https://github.com/MiChongs/WutherCore/compare/v0.3.2...v0.3.3
