@@ -3,11 +3,13 @@ name = "core-inbound"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+build = "build.rs"
 
 [features]
 default = ["standard"]
 standard = ["with_grpc", "with_reality", "with_shadowsocks", "with_xhttp"]
 with_tun = ["dep:core-capture"]
+with_ebpf = ["dep:core-ruleset"]
 with_grpc = ["dep:core-grpc", "with_reality", "tls_inbound"]
 with_reality = ["dep:core-reality"]
 with_shadowsocks = ["dep:shadowsocks"]
@@ -43,6 +45,7 @@ core-outbound = { workspace = true }
 core-smart    = { workspace = true }
 core-runtime  = { workspace = true }
 core-observe  = { workspace = true }
+core-ruleset  = { workspace = true, optional = true }
 core-reality  = { workspace = true, optional = true }
 tokio         = { workspace = true }
 tokio-util    = { workspace = true }
@@ -53,13 +56,16 @@ anyhow        = { workspace = true }
 thiserror     = { workspace = true }
 tracing       = { workspace = true }
 parking_lot   = { workspace = true }
+dashmap       = { workspace = true }
 base64        = { workspace = true }
 hex           = { workspace = true }
 serde         = { workspace = true }
+serde_json    = { workspace = true }
 uuid          = { workspace = true }
 subtle        = "2.6"
 rand          = { workspace = true }
 url           = { workspace = true }
+ipnet         = { workspace = true }
 shadowsocks   = { workspace = true, optional = true }
 
 # XHTTP/SplitHTTP inbound: HTTP/1.1 + HTTP/2 over TCP/TLS and HTTP/3 over QUIC.
@@ -87,4 +93,13 @@ sha1           = { version = "0.11", optional = true }
 x509-parser    = { version = "=0.18.1", features = ["verify-aws"], optional = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios", target_os = "freebsd"))'.dependencies]
-nix = { version = "0.31", features = ["user", "fs"] }
+nix = { version = "0.31", features = ["user", "fs", "net", "socket", "uio", "resource"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+aya = { version = "0.14.0", default-features = false }
+libc = { workspace = true }
+rtnetlink = { workspace = true }
+
+[build-dependencies]
+anyhow = { workspace = true }
+aya-build = { version = "0.2.0", default-features = false }

@@ -3,7 +3,8 @@ use std::{collections::BTreeSet, net::SocketAddr};
 use anyhow::{Result, ensure};
 use core_config::runtime_plan::RuntimePlan;
 use core_mesh::{
-    ClaimMode, HostResourceClaim, HostSubsystemId, ResourceClaim, SocketTransport, SystemResource,
+    ClaimMode, FwmarkRange, HostResourceClaim, HostSubsystemId, ResourceClaim, SocketTransport,
+    SystemResource,
 };
 
 /// Declare every fixed process-level listener before mesh backends can mutate
@@ -100,6 +101,38 @@ pub(crate) fn listener_resource_claims(plan: &RuntimePlan) -> Result<Vec<HostRes
                 host_owner("wuther.api"),
                 SocketTransport::Tcp,
                 address,
+            ));
+        }
+    }
+
+    for inbound in &plan.inbounds {
+        let core_config::model::Inbound::Ebpf(options) = inbound else {
+            continue;
+        };
+        if !options.enabled {
+            continue;
+        }
+        let owner = host_owner("wuther.ebpf");
+        claims.insert(HostResourceClaim::new(
+            owner.clone(),
+            ResourceClaim::exclusive(SystemResource::RouteTable {
+                table: options.route_table,
+            }),
+        ));
+        claims.insert(HostResourceClaim::new(
+            owner.clone(),
+            ResourceClaim::exclusive(SystemResource::FwmarkRange {
+                range: FwmarkRange::new(options.mark, options.mark)
+                    .expect("one-value fwmark range is valid"),
+            }),
+        ));
+        for value in &options.redirect_address {
+            let prefix = value.parse().map_err(|_| {
+                anyhow::anyhow!("eBPF redirect_address is not a valid CIDR: {value}")
+            })?;
+            claims.insert(HostResourceClaim::new(
+                owner.clone(),
+                ResourceClaim::exclusive(SystemResource::AddressPrefix { prefix }),
             ));
         }
     }

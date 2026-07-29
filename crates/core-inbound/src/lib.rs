@@ -1,11 +1,14 @@
-//! core-inbound —— 入站监听 / 协议解析 / 连接桥接。
+//! core-inbound 入站监听、协议解析与连接桥接。
 //!
 //! Protocol listeners and transparent TUN/TProxy/redirect ingress share this
 //! public module. The lower-level `core-capture` crate remains an internal
 //! platform backend and is re-exported through [`transparent`] when enabled.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
+#[cfg(all(feature = "with_ebpf", any(target_os = "linux", target_os = "android")))]
+#[allow(unsafe_code)]
+pub mod ebpf;
 #[cfg(feature = "with_grpc")]
 pub mod grpc;
 pub mod listener;

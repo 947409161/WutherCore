@@ -1,0 +1,65 @@
+version: 1
+profile: router
+name: linux-ebpf
+
+inbounds:
+  - type: ebpf
+    tag: ebpf-in
+    enabled: true
+    redirect_address:
+      - 127.128.0.0/9
+      - 2001:db8:2030::/64
+    bypass_rule_set:
+      - geoip-cn
+    include_uid: []
+    include_uid_range: []
+    exclude_uid: []
+    exclude_uid_range: []
+    cgroup_path: /sys/fs/cgroup
+    route_table: 721
+    rule_priority: 8999
+    mark: 721
+    map_capacity: 65536
+    dns_mode: hijack
+
+listen:
+  local:
+    host: 127.0.0.1
+    port: 7890
+    udp: true
+  panel: 127.0.0.1:9090
+  share: false
+
+route:
+  preset: custom
+  sets:
+    geoip-cn:
+      type: ipcidr
+      format: mrs
+      url: https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip-cn.mrs
+      path: data/rulesets/geoip-cn.mrs
+      every: 24h
+      via: direct
+  steps:
+    - "domain-suffix: lan,local,arpa -> direct"
+    - "ip: 10.0.0.0/8 -> direct"
+    - "ip: 172.16.0.0/12 -> direct"
+    - "ip: 192.168.0.0/16 -> direct"
+  final: direct
+
+resolver:
+  mode: secure
+  fake: off
+  ipv6: true
+  servers:
+    bootstrap: https://223.5.5.5/dns-query
+    overseas: https://1.1.1.1/dns-query
+  nameserver: [overseas]
+  proxy-server-nameserver: [bootstrap]
+  direct-nameserver: [bootstrap]
+  policy:
+    "+.cn": [bootstrap]
+
+ui:
+  on: true
+  secret: replace-with-random-token

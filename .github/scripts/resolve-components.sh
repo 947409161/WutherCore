@@ -15,7 +15,7 @@
 #   TARGET           target triple, used only for diagnostics
 #   YOUNG_SUPPORTED  `false` when this target has no NSS build chain
 #
-# Outputs (GITHUB_OUTPUT): tags, label, key, young
+# Outputs (GITHUB_OUTPUT): tags, label, key, young, ebpf
 
 set -euo pipefail
 
@@ -46,6 +46,11 @@ case ",${tags:-standard}," in
 *,with_young,* | *,standard,* | *,all_components,*) young=true ;;
 esac
 
+ebpf=false
+case ",${tags:-standard}," in
+*,with_ebpf,*) ebpf=true ;;
+esac
+
 # Fail loudly rather than shipping an archive that silently dropped a component
 # the caller asked for. Targets opt out through YOUNG_SUPPORTED because their
 # NSS build chain does not exist upstream, not because of a policy choice.
@@ -54,11 +59,17 @@ if [ "$young" = true ] && [ "${YOUNG_SUPPORTED:-true}" != "true" ]; then
   exit 1
 fi
 
+if [ "$ebpf" = true ] && [[ "${TARGET:-}" != *-linux-* ]]; then
+  echo "::error::with_ebpf only supports Linux and Android targets, not ${TARGET:-this target}."
+  exit 1
+fi
+
 {
   echo "tags=$tags"
   echo "label=$label"
   echo "key=$key"
   echo "young=$young"
+  echo "ebpf=$ebpf"
 } >> "$GITHUB_OUTPUT"
 
-echo "components: tags='${tags:-<default features>}' young=$young"
+echo "components: tags='${tags:-<default features>}' young=$young ebpf=$ebpf"

@@ -170,6 +170,7 @@ nav:
       - 手册入口: manual/index.md
       - 配置文件: manual/configuration-file.md
       - 监听与入站: manual/inbounds.md
+      - Aya eBPF 入站: manual/ebpf-inbound.md
       - 订阅与节点: manual/feeds-nodes.md
       - 策略组、路由与 DNS: manual/routing-dns.md
       - 系统接管: manual/capture.md

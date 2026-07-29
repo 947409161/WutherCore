@@ -106,6 +106,7 @@ wuther-core components --json
 | 预设 | `standard` | 默认标准组件集，不含 Naive/Cronet |
 | 预设 | `all_components` | `standard` 加 `with_naive` |
 | 运行组件 | `with_api` | 管理 API 与面板服务 |
+| 运行组件 | `with_ebpf` | Linux 与 Android root 的 Aya eBPF 入站 |
 | 运行组件 | `with_tun` | TUN/TProxy/Redirect capture |
 | 传输 | `with_quic` | QUIC/H3 基础能力 |
 | 传输 | `with_grpc` | Xray gRPC 入站与出站传输 |

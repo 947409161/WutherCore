@@ -115,7 +115,10 @@ jobs:
           components: rustfmt
 
       - name: Check formatting
-        run: cargo fmt --all --check
+        shell: bash
+        run: |
+          cargo fmt --all --check
+          cargo fmt --manifest-path crates/core-inbound/ebpf/Cargo.toml -- --check
 
   linux:
     name: Linux workspace
@@ -145,6 +148,10 @@ jobs:
           cache-targets: false
           save-cache: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
 
+      - name: Setup Aya eBPF build tools
+        if: contains(format(',{0},', needs.prepare.outputs.tags), ',with_ebpf,')
+        uses: ./.github/actions/setup-ebpf
+
       - name: Check workspace
         shell: bash
         env:
@@ -160,7 +167,9 @@ jobs:
 
   macos:
     name: macOS Apple Silicon
-    if: github.event_name != 'workflow_call' || inputs.validate-macos
+    if: >-
+      (github.event_name != 'workflow_call' || inputs.validate-macos) &&
+      !contains(format(',{0},', needs.prepare.outputs.tags), ',with_ebpf,')
     needs: prepare
     runs-on: macos-15
     timeout-minutes: 60

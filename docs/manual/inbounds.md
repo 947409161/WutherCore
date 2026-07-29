@@ -8,7 +8,7 @@ description: Mixed、Panel 和所有服务端协议入站的配置语义
 `inbounds` 是本地流量入口的统一配置。每个条目使用 `type` 选择数据面，使用
 `tag` 提供稳定身份。路由规则、连接表、日志和 Clash API 都使用这个 tag。
 
-当前统一入口支持 `mixed`、`tun`、`tproxy` 和 `redirect`。管理面板及现有服务端
+当前统一入口支持 `mixed`、`tun`、`tproxy`、`redirect` 和 `ebpf`。管理面板及现有服务端
 协议仍放在 `listen` 中。旧的 `listen.local` 和 `capture` 可以继续加载，但不能与
 等价的 `inbounds` 条目同时声明。
 
@@ -41,7 +41,7 @@ inbounds:
 ```
 
 每个 tag 必须非空、唯一且不超过 128 字节。当前运行时最多启用一个 Mixed 入口，
-并且 `tun`、`tproxy`、`redirect` 三种透明数据面合计只能声明一个。这样可以避免
+并且 `tun`、`tproxy`、`redirect`、`ebpf` 四种宿主流量数据面合计只能启用一个。这样可以避免
 多个入口同时争用系统路由、防火墙、TUN 设备和 DNS 劫持资源。
 
 列表字段接受单值和数组两种写法。`address: 198.18.0.1/15` 与只包含一个元素的
@@ -91,6 +91,42 @@ inbounds:
 Linux 或 Android root TCP REDIRECT。
 
 完整的地址、路由、应用过滤、平台能力和迁移示例见[系统接管](capture.md)。
+
+## Aya eBPF 入口
+
+`ebpf` 是 `core-inbound` 自带的 Linux 和 Android root 入站，不经过旧的
+capture supervisor，也不安装 iptables、nftables、TPROXY 或 REDIRECT 规则。
+它使用 cgroup socket address 程序选择本机进程流量，使用策略路由把选中的
+socket 送回本机协议栈，再由 `sk_lookup` 分配给核心持有的 TCP 和 UDP socket。
+
+```yaml
+inbounds:
+  - type: ebpf
+    tag: ebpf-in
+    redirect_address:
+      - 127.128.0.0/9
+      - 2001:db8:2030::/64
+    bypass_rule_set: [geoip-cn]
+    include_uid: []
+    include_uid_range: []
+    exclude_uid: []
+    exclude_uid_range: []
+    cgroup_path: /sys/fs/cgroup
+    route_table: 721
+    rule_priority: 8999
+    mark: 721
+    map_capacity: 65536
+    dns_mode: hijack
+```
+
+排除 UID 的优先级高于包含 UID。包含列表和包含区间都为空时接管所有 UID。
+`bypass_rule_set` 必须引用已经加载并能提取目标 IP 前缀的规则集。规则集刷新
+先写入备用 LPM map，全部成功后再切换活动 map，因此运行流量不会看到半份规则。
+`dns_mode: hijack` 同时接管 UDP 和 TCP 53，并交给核心 DNS 服务处理。
+
+该入口要求 `with_ebpf` 组件、root 或等价的 BPF 与网络管理能力、cgroup v2，
+以及支持 cgroup sock_addr 和 sk_lookup 的内核。完整部署、字段语义和诊断方法见
+[Aya eBPF 入站](ebpf-inbound.md)。
 
 ## 管理面板监听
 

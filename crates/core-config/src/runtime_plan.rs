@@ -543,6 +543,7 @@ fn normalize_inbounds(cfg: &mut UserConfig) -> ConfigResult<()> {
     let mut tags = HashSet::new();
     let mut mixed = None;
     let mut transparent = None;
+    let mut kernel_ingress = None;
 
     for (index, inbound) in cfg.inbounds.iter().enumerate() {
         let path = format!("inbounds[{index}]");
@@ -571,7 +572,14 @@ fn normalize_inbounds(cfg: &mut UserConfig) -> ConfigResult<()> {
                     );
                 }
             }
-            Inbound::Tun(_) | Inbound::Tproxy(_) | Inbound::Redirect(_) => {
+            Inbound::Tun(options) | Inbound::Tproxy(options) | Inbound::Redirect(options) => {
+                if options.enabled && kernel_ingress.replace((index, inbound.kind())).is_some() {
+                    return Err(ConfigError::invalid(
+                        "同一进程只能启用一个 tun、tproxy、redirect 或 ebpf inbound",
+                    )
+                    .at(path)
+                    .hint("这些入站共同接管宿主网络命名空间，不能叠加"));
+                }
                 if transparent.replace((index, inbound.clone())).is_some() {
                     return Err(ConfigError::invalid(
                         "同一进程只能声明一个 tun、tproxy 或 redirect inbound",
@@ -580,6 +588,17 @@ fn normalize_inbounds(cfg: &mut UserConfig) -> ConfigResult<()> {
                     .hint("透明入站共同占用宿主路由和防火墙资源，不能叠加"));
                 }
             }
+            Inbound::Ebpf(options) if options.enabled => {
+                if kernel_ingress.replace((index, inbound.kind())).is_some() {
+                    return Err(ConfigError::invalid(
+                        "同一进程只能启用一个 tun、tproxy、redirect 或 ebpf inbound",
+                    )
+                    .at(path)
+                    .hint("这些入站共同接管宿主网络命名空间，不能叠加"));
+                }
+                validate_ebpf_inbound(options, &path, std::env::consts::OS)?;
+            }
+            Inbound::Ebpf(_) => {}
             Inbound::Mixed(_) => {}
         }
     }
@@ -649,6 +668,127 @@ fn normalize_inbounds(cfg: &mut UserConfig) -> ConfigResult<()> {
             );
         }
         cfg.capture = inbound.transparent_capture();
+    }
+    Ok(())
+}
+
+fn validate_ebpf_inbound(options: &EbpfInboundOptions, path: &str, os: &str) -> ConfigResult<()> {
+    if !matches!(os, "linux" | "android") {
+        return Err(
+            ConfigError::new(crate::error::ConfigErrorKind::UnsupportedPlatform(format!(
+                "eBPF inbound 仅支持 Linux/Android；当前平台为 {os}"
+            )))
+            .at(path),
+        );
+    }
+    if options.redirect_address.is_empty() {
+        return Err(
+            ConfigError::invalid("redirect_address 至少需要一个 IPv4 或 IPv6 CIDR")
+                .at(format!("{path}.redirect_address")),
+        );
+    }
+    let mut has_v4 = false;
+    let mut has_v6 = false;
+    for (index, value) in options.redirect_address.iter().enumerate() {
+        match value.parse::<ipnet::IpNet>() {
+            Ok(ipnet::IpNet::V4(_)) => has_v4 = true,
+            Ok(ipnet::IpNet::V6(_)) => has_v6 = true,
+            Err(_) => {
+                return Err(ConfigError::invalid(format!(
+                    "redirect_address[{index}] 不是合法 CIDR: {value}"
+                ))
+                .at(format!("{path}.redirect_address[{index}]")));
+            }
+        }
+    }
+    if !has_v4 && !has_v6 {
+        return Err(
+            ConfigError::invalid("redirect_address 没有可用的 IP 地址族")
+                .at(format!("{path}.redirect_address")),
+        );
+    }
+    for (field, values) in [
+        ("include_uid_range", &options.include_uid_range),
+        ("exclude_uid_range", &options.exclude_uid_range),
+    ] {
+        if values.len() > 256 {
+            return Err(ConfigError::invalid(format!("{field} 最多允许 256 个区间"))
+                .at(format!("{path}.{field}")));
+        }
+        let mut ranges = HashSet::new();
+        for (index, value) in values.iter().enumerate() {
+            let valid = value
+                .split_once(':')
+                .and_then(|(start, end)| {
+                    Some((start.parse::<u32>().ok()?, end.parse::<u32>().ok()?))
+                })
+                .is_some_and(|(start, end)| start <= end);
+            if !valid {
+                return Err(ConfigError::invalid(format!(
+                    "{field}[{index}] 必须是 start:end 闭区间: {value}"
+                ))
+                .at(format!("{path}.{field}[{index}]")));
+            }
+            if !ranges.insert(value.as_str()) {
+                return Err(
+                    ConfigError::invalid(format!("{field} 不能包含重复区间: {value}"))
+                        .at(format!("{path}.{field}[{index}]")),
+                );
+            }
+        }
+    }
+    if !options.cgroup_path.to_string_lossy().starts_with('/') {
+        return Err(ConfigError::invalid("cgroup_path 必须是绝对路径")
+            .at(format!("{path}.cgroup_path"))
+            .hint("通常使用 /sys/fs/cgroup"));
+    }
+    if options.mark == 0 {
+        return Err(ConfigError::invalid("mark 不能为 0").at(format!("{path}.mark")));
+    }
+    if matches!(options.route_table, 0 | 253..=255) {
+        return Err(
+            ConfigError::invalid("route_table 不能为 0 或 Linux 保留表 253..=255")
+                .at(format!("{path}.route_table")),
+        );
+    }
+    if !(1..=32_765).contains(&options.rule_priority) {
+        return Err(ConfigError::invalid(
+            "rule_priority 必须在 1..=32765，且排在 Linux main rule 之前",
+        )
+        .at(format!("{path}.rule_priority")));
+    }
+    if !(1_024..=1_048_576).contains(&options.map_capacity) {
+        return Err(ConfigError::invalid("map_capacity 必须在 1024..=1048576")
+            .at(format!("{path}.map_capacity")));
+    }
+    for (field, values) in [
+        ("include_uid", &options.include_uid),
+        ("exclude_uid", &options.exclude_uid),
+    ] {
+        if values.len() > options.map_capacity as usize {
+            return Err(
+                ConfigError::invalid(format!("{field} 条目数不能超过 map_capacity"))
+                    .at(format!("{path}.{field}")),
+            );
+        }
+        let mut exact = HashSet::new();
+        for (index, uid) in values.iter().enumerate() {
+            if !exact.insert(*uid) {
+                return Err(
+                    ConfigError::invalid(format!("{field} 不能包含重复 UID: {uid}"))
+                        .at(format!("{path}.{field}[{index}]")),
+                );
+            }
+        }
+    }
+    let mut names = HashSet::new();
+    for (index, name) in options.bypass_rule_set.iter().enumerate() {
+        if name.trim().is_empty() || !names.insert(name.as_str()) {
+            return Err(
+                ConfigError::invalid("bypass_rule_set 不能包含空名称或重复名称")
+                    .at(format!("{path}.bypass_rule_set[{index}]")),
+            );
+        }
     }
     Ok(())
 }
@@ -7556,5 +7696,53 @@ route: {preset: direct, final: direct}
             let error = result.unwrap_err().to_string();
             assert!(error.contains(expected), "error={error}");
         }
+    }
+
+    #[test]
+    fn ebpf_inbound_validation_is_native_and_capacity_bounded() {
+        let mut options: EbpfInboundOptions = serde_json::from_value(serde_json::json!({
+            "tag": "ebpf-in",
+            "redirect_address": ["127.128.0.0/9", "2001:db8:2030::/64"],
+            "include_uid": [1000, 1001],
+            "include_uid_range": ["10000:19999"],
+            "bypass_rule_set": ["cnip"]
+        }))
+        .unwrap();
+        validate_ebpf_inbound(&options, "inbounds[0]", "linux").unwrap();
+        assert!(
+            validate_ebpf_inbound(&options, "inbounds[0]", "windows")
+                .unwrap_err()
+                .to_string()
+                .contains("仅支持 Linux/Android")
+        );
+
+        options.include_uid = vec![1000, 1000];
+        assert!(
+            validate_ebpf_inbound(&options, "inbounds[0]", "android")
+                .unwrap_err()
+                .to_string()
+                .contains("重复 UID")
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn ebpf_inbound_is_not_lowered_into_legacy_capture() {
+        let plan = crate::loader::load_from_str(
+            r#"
+version: 1
+profile: router
+inbounds:
+  - type: ebpf
+    tag: ebpf-in
+    redirect_address: [127.128.0.0/9]
+listen: {panel: false}
+route: {preset: direct, final: direct}
+ui: {on: false}
+"#,
+        )
+        .unwrap();
+        assert!(matches!(plan.inbounds.as_slice(), [Inbound::Ebpf(_)]));
+        assert!(!plan.capture.on);
     }
 }

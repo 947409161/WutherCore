@@ -14,7 +14,7 @@ hide:
 
 Mixed、TUN、TPROXY、REDIRECT、Panel、Shadowsocks、WireGuard、Young、gRPC、REALITY 和 XHTTP 入站。
 
-全手册当前覆盖 **802 个字段**、**55 个枚举类型**。
+全手册当前覆盖 **816 个字段**、**55 个枚举类型**。
 行为说明和跨字段约束请同时阅读同分类下的人工手册页面。
 
 ## `Inbound`
@@ -27,8 +27,9 @@ Mixed、TUN、TPROXY、REDIRECT、Panel、Shadowsocks、WireGuard、Young、gRPC
 | `tun` | [TUN 全部字段](capture-runtime.md#tuninboundoptions) | `tag`、`enabled`、`traffic`、`dns_mode`、`stack`、`mtu`、`offload`、`exclude` |
 | `tproxy` | [透明入口共用字段](capture-runtime.md#tuninboundoptions) | `tag`、`enabled`、`traffic`、`dns_mode`、`stack`、`offload`、`exclude` |
 | `redirect` | [透明入口共用字段](capture-runtime.md#tuninboundoptions) | `tag`、`enabled`、`traffic`、`dns_mode`、`stack`、`offload`、`exclude` |
+| `ebpf` | [Aya eBPF 字段](#ebpfinboundoptions) | `tag`、`enabled`、`redirect_address`、`bypass_rule_set`、UID 过滤、`dns_mode`、策略路由与 map 容量 |
 
-每个 tag 必须唯一。当前运行时最多启用一个 Mixed，并且最多声明一个透明入口。
+每个 tag 必须唯一。当前运行时最多启用一个 Mixed，并且 tun、tproxy、redirect、ebpf 中最多启用一个宿主流量入口。
 
 ## `Listen`
 
@@ -247,28 +248,51 @@ Xray REALITY 服务端监听配置。 字段名同时接受 Xray 的 camelCase �
 
 `MixedInboundOptions` 配置对象。
 
-[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5413)
+[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5418)
 
 | YAML / JSON 字段 | 类型 | 必填与默认 | 兼容别名 | 取值 / 形态 | 解析与用途 |
 | --- | --- | --- | --- | --- | --- |
-| `tag` | `字符串` | 可选；由 `default_mixed_inbound_tag()` 决定 | 无 | 无 | 用于显示、日志和其它配置项引用的稳定名称。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5415) |
-| `enabled` | `布尔值` | 可选；默认 `true` | 无 | 无 | 控制该配置块是否启用；关闭时保留配置但不启动对应运行时能力。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5417) |
-| `listen` | `字符串` | 可选；默认 `127.0.0.1` | `host`<br>`bind` | 无 | `MixedInboundOptions` 的 `listen` 参数。解析类型为 `字符串`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5419) |
-| `listen_port` | `0-65535 整数` | 必填 | `listen-port`<br>`port` | 无 | 监听或连接使用的端口；`0` 是否允许由所在配置块校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5421) |
-| `udp` | `布尔值` | 可选；默认 `true` | 无 | 无 | `MixedInboundOptions` 的 `udp` 参数。解析类型为 `布尔值`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5423) |
-| `users` | `InboundUser 列表` | 可选；默认空 | 无 | 无 | `MixedInboundOptions` 的 `users` 参数。解析类型为 `InboundUser 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5426) |
-| `streamSettings` | `crate::NodeStreamSettings（可选）` | 可选；默认不设置 | `stream_settings` | 无 | `MixedInboundOptions` 的 `streamSettings` 参数。解析类型为 `crate::NodeStreamSettings（可选）`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5428) |
+| `tag` | `字符串` | 可选；由 `default_mixed_inbound_tag()` 决定 | 无 | 无 | 用于显示、日志和其它配置项引用的稳定名称。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5420) |
+| `enabled` | `布尔值` | 可选；默认 `true` | 无 | 无 | 控制该配置块是否启用；关闭时保留配置但不启动对应运行时能力。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5422) |
+| `listen` | `字符串` | 可选；默认 `127.0.0.1` | `host`<br>`bind` | 无 | `MixedInboundOptions` 的 `listen` 参数。解析类型为 `字符串`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5424) |
+| `listen_port` | `0-65535 整数` | 必填 | `listen-port`<br>`port` | 无 | 监听或连接使用的端口；`0` 是否允许由所在配置块校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5426) |
+| `udp` | `布尔值` | 可选；默认 `true` | 无 | 无 | `MixedInboundOptions` 的 `udp` 参数。解析类型为 `布尔值`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5428) |
+| `users` | `InboundUser 列表` | 可选；默认空 | 无 | 无 | `MixedInboundOptions` 的 `users` 参数。解析类型为 `InboundUser 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5431) |
+| `streamSettings` | `crate::NodeStreamSettings（可选）` | 可选；默认不设置 | `stream_settings` | 无 | `MixedInboundOptions` 的 `streamSettings` 参数。解析类型为 `crate::NodeStreamSettings（可选）`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5433) |
 
 ## `InboundUser`
 
 `InboundUser` 配置对象。
 
-[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5437)
+[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5442)
 
 | YAML / JSON 字段 | 类型 | 必填与默认 | 兼容别名 | 取值 / 形态 | 解析与用途 |
 | --- | --- | --- | --- | --- | --- |
-| `username` | `字符串` | 必填 | `user` | 无 | `InboundUser` 的 `username` 参数。解析类型为 `字符串`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5439) |
-| `password` | `字符串` | 必填 | `pass` | 无 | 敏感认证材料；不要写入公开仓库、日志或截图。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5441) |
+| `username` | `字符串` | 必填 | `user` | 无 | `InboundUser` 的 `username` 参数。解析类型为 `字符串`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5444) |
+| `password` | `字符串` | 必填 | `pass` | 无 | 敏感认证材料；不要写入公开仓库、日志或截图。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5446) |
+
+## `EbpfInboundOptions`
+
+Aya eBPF inbound. The cgroup programs select local TCP and UDP sockets by UID and destination, while an `sk_lookup` program assigns the packet to the proxy sockets without iptables, nftables, TPROXY, or destination NAT.
+
+[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5470)
+
+| YAML / JSON 字段 | 类型 | 必填与默认 | 兼容别名 | 取值 / 形态 | 解析与用途 |
+| --- | --- | --- | --- | --- | --- |
+| `tag` | `字符串` | 可选；默认 `ebpf-in` | 无 | 无 | 用于显示、日志和其它配置项引用的稳定名称。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5472) |
+| `enabled` | `布尔值` | 可选；默认 `true` | 无 | 无 | 控制该配置块是否启用；关闭时保留配置但不启动对应运行时能力。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5474) |
+| `redirect_address` | `字符串 列表` | 可选；默认 `vec!["127.128.0.0/9".into(), "2001:db8:2030::/64".into()]` | 无 | 无 | `EbpfInboundOptions` 的 `redirect_address` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5477) |
+| `bypass_rule_set` | `字符串 列表` | 可选；默认空 | 无 | 无 | `EbpfInboundOptions` 的 `bypass_rule_set` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5480) |
+| `include_uid` | `非负整数 列表` | 可选；默认空 | 无 | 无 | 包含/排除过滤条件；与同配置块其它过滤器的组合规则见对应语义手册。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5483) |
+| `include_uid_range` | `字符串 列表` | 可选；默认空 | 无 | 无 | 包含/排除过滤条件；与同配置块其它过滤器的组合规则见对应语义手册。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5486) |
+| `exclude_uid` | `非负整数 列表` | 可选；默认空 | 无 | 无 | 包含/排除过滤条件；与同配置块其它过滤器的组合规则见对应语义手册。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5489) |
+| `exclude_uid_range` | `字符串 列表` | 可选；默认空 | 无 | 无 | 包含/排除过滤条件；与同配置块其它过滤器的组合规则见对应语义手册。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5492) |
+| `cgroup_path` | `PathBuf` | 可选；默认 `PathBuf::from("/sys/fs/cgroup")` | 无 | 无 | 文件或 URL 路径；相对路径按运行进程的工作目录解析。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5494) |
+| `route_table` | `非负整数` | 可选；由 `default_ebpf_route_table()` 决定 | 无 | 无 | `EbpfInboundOptions` 的 `route_table` 参数。解析类型为 `非负整数`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5496) |
+| `rule_priority` | `非负整数` | 可选；由 `default_ebpf_rule_priority()` 决定 | 无 | 无 | `EbpfInboundOptions` 的 `rule_priority` 参数。解析类型为 `非负整数`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5498) |
+| `mark` | `非负整数` | 可选；由 `default_ebpf_mark()` 决定 | 无 | 无 | `EbpfInboundOptions` 的 `mark` 参数。解析类型为 `非负整数`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5500) |
+| `map_capacity` | `非负整数` | 可选；由 `default_ebpf_map_capacity()` 决定 | 无 | 无 | `EbpfInboundOptions` 的 `map_capacity` 参数。解析类型为 `非负整数`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5502) |
+| `dns_mode` | `CaptureResolver` | 可选；默认 `hijack` | `dns-mode` | 无 | `EbpfInboundOptions` 的 `dns_mode` 参数。解析类型为 `CaptureResolver`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5508) |
 
 ## 本分类枚举
 

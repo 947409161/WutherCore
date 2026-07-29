@@ -1,0 +1,16 @@
+name: Setup Aya eBPF build tools
+description: Install the nightly rust-src component and cached bpf-linker used by core-inbound.
+
+runs:
+  using: composite
+  steps:
+    - name: Install nightly rust-src
+      uses: dtolnay/rust-toolchain@nightly
+      with:
+        toolchain: nightly
+        components: rust-src
+
+    - name: Install bpf-linker
+      uses: taiki-e/install-action@v2.85.2
+      with:
+        tool: bpf-linker@0.10.4

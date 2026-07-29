@@ -51,6 +51,7 @@ all_components = ["standard", "with_naive"]
 # Runtime components.
 with_api = ["dep:core-api"]
 with_tun = ["core-inbound/with_tun", "core-api?/with_tun"]
+with_ebpf = ["core-inbound/with_ebpf"]
 
 # Transport/capability tags.
 with_quic = ["core-outbound/with_quic"]

@@ -346,6 +346,7 @@ fn compiled_component_tags() -> Vec<&'static str> {
         };
     }
     push_tag!("with_api");
+    push_tag!("with_ebpf");
     push_tag!("with_tun");
     push_tag!("with_anytls");
     push_tag!("with_grpc");
@@ -449,6 +450,12 @@ fn validate_compiled_components(
     );
     if plan.capture.on && !cfg!(feature = "with_tun") {
         anyhow::bail!("capture/TUN is configured but not compiled in; rebuild with `with_tun`");
+    }
+    if plan.inbounds.iter().any(
+        |inbound| matches!(inbound, core_config::model::Inbound::Ebpf(options) if options.enabled),
+    ) && !cfg!(feature = "with_ebpf")
+    {
+        anyhow::bail!("eBPF inbound is configured but not compiled in; rebuild with `with_ebpf`");
     }
     if plan.ui.on && !cfg!(feature = "with_api") {
         anyhow::bail!("API/UI is configured but not compiled in; rebuild with `with_api`");
@@ -2137,6 +2144,37 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
         info!(addr = %address, %service, "VLESS-over-gRPC inbound ready");
     }
 
+    #[cfg(feature = "with_ebpf")]
+    let mut ebpf_inbound = {
+        let options = plan.inbounds.iter().find_map(|inbound| match inbound {
+            core_config::model::Inbound::Ebpf(options) if options.enabled => Some(options.clone()),
+            _ => None,
+        });
+        if let Some(options) = options {
+            let provider: Arc<dyn core_inbound::ebpf::EbpfRuleSetProvider> = ruleset_index.clone();
+            match core_inbound::ebpf::start_ebpf_inbound(options, runtime.clone(), Some(provider))
+                .await
+            {
+                Ok(handle) => Some(handle),
+                Err(error) => {
+                    if let Err(cleanup_error) = mesh_supervisor.stop().await {
+                        warn!(
+                            target: "mesh",
+                            error = %cleanup_error,
+                            "mesh stop failed while rolling back eBPF inbound startup"
+                        );
+                    }
+                    feed_mgr_handle.stop();
+                    _ruleset_mgr_handle.stop();
+                    runtime.shutdown().await;
+                    return Err(anyhow::anyhow!("eBPF inbound startup failed: {error}"));
+                }
+            }
+        } else {
+            None
+        }
+    };
+
     // 控制面板/API
     #[cfg(feature = "with_api")]
     if plan.ui.on {
@@ -2193,6 +2231,12 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
         if let Err(e) = sup.stop().await {
             warn!(target: "capture", error = %e, "capture stop failed");
         }
+    }
+    #[cfg(feature = "with_ebpf")]
+    if let Some(handle) = ebpf_inbound.take()
+        && let Err(error) = handle.shutdown().await
+    {
+        warn!(target: "inbound::ebpf", %error, "eBPF inbound shutdown failed");
     }
     #[cfg(feature = "with_wireguard")]
     for (server, dispatcher) in wireguard_inbounds {

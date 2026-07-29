@@ -5359,6 +5359,7 @@ pub enum Inbound {
     Tun(TransparentInboundOptions),
     Tproxy(TransparentInboundOptions),
     Redirect(TransparentInboundOptions),
+    Ebpf(EbpfInboundOptions),
 }
 
 impl Inbound {
@@ -5366,6 +5367,7 @@ impl Inbound {
         match self {
             Self::Mixed(options) => &options.tag,
             Self::Tun(options) | Self::Tproxy(options) | Self::Redirect(options) => &options.tag,
+            Self::Ebpf(options) => &options.tag,
         }
     }
 
@@ -5373,6 +5375,7 @@ impl Inbound {
         match self {
             Self::Mixed(options) => options.enabled,
             Self::Tun(options) | Self::Tproxy(options) | Self::Redirect(options) => options.enabled,
+            Self::Ebpf(options) => options.enabled,
         }
     }
 
@@ -5382,6 +5385,7 @@ impl Inbound {
             Self::Tun(_) => "tun",
             Self::Tproxy(_) => "tproxy",
             Self::Redirect(_) => "redirect",
+            Self::Ebpf(_) => "ebpf",
         }
     }
 
@@ -5390,6 +5394,7 @@ impl Inbound {
             Self::Tun(options) => (CaptureMethod::VirtualNic, options),
             Self::Tproxy(options) => (CaptureMethod::Tproxy, options),
             Self::Redirect(options) => (CaptureMethod::Redirect, options),
+            Self::Ebpf(_) => return None,
             Self::Mixed(_) => return None,
         };
         Some(Capture {
@@ -5452,6 +5457,83 @@ pub struct TransparentInboundOptions {
     pub offload: bool,
     pub exclude: CaptureExclude,
     pub tun: TunInboundOptions,
+}
+
+/// Aya eBPF inbound.
+///
+/// The cgroup programs select local TCP and UDP sockets by UID and destination,
+/// while an `sk_lookup` program assigns the packet to the proxy sockets without
+/// iptables, nftables, TPROXY, or destination NAT.
+#[serde_as]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EbpfInboundOptions {
+    #[serde(default = "default_ebpf_inbound_tag")]
+    pub tag: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
+    #[serde(default = "default_ebpf_redirect_address")]
+    pub redirect_address: Vec<String>,
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
+    #[serde(default)]
+    pub bypass_rule_set: Vec<String>,
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
+    #[serde(default)]
+    pub include_uid: Vec<u32>,
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
+    #[serde(default)]
+    pub include_uid_range: Vec<String>,
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
+    #[serde(default)]
+    pub exclude_uid: Vec<u32>,
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
+    #[serde(default)]
+    pub exclude_uid_range: Vec<String>,
+    #[serde(default = "default_ebpf_cgroup_path")]
+    pub cgroup_path: PathBuf,
+    #[serde(default = "default_ebpf_route_table")]
+    pub route_table: u32,
+    #[serde(default = "default_ebpf_rule_priority")]
+    pub rule_priority: u32,
+    #[serde(default = "default_ebpf_mark")]
+    pub mark: u32,
+    #[serde(default = "default_ebpf_map_capacity")]
+    pub map_capacity: u32,
+    #[serde(
+        default = "default_capture_resolver",
+        rename = "dns_mode",
+        alias = "dns-mode"
+    )]
+    pub resolver: CaptureResolver,
+}
+
+fn default_ebpf_inbound_tag() -> String {
+    "ebpf-in".into()
+}
+
+fn default_ebpf_redirect_address() -> Vec<String> {
+    vec!["127.128.0.0/9".into(), "2001:db8:2030::/64".into()]
+}
+
+fn default_ebpf_cgroup_path() -> PathBuf {
+    PathBuf::from("/sys/fs/cgroup")
+}
+
+const fn default_ebpf_route_table() -> u32 {
+    0x2d1
+}
+
+const fn default_ebpf_rule_priority() -> u32 {
+    8999
+}
+
+const fn default_ebpf_mark() -> u32 {
+    0x2d1
+}
+
+const fn default_ebpf_map_capacity() -> u32 {
+    65_536
 }
 
 #[derive(Serialize, Deserialize)]
@@ -5543,8 +5625,13 @@ impl<'de> Deserialize<'de> for Inbound {
             "redirect" => transparent_inbound_from_fields("redirect", raw.fields)
                 .map(Self::Redirect)
                 .map_err(serde::de::Error::custom),
+            "ebpf" => {
+                serde_json::from_value(serde_json::Value::Object(raw.fields.into_iter().collect()))
+                    .map(Self::Ebpf)
+                    .map_err(serde::de::Error::custom)
+            }
             _ => Err(serde::de::Error::custom(format!(
-                "unsupported inbound type `{}`; supported types: mixed, tun, tproxy, redirect",
+                "unsupported inbound type `{}`; supported types: mixed, tun, tproxy, redirect, ebpf",
                 raw.kind
             ))),
         }
@@ -5606,6 +5693,17 @@ impl Serialize for Inbound {
                 kind: self.kind().into(),
                 fields: transparent_inbound_fields(options).map_err(serde::ser::Error::custom)?,
             },
+            Self::Ebpf(options) => {
+                let fields =
+                    match serde_json::to_value(options).map_err(serde::ser::Error::custom)? {
+                        serde_json::Value::Object(fields) => fields.into_iter().collect(),
+                        _ => BTreeMap::new(),
+                    };
+                RawInbound {
+                    kind: "ebpf".into(),
+                    fields,
+                }
+            }
         };
         raw.serialize(serializer)
     }
@@ -6313,6 +6411,39 @@ fn default_tailscale_mode() -> TailscaleMode {
 #[cfg(test)]
 mod xhttp_config_tests {
     use super::*;
+
+    #[test]
+    fn ebpf_is_a_flat_canonical_inbound() {
+        let inbound: Inbound = serde_yaml::from_str(
+            r#"
+type: ebpf
+tag: ebpf-root
+redirect_address:
+  - 127.128.0.0/9
+bypass_rule_set: cnip
+include_uid: [1000, 1001]
+include_uid_range: "10000:19999"
+exclude_uid: 0
+dns_mode: hijack
+"#,
+        )
+        .unwrap();
+        let Inbound::Ebpf(options) = &inbound else {
+            panic!("expected an eBPF inbound");
+        };
+        assert_eq!(options.tag, "ebpf-root");
+        assert_eq!(options.bypass_rule_set, ["cnip"]);
+        assert_eq!(options.include_uid, [1000, 1001]);
+        assert_eq!(options.include_uid_range, ["10000:19999"]);
+        assert_eq!(options.exclude_uid, [0]);
+        assert!(inbound.transparent_capture().is_none());
+
+        let canonical = serde_json::to_value(inbound).unwrap();
+        assert_eq!(canonical["type"], "ebpf");
+        assert_eq!(canonical["tag"], "ebpf-root");
+        assert!(canonical.get("capture").is_none());
+        assert!(canonical.get("tun").is_none());
+    }
 
     #[test]
     fn capture_mtu_is_non_zero_and_bounded_by_platform_width() {

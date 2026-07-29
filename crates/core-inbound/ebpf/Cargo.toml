@@ -1,0 +1,24 @@
+[workspace]
+
+[package]
+name = "core-inbound-ebpf"
+version = "0.3.7"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+aya-ebpf = { version = "0.2.1", default-features = false }
+
+[build-dependencies]
+which = "8"
+
+[[bin]]
+name = "core-inbound-ebpf"
+path = "src/main.rs"
+
+[profile.release]
+debug = 2
+codegen-units = 1
+strip = false
+lto = "off"
+

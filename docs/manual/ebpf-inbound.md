@@ -1,0 +1,166 @@
+---
+title: Aya eBPF 入站
+description: Linux 与 Android root 的无 netfilter 流量接管、UID 过滤、规则集旁路和 DNS 劫持
+---
+
+# Aya eBPF 入站
+
+Aya eBPF 入站属于 `core-inbound`。配置直接写在 `inbounds`，不会转换成
+`capture`，也不会调用 `core-capture` 的 TUN、TPROXY 或 REDIRECT 后端。
+
+## 数据路径
+
+本机进程创建 TCP 连接或发送 UDP 数据时，挂在 cgroup v2 的 connect4、
+connect6、sendmsg4 和 sendmsg6 程序读取 UID、TGID、目标地址和目标端口。
+符合条件的 socket 获得专用 mark。对应的 IPv4 或 IPv6 策略路由把带 mark 的
+包送到本机 local route。挂在当前 network namespace 的 sk_lookup 程序只接受
+从 loopback 策略路由返回的包，再把 TCP 或 UDP 包分配给 `core-inbound` 持有的
+透明 socket。物理接口进入的真实服务流量不会被该程序接管。
+
+核心进程自身的 TGID 始终旁路，避免出站再次进入 eBPF 入站。回环、链路本地、
+RFC1918、CGNAT、ULA、组播、广播、redirect 地址和宿主接口地址也会进入内核
+LPM 旁路集合。配置的规则集前缀与这些安全前缀合并。
+
+TCP 保留原始目标地址并进入统一 `ListenerHandler`。UDP 按来源和目标建立会话，
+响应使用 `IP_TRANSPARENT` socket 以原始目标作为源地址发回应用。连接表、规则
+匹配、策略组、上传和下载统计继续使用核心运行时的统一实现。
+
+## 完整配置
+
+```yaml
+inbounds:
+  - type: ebpf
+    tag: ebpf-in
+    enabled: true
+
+    redirect_address:
+      - 127.128.0.0/9
+      - 2001:db8:2030::/64
+
+    bypass_rule_set:
+      - geoip-cn
+
+    include_uid: []
+    include_uid_range:
+      - "10000:19999"
+    exclude_uid:
+      - 0
+    exclude_uid_range: []
+
+    cgroup_path: /sys/fs/cgroup
+    route_table: 721
+    rule_priority: 8999
+    mark: 721
+    map_capacity: 65536
+    dns_mode: hijack
+```
+
+字段语义：
+
+| 字段 | 行为 |
+| --- | --- |
+| `tag` | 路由、连接表、日志和 API 使用的入站名称 |
+| `enabled` | 保留配置但不启动该入口 |
+| `redirect_address` | 为每个启用地址族提供内部透明 socket 锚点，至少一个 CIDR |
+| `bypass_rule_set` | 在 cgroup 层直接旁路的目标 IP 规则集 |
+| `include_uid` | 只接管列出的单个 UID |
+| `include_uid_range` | 只接管 `start:end` 闭区间中的 UID |
+| `exclude_uid` | 不接管列出的单个 UID，优先级高于包含条件 |
+| `exclude_uid_range` | 不接管 `start:end` 闭区间中的 UID |
+| `cgroup_path` | Aya cgroup sock_addr 程序的挂载点 |
+| `route_table` | 带 mark 流量使用的独立策略路由表 |
+| `rule_priority` | fwmark rule 优先级，必须排在 main rule 之前 |
+| `mark` | eBPF 写入 socket 的非零 mark |
+| `map_capacity` | 每个 UID hash map 和每个 IP LPM map 的容量 |
+| `dns_mode` | `hijack` 接管 TCP/UDP 53，`off` 按普通流量处理 |
+
+包含 UID 列表和区间都为空时，默认接管所有 UID。精确 UID 和区间可以同时使用，
+两者是并集。任何排除条件命中后都不会接管。
+
+## 规则集同步
+
+`bypass_rule_set` 通过共享的 `RulesetIndex` 获取一个版本一致的快照。以下状态会
+让启动直接失败：
+
+| 状态 | 处理 |
+| --- | --- |
+| 名称不存在 | 报错，不启动 |
+| 首次下载失败 | 报错，不启动 |
+| 仍在加载 | 报错，不启动 |
+| 仅包含域名 | 报错，不启动 |
+| IP 范围展开超过限制 | 报错，不启动 |
+| 合并前缀超过 `map_capacity` | 报错，不启动 |
+
+运行中刷新采用双 LPM map。新快照完整写入非活动 map，随后通过一次 CONFIG map
+更新切换活动 bank。写入失败时继续使用旧快照。该过程不会先清空正在使用的规则。
+
+## DNS 劫持
+
+`dns_mode: hijack` 对 UID 和进程过滤范围内的 TCP 53 与 UDP 53 生效。DNS 接管
+优先于目标地址旁路，因此公开 DNS 地址即使位于 `bypass_rule_set` 中也仍会进入
+核心 DNS 服务。核心 DNS 服务继续执行 nameserver policy、Fake IP、缓存和地址到
+域名映射。
+
+`dns_mode: off` 不做这项特殊处理。DNS 流量是否进入普通代理路径取决于目标地址
+旁路和路由规则。
+
+## 构建
+
+```bash
+rustup toolchain install nightly --component rust-src --profile minimal
+cargo install bpf-linker --version 0.10.4 --locked
+
+cargo build --release -p wuther-core \
+  --no-default-features \
+  --features "with_ebpf,with_api"
+```
+
+`with_ebpf` 只支持 Linux 和 Android 目标。构建脚本使用稳定工具链编译用户态核心，
+并通过 Aya 在构建期间调用 nightly、rust-src 和 bpf-linker 生成嵌入式 eBPF ELF。
+GitHub Build Matrix 在选择该标签时会安装并缓存同一套工具。
+
+## 系统要求
+
+目标系统需要：
+
+- Linux 或 Android root 环境
+- cgroup v2 挂载点
+- 支持 cgroup sock_addr 与 sk_lookup 的内核
+- 可加载 BPF 程序和创建 BPF map 的权限
+- 修改策略路由、socket mark 与透明 socket 的权限
+
+sk_lookup 需要 Linux 5.9 或更新内核。Android 厂商内核还可能单独关闭 BPF 程序
+类型或限制未签名 BPF 加载。Aya 返回的 verifier 日志和 attach 错误会作为启动错误
+输出，入口不会降级到其它接管方式。
+
+## 启动与清理
+
+启动顺序是加载 map 和程序、绑定透明 socket、挂载 sk_lookup、安装策略路由、
+最后挂载 cgroup 程序。只有最后一步完成后应用流量才会获得 mark。
+
+关闭时顺序相反。核心先移除 cgroup 程序，阻止新 socket 进入，再删除策略路由，
+移除 sk_lookup，停止 TCP 和 UDP relay。启动失败会回滚已经完成的步骤。进程异常
+退出后 BPF link 随文件描述符关闭，下一次启动还会删除该 tag 配置对应的旧策略
+路由状态。
+
+## 诊断
+
+先确认二进制包含组件：
+
+```bash
+wuther-core components
+```
+
+输出必须包含 `with_ebpf`。常见错误对应关系：
+
+| 错误 | 检查 |
+| --- | --- |
+| 打开 cgroup 失败 | `cgroup_path` 是否存在，是否为 cgroup v2 |
+| 加载或 verifier 失败 | 内核 BPF 配置、程序类型和权限 |
+| 创建透明 socket 失败 | root 或网络管理能力，redirect 地址格式 |
+| 安装 fwmark rule 失败 | `route_table`、`rule_priority`、外部策略路由冲突 |
+| 规则集不可用 | 规则集 URL、缓存、格式、类型和首次刷新日志 |
+| map 容量不足 | 增大 `map_capacity`，或缩小旁路规则集 |
+
+完整可运行文件见仓库中的
+[`examples/advanced/linux-ebpf.yaml`](https://github.com/MiChongs/WutherCore/blob/main/examples/advanced/linux-ebpf.yaml)。

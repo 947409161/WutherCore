@@ -204,6 +204,10 @@ jobs:
           targets: ${{ matrix.platform.target }}
           cache-targets: true
 
+      - name: Setup Aya eBPF build tools
+        if: steps.components.outputs.ebpf == 'true'
+        uses: ./.github/actions/setup-ebpf
+
       - name: Build Linux binary
         shell: bash
         env:
@@ -325,6 +329,10 @@ jobs:
           cache-key: build-${{ matrix.platform.target }}-${{ steps.components.outputs.key }}
           targets: ${{ matrix.platform.target }}
           cache-targets: true
+
+      - name: Setup Aya eBPF build tools
+        if: steps.components.outputs.ebpf == 'true'
+        uses: ./.github/actions/setup-ebpf
 
       - name: Setup Android NDK
         id: ndk

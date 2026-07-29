@@ -511,6 +511,7 @@ def category_for(name: str, source: Path) -> str:
         "Inbound",
         "InboundUser",
         "MixedInboundOptions",
+        "EbpfInboundOptions",
         "TransparentInboundOptions",
         "Listen",
         "PanelBind",
@@ -781,8 +782,9 @@ def render_category(
                 "| `tun` | [TUN 全部字段](capture-runtime.md#tuninboundoptions) | `tag`、`enabled`、`traffic`、`dns_mode`、`stack`、`mtu`、`offload`、`exclude` |",
                 "| `tproxy` | [透明入口共用字段](capture-runtime.md#tuninboundoptions) | `tag`、`enabled`、`traffic`、`dns_mode`、`stack`、`offload`、`exclude` |",
                 "| `redirect` | [透明入口共用字段](capture-runtime.md#tuninboundoptions) | `tag`、`enabled`、`traffic`、`dns_mode`、`stack`、`offload`、`exclude` |",
+                "| `ebpf` | [Aya eBPF 字段](#ebpfinboundoptions) | `tag`、`enabled`、`redirect_address`、`bypass_rule_set`、UID 过滤、`dns_mode`、策略路由与 map 容量 |",
                 "",
-                "每个 tag 必须唯一。当前运行时最多启用一个 Mixed，并且最多声明一个透明入口。",
+                "每个 tag 必须唯一。当前运行时最多启用一个 Mixed，并且 tun、tproxy、redirect、ebpf 中最多启用一个宿主流量入口。",
                 "",
             ]
         )

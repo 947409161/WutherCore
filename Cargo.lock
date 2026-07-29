@@ -394,6 +394,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "assert_matches"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b34d609dfbaf33d6889b2b7106d3ca345eacad44200913df5ba02bfd31d2ba9"
+
+[[package]]
 name = "assoc"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -532,6 +538,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "aya"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "66e644424fada9fff4fdc63848db1732fb69b626e8328202ef55c03df1f4d939"
+dependencies = [
+ "assert_matches",
+ "aya-obj",
+ "bitflags 2.13.1",
+ "hashbrown 0.17.1",
+ "libc",
+ "log",
+ "object 0.39.1",
+ "once_cell",
+ "scopeguard",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "aya-build"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "609b414caa508f04d2dbbc9481ad6869f43ab9ab1dc9abd237fca27c0818f663"
+dependencies = [
+ "anyhow",
+ "cargo_metadata",
+ "rustc_version",
+ "which 8.0.5",
+]
+
+[[package]]
+name = "aya-obj"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c76b9c75d9cdc155ff8f6a06d61e873f67bf47be8cfa92a3b5aaea43f4b4077"
+dependencies = [
+ "bytes",
+ "log",
+ "object 0.39.1",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "backtrace"
 version = "0.3.76"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -541,7 +589,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "miniz_oxide",
- "object",
+ "object 0.37.3",
  "rustc-demangle",
  "windows-link 0.2.1",
 ]
@@ -650,7 +698,7 @@ dependencies = [
  "rustc-hash 1.1.0",
  "shlex 1.3.0",
  "syn 2.0.119",
- "which",
+ "which 4.4.2",
 ]
 
 [[package]]
@@ -978,12 +1026,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "camino"
+version = "1.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb1307f12aa967b5a58416e87b3653360e0fd614a016b6e970db08fecbb1b80d"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
 name = "caps"
 version = "0.5.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fd1ddba47aba30b6a889298ad0109c3b8dcb0e8fc993b459daa7067d46f865e0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "cargo-platform"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd0061da739915fae12ea00e16397555ed4371a6bb285431aab930f61b0aa4ba"
+dependencies = [
+ "serde",
+ "serde_core",
+]
+
+[[package]]
+name = "cargo_metadata"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef987d17b0a113becdd19d3d0022d04d7ef41f9efe4f3fb63ac44ba61df3ade9"
+dependencies = [
+ "camino",
+ "cargo-platform",
+ "semver",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -1519,6 +1600,8 @@ version = "0.3.7"
 dependencies = [
  "anyhow",
  "async-trait",
+ "aya",
+ "aya-build",
  "base64 0.23.0",
  "boring",
  "boring-sys",
@@ -1532,8 +1615,10 @@ dependencies = [
  "core-reality",
  "core-resolver",
  "core-route",
+ "core-ruleset",
  "core-runtime",
  "core-smart",
+ "dashmap",
  "futures",
  "h2",
  "h3",
@@ -1543,6 +1628,8 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "ipnet",
+ "libc",
  "nix 0.31.3",
  "ocsp-stapler",
  "parking_lot",
@@ -1552,9 +1639,11 @@ dependencies = [
  "rasn-ocsp",
  "rasn-pkix",
  "rcgen",
+ "rtnetlink",
  "rustls",
  "rustls-pemfile",
  "serde",
+ "serde_json",
  "sha1 0.11.0",
  "shadowsocks",
  "subtle",
@@ -3256,6 +3345,10 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "equivalent",
+ "foldhash 0.2.0",
+]
 
 [[package]]
 name = "heapless"
@@ -4784,7 +4877,7 @@ dependencies = [
  "strum 0.27.2",
  "thiserror 2.0.19",
  "toml 0.9.12+spec-1.1.0",
- "windows 0.61.3",
+ "windows 0.62.2",
  "zeroize",
 ]
 
@@ -4919,6 +5012,18 @@ version = "0.37.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff76201f031d8863c38aa7f905eca4f53abbfa15f609db4277d44cd8938f33fe"
 dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "object"
+version = "0.39.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e5a6c098c7a3b6547378093f5cc30bc54fd361ce711e05293a5cc589562739b"
+dependencies = [
+ "crc32fast",
+ "hashbrown 0.17.1",
+ "indexmap 2.14.0",
  "memchr",
 ]
 
@@ -6600,6 +6705,10 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
+dependencies = [
+ "serde",
+ "serde_core",
+]
 
 [[package]]
 name = "sendfd"
@@ -8516,6 +8625,15 @@ dependencies = [
  "home",
  "once_cell",
  "rustix 0.38.44",
+]
+
+[[package]]
+name = "which"
+version = "8.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f3ef584124b911bcc3875c2f1472e80f24361ceb789bd1c62b3e9a3df9ff43c"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
