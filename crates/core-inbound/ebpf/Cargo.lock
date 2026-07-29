@@ -99,7 +99,7 @@ dependencies = [
 
 [[package]]
 name = "core-inbound-ebpf"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "aya-ebpf",
  "which",

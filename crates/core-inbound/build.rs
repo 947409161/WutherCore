@@ -1,11 +1,10 @@
+#[cfg(feature = "with_ebpf")]
 use std::path::PathBuf;
 
+#[cfg(feature = "with_ebpf")]
 fn main() -> anyhow::Result<()> {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_WITH_EBPF");
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_OS");
-    if std::env::var_os("CARGO_FEATURE_WITH_EBPF").is_none() {
-        return Ok(());
-    }
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if !matches!(target_os.as_str(), "linux" | "android") {
         anyhow::bail!("with_ebpf only supports Linux and Android targets");
@@ -26,4 +25,10 @@ fn main() -> anyhow::Result<()> {
         }],
         aya_build::Toolchain::default(),
     )
+}
+
+#[cfg(not(feature = "with_ebpf"))]
+fn main() {
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_WITH_EBPF");
+    println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_OS");
 }

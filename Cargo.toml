@@ -24,6 +24,7 @@ members = [
     "tests-e2e",
 ]
 exclude = [
+    "third_party/aya-0.14.0",
     "third_party/h3-c38a1af/h3",
     "third_party/nss-rs-b7cfa30",
     "third_party/shaped-rustls-94f088e",
@@ -226,6 +227,11 @@ xray-transport = { path = "third_party/xray-transport" }
 xray-utls     = { git = "https://github.com/aimalygin/xray-rust.git", rev = "bb3e00da1abfc5fff70487b0dd2ba16054797584", package = "xray-utls" }
 
 [patch.crates-io]
+# aya 0.14.0 assumes socklen_t is u32. Android's 32-bit bionic defines it as
+# i32, so the upstream crate does not compile for armv7-linux-androideabi.
+# Keep an otherwise identical local copy and cast through libc::socklen_t.
+aya = { path = "third_party/aya-0.14.0" }
+
 # REALITY 必须在同一个真实 ClientHello 上完成 session-id 封装并继续握手；
 # XHTTP 的 uTLS/ECH 也依赖精确扩展塑形。上游 rustls 没有这些 finalizer/
 # customizer hook，因此固定使用经过审阅的同 revision 本地源码。
