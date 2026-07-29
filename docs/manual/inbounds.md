@@ -125,6 +125,7 @@ inbounds:
       include_source_address: [0.0.0.0/0, "::/0"]
       exclude_source_address: []
       interface_refresh_interval: 3s
+      packet_stats: false
       tc_priority: 1
     dns_mode: hijack
 ```
@@ -134,6 +135,9 @@ inbounds:
 先写入备用 LPM map，全部成功后再切换活动 map，因此运行流量不会看到半份规则。
 `dns_mode: hijack` 同时接管 UDP 和 TCP 53，并交给核心 DNS 服务处理。
 共享接口按 glob 动态发现，Android 开关热点或 USB 共享后无需重启核心。
+默认的全地址源规则使用内核快速路径，不执行源地址 LPM 查询。逐包 TC 诊断统计
+默认关闭，避免热点大流量时为每个包写统计 Map；需要排障时可设置
+`packet_stats: true`。
 
 该入口要求 `with_ebpf` 组件、root 或等价的 BPF 与网络管理能力、cgroup v2，
 以及支持 cgroup sock_addr 和 sk_lookup 的内核。完整部署、字段语义和诊断方法见

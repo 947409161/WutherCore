@@ -49,6 +49,7 @@ inbounds:
         - ::/0
       exclude_source_address: []
       interface_refresh_interval: 3s
+      packet_stats: false
       tc_priority: 1
     dns_mode: hijack
 

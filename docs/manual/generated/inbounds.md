@@ -14,7 +14,7 @@ hide:
 
 Mixed、TUN、TPROXY、REDIRECT、Panel、Shadowsocks、WireGuard、Young、gRPC、REALITY 和 XHTTP 入站。
 
-全手册当前覆盖 **824 个字段**、**55 个枚举类型**。
+全手册当前覆盖 **825 个字段**、**55 个枚举类型**。
 行为说明和跨字段约束请同时阅读同分类下的人工手册页面。
 
 ## `Inbound`
@@ -309,7 +309,8 @@ Forwarded-device capture for Linux routers and Android hotspot/tethering. The TC
 | `include_source_address` | `字符串 列表` | 可选；默认 `vec!["0.0.0.0/0".into(), "::/0".into()]` | 无 | 无 | Source CIDRs accepted from selected downstream interfaces. An empty list accepts every source address. [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5546) |
 | `exclude_source_address` | `字符串 列表` | 可选；默认 空 | 无 | 无 | Source CIDRs bypassed before the include set is evaluated. [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5550) |
 | `interface_refresh_interval` | `时长` | 可选；由 `default_ebpf_interface_refresh_interval()` 决定 | 无 | 无 | Polling interval used to attach newly created hotspot interfaces and detach interfaces removed by Android or Linux network management. [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5557) |
-| `tc_priority` | `0-65535 整数` | 可选；由 `default_ebpf_tc_priority()` 决定 | 无 | 无 | Legacy clsact filter priority. Lower values run before tethering offload. [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5560) |
+| `packet_stats` | `布尔值` | 可选；默认 `false` | 无 | 无 | Collect per-packet TC diagnostics for shared-network traffic. Disabled by default because updating a BPF counter for every forwarded packet adds measurable CPU cost on mobile hotspots. Flow-level lookup and local socket counters remain available when this is disabled. [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5564) |
+| `tc_priority` | `0-65535 整数` | 可选；由 `default_ebpf_tc_priority()` 决定 | 无 | 无 | Legacy clsact filter priority. Lower values run before tethering offload. [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5567) |
 
 ## 本分类枚举
 

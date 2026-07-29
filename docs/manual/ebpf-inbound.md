@@ -89,6 +89,7 @@ inbounds:
         - ::/0
       exclude_source_address: []
       interface_refresh_interval: 3s
+      packet_stats: false
       tc_priority: 1
 
     dns_mode: hijack
@@ -131,11 +132,18 @@ NAT 或修改系统 IP forwarding。Android 系统、NetworkManager、hostapd �
 | `include_source_address` | 允许接管的下游源 CIDR；空列表表示任意源地址 |
 | `exclude_source_address` | 不接管的源 CIDR，优先级高于包含地址 |
 | `interface_refresh_interval` | 接口重扫周期，范围 `1s..=5m` |
+| `packet_stats` | 记录共享网络逐包诊断计数，默认关闭以降低热点高流量时的 CPU 开销 |
 | `tc_priority` | 旧内核 clsact 挂载的 TC 优先级，数值越小越先执行 |
 
 接口会按刷新周期重新扫描。Android 开启或关闭 Wi-Fi 热点、USB 网络共享、蓝牙
 网络共享时，不需要重启核心。Linux 新增或删除 bridge、AP 和有线下游接口也会
 自动挂载或卸载。
+
+源地址条件会在加载时按 IPv4 和 IPv6 分别编译。空列表及 `0.0.0.0/0`、
+`::/0` 使用无 LPM 查询的放行快速路径，空排除列表不会触发排除 Map 查询。
+`packet_stats` 默认关闭，因此 TC 不会为每个转发包更新统计 Map。连接级重定向、
+失败计数和本机进程统计仍会保留。只有排查源地址过滤或不支持协议时才建议临时
+开启逐包统计。
 
 Linux 6.6 及更新内核优先使用 TCX，并把程序放在已有 TCX 链的前面。旧内核自动
 使用 clsact direct-action，`tc_priority` 默认 1，使接管发生在常见硬件 offload
