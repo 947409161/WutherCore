@@ -160,6 +160,13 @@ runs:
         # same way in its own build-all.sh.
         sed -i'' 's/if test -z "$android_ndk" ; then/$as_echo "#define ANDROID 1" >>confdefs.h\n    ;;\nunreachable)\n    if test -z "$android_ndk" ; then/g' nspr/configure
 
+        # build-nss-android.sh puts its gyp and NSPR trees in `mktemp -d`
+        # directories it never reports back. Point TMPDIR somewhere we own so
+        # the archives it does not copy can still be recovered below.
+        export TMPDIR="$ROOT/tmp"
+        rm -rf "$TMPDIR"
+        mkdir -p "$TMPDIR"
+
         staging="$ROOT/staging"
         rm -rf "$staging"
         ./build-nss-android.sh "$ROOT" "$staging" "$toolchain_path" "$TOOLCHAIN" "$API_LEVEL"
@@ -172,7 +179,17 @@ runs:
         cp -a "$staging/lib/." dist/Release/lib/
         cp -a "$staging/include/nss" dist/Release/include/nspr
         cp -a "$staging/include/nss" dist/public/nss
-        rm -rf "$staging"
+
+        # That script copies a fixed list of archives, which omits ones its own
+        # consumers get elsewhere -- libsqlite.a among them, and nss-rs's
+        # static_link() asks for sqlite on every target except macOS. Take
+        # whatever else the build produced without disturbing the curated copies.
+        while IFS= read -r archive; do
+          name="$(basename "$archive")"
+          [ -f "dist/Release/lib/$name" ] || cp -aL "$archive" "dist/Release/lib/$name"
+        done < <(find "$TMPDIR" -type f -name 'lib*.a')
+
+        rm -rf "$staging" "$TMPDIR"
 
         # Sanity-check the archives nss-rs's static_link() will ask for.
         for lib in nspr4 plc4 plds4 nssutil nss_static ssl softokn_static freebl_static sqlite; do

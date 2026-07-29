@@ -107,7 +107,9 @@ runs:
           -w /work \
           "$ALPINE_IMAGE" \
           sh -euc '
-            apk add --no-cache build-base python3 py3-pip ninja perl linux-headers zlib-dev
+            # NSS build.sh and its coreconf helpers are bash scripts; Alpine
+            # only ships busybox ash by default.
+            apk add --no-cache bash build-base python3 py3-pip ninja perl linux-headers zlib-dev
             python3 -m pip install --break-system-packages --no-input "gyp-next==0.22.2"
             ./nss/build.sh \
               -Ddisable_tests=1 \
