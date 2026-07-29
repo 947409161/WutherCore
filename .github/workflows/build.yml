@@ -484,20 +484,6 @@ jobs:
       # executable keeps a load-time dependency on nss3.dll and friends even
       # though nss-rs asks for the static archives. Ship them beside the binary
       # exactly as the Linux and macOS archives do.
-      # Provisioning NSS prepends MSYS2 to PATH so NSS's build.sh can run there.
-      # It also shadows the runner's Python with MSYS2's POSIX build, which
-      # reads `D:\...` as a POSIX path and mangles it. NSS is built by now, so
-      # take MSYS2 back off PATH before any packaging script runs.
-      - name: Restore native Windows PATH
-        if: steps.components.outputs.young == 'true'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $filtered = ($env:PATH -split ';' |
-            Where-Object { $_ -and $_ -notmatch 'msys64' }) -join ';'
-          "PATH=$filtered" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          Write-Output "python resolves to: $((Get-Command python).Source)"
-
       - name: Stage Windows runtime libraries
         if: steps.components.outputs.young == 'true'
         shell: pwsh
@@ -505,14 +491,26 @@ jobs:
           TARGET: ${{ matrix.platform.target }}
         run: |
           $ErrorActionPreference = 'Stop'
-          Write-Output "python: $((Get-Command python).Source)"
           $libDir = Join-Path (Split-Path $env:NSS_DIR -Parent) 'dist\Release\lib'
-          python scripts/stage-runtime-libraries.py `
-            --target "$env:TARGET" `
-            --source "$libDir" `
-            --require nss3.dll `
-            --require nssutil3.dll `
-            --require ssl3.dll
+          $profileDir = Join-Path $env:GITHUB_WORKSPACE "target\$env:TARGET\release"
+          if (-not (Test-Path -LiteralPath $libDir -PathType Container)) {
+            throw "NSS runtime library directory not found: $libDir"
+          }
+          if (-not (Test-Path -LiteralPath $profileDir -PathType Container)) {
+            throw "Windows build profile directory not found: $profileDir"
+          }
+
+          $libraries = @(Get-ChildItem -LiteralPath $libDir -Filter '*.dll' -File)
+          foreach ($library in $libraries) {
+            Copy-Item -LiteralPath $library.FullName -Destination $profileDir -Force
+            Write-Output "staged $($library.Name)"
+          }
+          foreach ($required in @('nss3.dll', 'nssutil3.dll', 'ssl3.dll')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $profileDir $required) -PathType Leaf)) {
+              throw "required runtime library was not produced: $required"
+            }
+          }
+          Write-Output "staged $($libraries.Count) Windows runtime libraries"
 
       - name: Smoke-test Windows binary
         shell: pwsh
