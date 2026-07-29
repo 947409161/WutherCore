@@ -78,6 +78,8 @@ pub struct CaptureFilters {
 
 #[derive(Debug, Clone)]
 pub struct CapturePlan {
+    /// Stable inbound tag used by route matching and connection metadata.
+    pub tag: String,
     pub on: bool,
     pub kind: EngineKind,
     pub stack: CaptureStack,
@@ -134,6 +136,11 @@ pub struct CapturePlan {
 impl CapturePlan {
     /// 由 [`Capture`] 配置 + 平台决议得到的执行计划。
     pub fn from_config(c: &Capture) -> Result<Self, CaptureError> {
+        if c.on && c.tag.trim().is_empty() {
+            return Err(CaptureError::DeviceFailed(
+                "inbound tag must not be empty".into(),
+            ));
+        }
         let kind = decide_kind(c)?;
         let mut excludes = parse_cidr_list("capture.exclude.cidr", &c.exclude.cidr, c.on)?;
         // §9.1：默认排除 Tailnet。
@@ -294,6 +301,7 @@ impl CapturePlan {
         };
 
         Ok(Self {
+            tag: c.tag.clone(),
             on: c.on,
             kind,
             stack: c.stack,
@@ -642,6 +650,7 @@ mod tests {
 
     fn base() -> Capture {
         Capture {
+            tag: "test-in".into(),
             on: true,
             method: CaptureMethod::VirtualNic,
             traffic: CaptureTraffic::System,

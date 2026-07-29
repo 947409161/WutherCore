@@ -66,6 +66,8 @@ const HTTP_READ_CHUNK_BYTES: usize = 2048;
 
 #[derive(Debug, Clone)]
 pub struct MixedListener {
+    /// Stable route-visible inbound tag.
+    pub tag: String,
     pub listen: SocketAddr,
     pub auth: Option<Vec<core_config::runtime_plan::UserPass>>,
     /// Whether RFC 1928 UDP ASSOCIATE is accepted on the mixed listener.
@@ -130,6 +132,7 @@ async fn serve_mixed(
     listener: MixedListener,
     runtime: Arc<Runtime>,
 ) -> io::Result<()> {
+    let inbound_tag: Arc<str> = Arc::from(listener.tag.clone());
     let auth = listener.auth.map(Arc::new);
     let stream_settings = listener.stream_settings.map(Arc::new);
     let connection_permits = Arc::new(Semaphore::new(MIXED_MAX_CONNECTIONS));
@@ -151,6 +154,7 @@ async fn serve_mixed(
                     }
                 };
                 let runtime = runtime.clone();
+                let inbound_tag = inbound_tag.clone();
                 let auth = auth.clone();
                 let udp = listener.udp;
                 let stream_settings = stream_settings.clone();
@@ -161,6 +165,7 @@ async fn serve_mixed(
                         sock,
                         peer,
                         runtime,
+                        inbound_tag,
                         auth,
                         udp,
                         udp_session_permits,
@@ -185,6 +190,7 @@ async fn handle(
     sock: TcpStream,
     mut peer: SocketAddr,
     runtime: Arc<Runtime>,
+    inbound_tag: Arc<str>,
     auth: Option<Arc<Vec<core_config::runtime_plan::UserPass>>>,
     udp_enabled: bool,
     udp_session_permits: Arc<Semaphore>,
@@ -238,6 +244,7 @@ async fn handle(
             peer,
             local,
             runtime,
+            inbound_tag.clone(),
             auth.as_deref().map(|v| v.as_slice()),
             udp_enabled,
             udp_session_permits,
@@ -249,6 +256,7 @@ async fn handle(
             peer,
             local,
             runtime,
+            inbound_tag.as_ref(),
             auth.as_deref().map(|v| v.as_slice()),
             stream_settings
                 .as_ref()
@@ -469,6 +477,7 @@ async fn handle_socks5(
     peer: SocketAddr,
     inbound_addr: SocketAddr,
     runtime: Arc<Runtime>,
+    inbound_tag: Arc<str>,
     auth: Option<&[core_config::runtime_plan::UserPass]>,
     udp_enabled: bool,
     udp_session_permits: Arc<Semaphore>,
@@ -495,6 +504,7 @@ async fn handle_socks5(
                 peer,
                 inbound_addr,
                 runtime,
+                inbound_tag.as_ref(),
                 request.address,
                 request.port,
                 inbound_user,
@@ -507,6 +517,7 @@ async fn handle_socks5(
                 peer,
                 inbound_addr,
                 runtime,
+                inbound_tag,
                 request.address,
                 request.port,
                 UdpRelayLimits::default(),
@@ -694,14 +705,21 @@ async fn handle_socks5_connect(
     peer: SocketAddr,
     inbound_addr: SocketAddr,
     runtime: Arc<Runtime>,
+    inbound_tag: &str,
     address: SocksAddress,
     port: u16,
     inbound_user: String,
 ) -> io::Result<()> {
     let handler = ListenerHandler::new(runtime);
-    let metadata =
-        InboundMetadata::tcp("socks5", "Socks5", peer, inbound_addr, address.host(), port)
-            .with_inbound_user(inbound_user);
+    let metadata = InboundMetadata::tcp(
+        inbound_tag,
+        "Socks5",
+        peer,
+        inbound_addr,
+        address.host(),
+        port,
+    )
+    .with_inbound_user(inbound_user);
     match handler.prepare_tcp(metadata).await {
         Ok(prepared) => {
             // The stream abstraction does not expose the outbound socket's local
@@ -1134,6 +1152,7 @@ async fn handle_socks5_udp_associate(
     peer: SocketAddr,
     control_local: SocketAddr,
     runtime: Arc<Runtime>,
+    inbound_tag: Arc<str>,
     client_address: SocksAddress,
     client_port: u16,
     limits: UdpRelayLimits,
@@ -1263,6 +1282,7 @@ async fn handle_socks5_udp_associate(
                                     done_tx.clone(),
                                     limits,
                                     udp_session_permits.clone(),
+                                    inbound_tag.clone(),
                                     inbound_user.clone(),
                                 );
                                 if let Some(entry) = entry {
@@ -1287,6 +1307,7 @@ async fn handle_socks5_udp_associate(
                         done_tx.clone(),
                         limits,
                         udp_session_permits.clone(),
+                        inbound_tag.clone(),
                         inbound_user.clone(),
                     );
                     if let Some(entry) = entry {
@@ -1355,6 +1376,7 @@ fn spawn_udp_target_session(
     done: mpsc::UnboundedSender<UdpTargetDone>,
     limits: UdpRelayLimits,
     session_permits: Arc<Semaphore>,
+    inbound_tag: Arc<str>,
     inbound_user: String,
 ) -> Option<UdpTargetSession> {
     let permit = match session_permits.try_acquire_owned() {
@@ -1384,6 +1406,7 @@ fn spawn_udp_target_session(
             shutdown,
             done,
             limits,
+            inbound_tag,
             inbound_user,
         )
         .await;
@@ -1403,6 +1426,7 @@ async fn run_udp_target_session(
     mut shutdown: watch::Receiver<bool>,
     done: mpsc::UnboundedSender<UdpTargetDone>,
     limits: UdpRelayLimits,
+    inbound_tag: Arc<str>,
     inbound_user: String,
 ) {
     let _done = UdpTargetDoneGuard {
@@ -1415,7 +1439,7 @@ async fn run_udp_target_session(
     }
 
     let metadata = InboundMetadata::udp(
-        "socks5",
+        inbound_tag.as_ref(),
         "Socks5",
         client_endpoint,
         Some(relay_local),
@@ -1541,6 +1565,7 @@ async fn handle_http(
     peer: SocketAddr,
     inbound_addr: SocketAddr,
     runtime: Arc<Runtime>,
+    inbound_tag: &str,
     auth: Option<&[core_config::runtime_plan::UserPass]>,
     trusted_x_forwarded_for: &[String],
 ) -> io::Result<()> {
@@ -1600,7 +1625,7 @@ async fn handle_http(
     match route {
         HttpRoute::Connect(authority) => {
             let metadata = InboundMetadata::tcp(
-                "http-connect",
+                inbound_tag,
                 "HTTP",
                 peer,
                 inbound_addr,
@@ -1653,7 +1678,7 @@ async fn handle_http(
             }
             let forwarded_head = build_forward_head(&request, &target);
             let metadata = InboundMetadata::tcp(
-                "http",
+                inbound_tag,
                 "HTTP",
                 peer,
                 inbound_addr,
@@ -2914,6 +2939,7 @@ route:
         let socket = TcpListener::bind(SocketAddr::new(ip, 0)).await.unwrap();
         let addr = socket.local_addr().unwrap();
         let listener = MixedListener {
+            tag: "mixed-test".into(),
             listen: addr,
             auth,
             udp,

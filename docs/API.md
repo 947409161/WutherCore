@@ -68,7 +68,8 @@ Clash 兼容 `GET /configs` 的 `authentication` 字段只返回用户名列表�
 | `DELETE` | `/v1/connections/:id` | 关闭指定连接 |
 | `GET` | `/v1/resolver/query` | 调试 DNS 查询 |
 | `GET` | `/v1/route/check` | 调试路由结果 |
-| `GET` | `/v1/capture/state` | 流量接管状态 |
+| `GET` | `/v1/inbounds/state` | 统一入口及透明数据面状态 |
+| `GET` | `/v1/capture/state` | 旧版流量接管状态别名 |
 | `GET` | `/v1/mesh/status` | 组网监督器、后端、动态附件、资源声明与冲突快照 |
 | `GET` | `/v1/smart/why` | 查看 Smart 选择理由 |
 | `POST` | `/v1/smart/pin` | 固定节点 |

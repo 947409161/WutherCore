@@ -190,6 +190,7 @@ mod tests {
 
     fn capture(on: bool) -> Capture {
         Capture {
+            tag: "test-in".into(),
             on,
             method: CaptureMethod::Auto,
             traffic: CaptureTraffic::System,

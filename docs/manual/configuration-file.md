@@ -41,14 +41,15 @@ YAML 字段推断功能一定关闭。
 | `name` | 字符串 | 不设置 | 配置实例的显示名称 |
 | `log` | 对象 | 使用 Profile 后的日志默认 | 日志级别、过滤器、输出和连接摘要 |
 | `database` | 对象 | 启用 Turso 和默认路径 | 持久化流量、学习结果、DNS 缓存和面板状态 |
-| `listen` | 对象 | 由 Profile 创建 | Mixed、面板和服务端协议监听 |
+| `inbounds` | 对象列表 | 空 | Mixed、TUN、TPROXY 和 REDIRECT 统一入口 |
+| `listen` | 对象 | 由 Profile 创建 | 面板和服务端协议监听，旧版 Mixed 继续兼容 |
 | `feeds` | 名称到订阅定义的映射 | 空 | 远程或内联节点来源 |
 | `nodes` | 节点列表 | 空 | URI 短写或结构化手动节点 |
 | `groups` | 名称到分组定义的映射 | 自动创建 `main` | 手动、Smart、测速和负载分散策略 |
 | `rule-providers` | 名称到 Mihomo provider 的映射 | 空 | 兼容入口，编译时合并到 `route.sets` |
 | `route` | 对象 | 由 Profile 创建 | 预设、步骤、规则集和最终出站 |
 | `resolver` | 对象 | 由 Profile 创建 | DNS 服务、服务组、规则、缓存和 Fake IP |
-| `capture` | 对象 | 由 Profile 创建 | TUN、TPROXY、REDIRECT 和平台过滤 |
+| `capture` | 对象 | 由 Profile 创建 | 旧版透明入口兼容配置 |
 | `smart` | 对象 | 使用默认配置 | 学习目标、窗口、粘性和解释 |
 | `ui` | 对象 | 使用默认配置 | 原生 API、Clash 兼容 API、密钥和 CORS |
 | `mesh` | 对象 | 创建 Tailscale 默认块 | Tailnet 直连和 userspace 协同 |
@@ -59,6 +60,9 @@ YAML 字段推断功能一定关闭。
 ## Profile 默认值
 
 Profile 只补整块缺失的配置。显式字段优先。
+
+显式声明 `inbounds` 后，Profile 不再生成 `listen.local` 或 `capture`，避免新旧入口
+同时争用监听端口、路由表和防火墙资源。未迁移的配置保持原有默认行为。
 
 | 配置 | desktop | router | server | mobile |
 | --- | --- | --- | --- | --- |

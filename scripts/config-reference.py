@@ -96,8 +96,8 @@ CATEGORIES: dict[str, tuple[str, str]] = {
         "顶层配置、Profile、进程识别和日志输出的完整字段合同。",
     ),
     "inbounds": (
-        "监听与服务端入站",
-        "Mixed、Panel、Shadowsocks、WireGuard、Young、gRPC、REALITY 和 XHTTP 入站。",
+        "统一入口与服务端入站",
+        "Mixed、TUN、TPROXY、REDIRECT、Panel、Shadowsocks、WireGuard、Young、gRPC、REALITY 和 XHTTP 入站。",
     ),
     "feeds-nodes": (
         "订阅、节点与出站",
@@ -124,6 +124,11 @@ CATEGORIES: dict[str, tuple[str, str]] = {
         "未归入主要领域但仍属于用户配置合同的公开字段。",
     ),
 }
+
+# These types implement a flat, type-discriminated Serde contract manually.
+# Rendering their Rust storage fields would incorrectly document the internal
+# `tun` member as a nested YAML object.
+MANUAL_SERDE_TYPES = {"Inbound", "TransparentInboundOptions"}
 
 
 def compact(value: str) -> str:
@@ -502,7 +507,17 @@ def category_for(name: str, source: Path) -> str:
         return "xhttp"
     if name.startswith(("Feed", "Node", "RealityClient", "GrpcTransport")):
         return "feeds-nodes"
-    if name in {"Listen", "PanelBind", "Share", "ShareValue", "ListenLocal"} or name.startswith(
+    if name in {
+        "Inbound",
+        "InboundUser",
+        "MixedInboundOptions",
+        "TransparentInboundOptions",
+        "Listen",
+        "PanelBind",
+        "Share",
+        "ShareValue",
+        "ListenLocal",
+    } or name.startswith(
         (
             "ListenLocal",
             "Shadowsocks",
@@ -753,6 +768,25 @@ def render_category(
         "",
     ]
 
+    if category == "inbounds":
+        lines.extend(
+            [
+                "## `Inbound`",
+                "",
+                "`inbounds` 使用 `type` 判别入口，透明入口字段与 TUN 字段位于同一层。",
+                "",
+                "| `type` | 专用字段 | 公共透明字段 |",
+                "| --- | --- | --- |",
+                "| `mixed` | `listen`、`listen_port`、`udp`、`users`、`streamSettings` | `tag`、`enabled` |",
+                "| `tun` | [TUN 全部字段](capture-runtime.md#tuninboundoptions) | `tag`、`enabled`、`traffic`、`dns_mode`、`stack`、`mtu`、`offload`、`exclude` |",
+                "| `tproxy` | [透明入口共用字段](capture-runtime.md#tuninboundoptions) | `tag`、`enabled`、`traffic`、`dns_mode`、`stack`、`offload`、`exclude` |",
+                "| `redirect` | [透明入口共用字段](capture-runtime.md#tuninboundoptions) | `tag`、`enabled`、`traffic`、`dns_mode`、`stack`、`offload`、`exclude` |",
+                "",
+                "每个 tag 必须唯一。当前运行时最多启用一个 Mixed，并且最多声明一个透明入口。",
+                "",
+            ]
+        )
+
     for struct in structs:
         source_link = rustdoc_link(struct.source, struct.line)
         lines.extend(
@@ -871,13 +905,16 @@ def build_outputs() -> tuple[dict[Path, str], int, int]:
 
     structs_by_category: dict[str, list[Struct]] = defaultdict(list)
     enums_by_category: dict[str, list[Enum]] = defaultdict(list)
-    for item in all_structs:
+    visible_structs = [item for item in all_structs if item.name not in MANUAL_SERDE_TYPES]
+    visible_enums = [item for item in all_enums if item.name not in MANUAL_SERDE_TYPES]
+
+    for item in visible_structs:
         structs_by_category[category_for(item.name, item.source)].append(item)
-    for item in all_enums:
+    for item in visible_enums:
         enums_by_category[category_for(item.name, item.source)].append(item)
 
-    total_fields = sum(len(item.fields) for item in all_structs)
-    total_enums = len(all_enums)
+    total_fields = sum(len(item.fields) for item in visible_structs)
+    total_enums = len(visible_enums)
     outputs: dict[Path, str] = {}
     for category in CATEGORIES:
         if not structs_by_category[category] and not enums_by_category[category]:

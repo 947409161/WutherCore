@@ -7,6 +7,7 @@ use std::{collections::BTreeMap, fmt, path::PathBuf, time::Duration};
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+use serde_with::{OneOrMany, formats::PreferMany, serde_as};
 
 /// 顶层配置 —— 用户实际写的 YAML。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -22,6 +23,13 @@ pub struct UserConfig {
     pub log: Option<Log>,
     #[serde(default, alias = "storage", alias = "store")]
     pub database: DatabaseConfig,
+    /// Canonical inbound configuration. Every entry uses a sing-box-style
+    /// `type` discriminator and a stable route-visible `tag`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inbounds: Vec<Inbound>,
+    /// Legacy listener configuration. New data-plane listeners belong in
+    /// [`UserConfig::inbounds`]; control-plane fields remain supported here
+    /// during the migration.
     #[serde(default)]
     pub listen: Option<Listen>,
     #[serde(default)]
@@ -1058,6 +1066,8 @@ pub enum ListenLocal {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ListenLocalDetail {
+    #[serde(default)]
+    pub tag: Option<String>,
     #[serde(default = "default_localhost")]
     pub host: String,
     pub port: u16,
@@ -5230,6 +5240,9 @@ impl Default for FakeIpFilterMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Capture {
+    /// Stable inbound tag exposed to route matching and connection metadata.
+    #[serde(default = "default_transparent_inbound_tag")]
+    pub tag: String,
     #[serde(default)]
     pub on: bool,
     #[serde(default = "default_capture_method")]
@@ -5254,6 +5267,7 @@ pub struct Capture {
 impl Default for Capture {
     fn default() -> Self {
         Self {
+            tag: default_transparent_inbound_tag(),
             on: false,
             method: CaptureMethod::Auto,
             traffic: CaptureTraffic::System,
@@ -5265,6 +5279,10 @@ impl Default for Capture {
             tun: TunInboundOptions::default(),
         }
     }
+}
+
+fn default_transparent_inbound_tag() -> String {
+    "tun-in".into()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -5288,6 +5306,7 @@ pub enum CaptureTraffic {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CaptureResolver {
+    #[serde(alias = "disabled")]
     Off,
     Hijack,
 }
@@ -5317,13 +5336,279 @@ pub enum CaptureStack {
     Gvisor,
 }
 
+#[serde_as]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CaptureExclude {
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
     #[serde(default)]
     pub cidr: Vec<String>,
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
     #[serde(default)]
     pub process: Vec<String>,
+}
+
+/* ---------------- canonical inbounds ---------------- */
+
+/// Canonical inbound entry. Transparent inbounds use the same flat option
+/// layout as sing-box instead of splitting behavior across `capture` and
+/// `capture.tun`.
+#[derive(Debug, Clone)]
+pub enum Inbound {
+    Mixed(MixedInboundOptions),
+    Tun(TransparentInboundOptions),
+    Tproxy(TransparentInboundOptions),
+    Redirect(TransparentInboundOptions),
+}
+
+impl Inbound {
+    pub fn tag(&self) -> &str {
+        match self {
+            Self::Mixed(options) => &options.tag,
+            Self::Tun(options) | Self::Tproxy(options) | Self::Redirect(options) => &options.tag,
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        match self {
+            Self::Mixed(options) => options.enabled,
+            Self::Tun(options) | Self::Tproxy(options) | Self::Redirect(options) => options.enabled,
+        }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Mixed(_) => "mixed",
+            Self::Tun(_) => "tun",
+            Self::Tproxy(_) => "tproxy",
+            Self::Redirect(_) => "redirect",
+        }
+    }
+
+    pub fn transparent_capture(&self) -> Option<Capture> {
+        let (method, options) = match self {
+            Self::Tun(options) => (CaptureMethod::VirtualNic, options),
+            Self::Tproxy(options) => (CaptureMethod::Tproxy, options),
+            Self::Redirect(options) => (CaptureMethod::Redirect, options),
+            Self::Mixed(_) => return None,
+        };
+        Some(Capture {
+            tag: options.tag.clone(),
+            on: options.enabled,
+            method,
+            traffic: options.traffic,
+            resolver: options.resolver,
+            stack: options.stack,
+            mtu: options.mtu,
+            offload: options.offload,
+            exclude: options.exclude.clone(),
+            tun: options.tun.clone(),
+        })
+    }
+}
+
+#[serde_as]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MixedInboundOptions {
+    #[serde(default = "default_mixed_inbound_tag")]
+    pub tag: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_localhost", alias = "host", alias = "bind")]
+    pub listen: String,
+    #[serde(rename = "listen_port", alias = "listen-port", alias = "port")]
+    pub listen_port: u16,
+    #[serde(default = "default_true")]
+    pub udp: bool,
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
+    #[serde(default)]
+    pub users: Vec<InboundUser>,
+    #[serde(default, rename = "streamSettings", alias = "stream_settings")]
+    pub stream_settings: Option<crate::NodeStreamSettings>,
+}
+
+pub(crate) fn default_mixed_inbound_tag() -> String {
+    "mixed-in".into()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InboundUser {
+    #[serde(alias = "user")]
+    pub username: String,
+    #[serde(alias = "pass")]
+    pub password: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TransparentInboundOptions {
+    pub tag: String,
+    pub enabled: bool,
+    pub traffic: CaptureTraffic,
+    pub resolver: CaptureResolver,
+    pub stack: CaptureStack,
+    pub mtu: Option<std::num::NonZeroU16>,
+    pub offload: bool,
+    pub exclude: CaptureExclude,
+    pub tun: TunInboundOptions,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RawInbound {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(flatten)]
+    fields: BTreeMap<String, serde_json::Value>,
+}
+
+fn take_inbound_field<T>(
+    fields: &mut BTreeMap<String, serde_json::Value>,
+    aliases: &[&str],
+) -> Result<Option<T>, String>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let mut value = None;
+    for alias in aliases {
+        if let Some(candidate) = fields.remove(*alias) {
+            if value.is_some() {
+                return Err(format!(
+                    "inbound fields `{}` are aliases and cannot be specified together",
+                    aliases.join("`, `")
+                ));
+            }
+            value = Some(candidate);
+        }
+    }
+    value
+        .map(|value| serde_json::from_value(value).map_err(|error| error.to_string()))
+        .transpose()
+}
+
+fn transparent_inbound_from_fields(
+    kind: &str,
+    mut fields: BTreeMap<String, serde_json::Value>,
+) -> Result<TransparentInboundOptions, String> {
+    let tag = take_inbound_field::<String>(&mut fields, &["tag"])?
+        .unwrap_or_else(|| format!("{kind}-in"));
+    let enabled = take_inbound_field::<bool>(&mut fields, &["enabled"])?.unwrap_or(true);
+    let traffic = take_inbound_field::<CaptureTraffic>(&mut fields, &["traffic"])?
+        .unwrap_or_else(default_capture_traffic);
+    let resolver =
+        take_inbound_field::<CaptureResolver>(&mut fields, &["dns_mode", "dns-mode", "resolver"])?
+            .unwrap_or_else(default_capture_resolver);
+    let stack = take_inbound_field::<CaptureStack>(&mut fields, &["stack"])?
+        .unwrap_or_else(default_capture_stack);
+    let mtu = take_inbound_field::<Option<std::num::NonZeroU16>>(&mut fields, &["mtu"])?.flatten();
+    let offload = take_inbound_field::<bool>(&mut fields, &["offload", "gso"])?.unwrap_or(true);
+    let exclude =
+        take_inbound_field::<CaptureExclude>(&mut fields, &["exclude"])?.unwrap_or_default();
+    let tun = serde_json::from_value(serde_json::Value::Object(fields.into_iter().collect()))
+        .map_err(|error| error.to_string())?;
+    Ok(TransparentInboundOptions {
+        tag,
+        enabled,
+        traffic,
+        resolver,
+        stack,
+        mtu,
+        offload,
+        exclude,
+        tun,
+    })
+}
+
+impl<'de> Deserialize<'de> for Inbound {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawInbound::deserialize(deserializer)?;
+        let kind = raw.kind.trim().to_ascii_lowercase().replace('-', "_");
+        match kind.as_str() {
+            "mixed" => {
+                let options = serde_json::from_value(serde_json::Value::Object(
+                    raw.fields.into_iter().collect(),
+                ))
+                .map_err(serde::de::Error::custom)?;
+                Ok(Self::Mixed(options))
+            }
+            "tun" => transparent_inbound_from_fields("tun", raw.fields)
+                .map(Self::Tun)
+                .map_err(serde::de::Error::custom),
+            "tproxy" => transparent_inbound_from_fields("tproxy", raw.fields)
+                .map(Self::Tproxy)
+                .map_err(serde::de::Error::custom),
+            "redirect" => transparent_inbound_from_fields("redirect", raw.fields)
+                .map(Self::Redirect)
+                .map_err(serde::de::Error::custom),
+            _ => Err(serde::de::Error::custom(format!(
+                "unsupported inbound type `{}`; supported types: mixed, tun, tproxy, redirect",
+                raw.kind
+            ))),
+        }
+    }
+}
+
+fn insert_inbound_field<T>(
+    fields: &mut BTreeMap<String, serde_json::Value>,
+    name: &str,
+    value: T,
+) -> Result<(), serde_json::Error>
+where
+    T: Serialize,
+{
+    fields.insert(name.to_owned(), serde_json::to_value(value)?);
+    Ok(())
+}
+
+fn transparent_inbound_fields(
+    options: &TransparentInboundOptions,
+) -> Result<BTreeMap<String, serde_json::Value>, serde_json::Error> {
+    let mut fields = match serde_json::to_value(&options.tun)? {
+        serde_json::Value::Object(fields) => fields.into_iter().collect(),
+        _ => BTreeMap::new(),
+    };
+    insert_inbound_field(&mut fields, "tag", &options.tag)?;
+    insert_inbound_field(&mut fields, "enabled", options.enabled)?;
+    insert_inbound_field(&mut fields, "traffic", options.traffic)?;
+    insert_inbound_field(&mut fields, "dns_mode", options.resolver)?;
+    insert_inbound_field(&mut fields, "stack", options.stack)?;
+    if let Some(mtu) = options.mtu {
+        insert_inbound_field(&mut fields, "mtu", mtu)?;
+    }
+    insert_inbound_field(&mut fields, "offload", options.offload)?;
+    if !options.exclude.cidr.is_empty() || !options.exclude.process.is_empty() {
+        insert_inbound_field(&mut fields, "exclude", &options.exclude)?;
+    }
+    Ok(fields)
+}
+
+impl Serialize for Inbound {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let raw = match self {
+            Self::Mixed(options) => {
+                let fields =
+                    match serde_json::to_value(options).map_err(serde::ser::Error::custom)? {
+                        serde_json::Value::Object(fields) => fields.into_iter().collect(),
+                        _ => BTreeMap::new(),
+                    };
+                RawInbound {
+                    kind: "mixed".into(),
+                    fields,
+                }
+            }
+            Self::Tun(options) | Self::Tproxy(options) | Self::Redirect(options) => RawInbound {
+                kind: self.kind().into(),
+                fields: transparent_inbound_fields(options).map_err(serde::ser::Error::custom)?,
+            },
+        };
+        raw.serialize(serializer)
+    }
 }
 
 /* -------- sing-box 风格 TUN 字段模型（各数据面按能力校验） -------- */
@@ -5392,6 +5677,7 @@ pub fn normalize_auto_redirect_mark(value: Option<&str>, default: u32) -> Option
 
 /// sing-box `inbounds[type=tun]` 兼容字段映射 —— 见
 /// <https://sing-box.sagernet.org/configuration/inbound/tun/>
+#[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TunInboundOptions {
@@ -5399,6 +5685,7 @@ pub struct TunInboundOptions {
     #[serde(default)]
     pub interface_name: Option<String>,
     /// `address` —— TUN 接口 v4 / v6 CIDR 列表（首条 v4 / 首条 v6 生效）。
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
     #[serde(default)]
     pub address: Vec<String>,
     /// `inet6` —— 是否在 TUN 上启用 IPv6。关闭后不配 v6 地址 / 路由 / 规则 / listener。
@@ -5440,15 +5727,19 @@ pub struct TunInboundOptions {
     #[serde(default)]
     pub strict_route: bool,
     /// `route_address` —— 仅这些 CIDR 走 TUN（白名单）。空 = 全部。
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
     #[serde(default)]
     pub route_address: Vec<String>,
     /// `route_exclude_address` —— 这些 CIDR 不走 TUN（黑名单）。
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
     #[serde(default)]
     pub route_exclude_address: Vec<String>,
     /// `route_address_set` —— 白名单引用 ruleset（动态 IP 集）。
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
     #[serde(default)]
     pub route_address_set: Vec<String>,
     /// `route_exclude_address_set` —— 黑名单引用 ruleset。
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
     #[serde(default)]
     pub route_exclude_address_set: Vec<String>,
 
@@ -5467,52 +5758,68 @@ pub struct TunInboundOptions {
     #[serde(default)]
     pub exclude_mptcp: bool,
     /// `loopback_address` —— 哪些 IP 视为 loopback 不接管（如保留地址）。
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
     #[serde(default)]
     pub loopback_address: Vec<String>,
 
     /* ---- 接口过滤 ---- */
     /// `include_interface` —— 仅接管这些上行接口的流量。
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
     #[serde(default)]
     pub include_interface: Vec<String>,
     /// `exclude_interface` —— 排除这些接口。
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
     #[serde(default)]
     pub exclude_interface: Vec<String>,
 
     /* ---- UID 过滤（Linux/Android）---- */
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
     #[serde(default)]
     pub include_uid: Vec<u32>,
     /// 形如 `"1000:99999"`，闭区间。
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
     #[serde(default)]
     pub include_uid_range: Vec<String>,
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
     #[serde(default)]
     pub exclude_uid: Vec<u32>,
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
     #[serde(default)]
     pub exclude_uid_range: Vec<String>,
 
     /* ---- GID 过滤（Linux/Android）—— 与 UID 同语义，作用于 `meta skgid` ---- */
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
     #[serde(default)]
     pub include_gid: Vec<u32>,
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
     #[serde(default)]
     pub include_gid_range: Vec<String>,
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
     #[serde(default)]
     pub exclude_gid: Vec<u32>,
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
     #[serde(default)]
     pub exclude_gid_range: Vec<String>,
 
     /* ---- Android 专属 ---- */
     /// `include_android_user` —— 仅接管这些 Android user id 的流量（双开 / 工作资料）。
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
     #[serde(default)]
     pub include_android_user: Vec<u32>,
     /// `include_package` —— Android 包名白名单。
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
     #[serde(default)]
     pub include_package: Vec<String>,
     /// `exclude_package` —— Android 包名黑名单。
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
     #[serde(default)]
     pub exclude_package: Vec<String>,
 
     /* ---- LAN MAC 过滤（路由器场景）---- */
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
     #[serde(default)]
     pub include_mac_address: Vec<String>,
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
     #[serde(default)]
     pub exclude_mac_address: Vec<String>,
 

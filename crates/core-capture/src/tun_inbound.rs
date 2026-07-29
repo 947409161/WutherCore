@@ -45,7 +45,7 @@ pub fn build_inbound_metadata(session: &TunSession) -> InboundMetadata {
     let route_ip = session.target.host.parse::<IpAddr>().ok();
     let mut metadata = InboundMetadata::new(
         network,
-        "tun",
+        session.inbound_tag.clone(),
         "Tun",
         session.source,
         // A TUN flow has no userspace listener endpoint. The NAT listener
@@ -178,6 +178,7 @@ pub enum TunPacket {
 
 #[derive(Debug, Clone)]
 pub struct TunSession {
+    pub inbound_tag: String,
     pub network: &'static str,
     pub source: SocketAddr,
     pub original_dst: SocketAddr,
@@ -447,6 +448,7 @@ impl TunInbound {
         }
         let bypass = self.route_policy(original_dst.ip())?;
         Ok(TunSession {
+            inbound_tag: self.plan.tag.clone(),
             network,
             source,
             original_dst,
@@ -477,7 +479,7 @@ impl TunInbound {
             source_port: session.source.port().to_compact_string(),
             destination_ip: session.original_dst.ip().to_compact_string(),
             destination_port: session.original_dst.port().to_compact_string(),
-            inbound_name: "tun".into(),
+            inbound_name: session.inbound_tag.as_str().into(),
             host: session.target.host.as_str().into(),
             dns_mode: session.target.dns_mode.as_str().into(),
             sniff_host: session.sniff_host.as_deref().unwrap_or_default().into(),
@@ -540,6 +542,7 @@ mod tests {
 
     fn base_plan() -> CapturePlan {
         CapturePlan::from_config(&core_config::model::Capture {
+            tag: "system-test".into(),
             on: true,
             method: core_config::model::CaptureMethod::VirtualNic,
             stack: core_config::model::CaptureStack::Mixed,
@@ -916,6 +919,7 @@ mod tests {
         let meta = inbound.tcp_meta(&session, original_dst, &out);
         assert_eq!(meta.network, "tcp");
         assert_eq!(meta.kind, "Tun");
+        assert_eq!(meta.inbound_name, "system-test");
         assert_eq!(meta.source_ip, "10.0.0.2");
         assert_eq!(meta.destination_ip, "8.8.8.8");
         assert!(meta.inbound_ip.is_empty());

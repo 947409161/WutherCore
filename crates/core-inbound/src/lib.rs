@@ -1,8 +1,8 @@
 //! core-inbound —— 入站监听 / 协议解析 / 连接桥接。
 //!
-//! §8.1：listen.local 是用户唯一需要记住的入口，同一端口同时接收
-//! HTTP CONNECT、HTTP 普通代理与 SOCKS5（CONNECT + UDP ASSOCIATE）。
-//! TUN/TProxy 由 capture 模块单独承载。
+//! Protocol listeners and transparent TUN/TProxy/redirect ingress share this
+//! public module. The lower-level `core-capture` crate remains an internal
+//! platform backend and is re-exported through [`transparent`] when enabled.
 
 #![forbid(unsafe_code)]
 
@@ -15,6 +15,8 @@ pub mod privilege;
 pub mod reality;
 #[cfg(feature = "with_shadowsocks")]
 pub mod shadowsocks;
+#[cfg(feature = "with_tun")]
+pub mod transparent;
 pub mod vless;
 #[cfg(feature = "with_xhttp")]
 pub mod xhttp;

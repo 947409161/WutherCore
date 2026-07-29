@@ -6,14 +6,14 @@ license.workspace = true
 
 [features]
 default = ["with_tun"]
-with_tun = ["dep:core-capture"]
+with_tun = ["core-inbound/with_tun"]
 
 [dependencies]
 core-config  = { workspace = true }
 core-smart   = { workspace = true }
 core-runtime = { workspace = true }
 core-route   = { workspace = true }
-core-capture = { workspace = true, optional = true }
+core-inbound = { workspace = true, default-features = false }
 core-mesh    = { workspace = true }
 core-feeds   = { workspace = true }
 core-observe = { workspace = true }

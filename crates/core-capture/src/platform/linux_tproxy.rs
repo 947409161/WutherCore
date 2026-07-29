@@ -353,10 +353,10 @@ impl TcpInterceptMode {
         }
     }
 
-    fn metadata(self) -> (&'static str, &'static str) {
+    fn inbound_kind(self) -> &'static str {
         match self {
-            Self::Tproxy => ("tproxy", "TPROXY"),
-            Self::Redirect => ("redirect", "REDIRECT"),
+            Self::Tproxy => "TPROXY",
+            Self::Redirect => "REDIRECT",
         }
     }
 }
@@ -370,9 +370,18 @@ pub(crate) async fn run_tcp_tproxy(
     listener: TcpListener,
     events: mpsc::Sender<CaptureEvent>,
     runtime: Arc<core_runtime::Runtime>,
+    inbound_tag: Arc<str>,
     stop: oneshot::Receiver<()>,
 ) -> Result<(), CaptureError> {
-    run_tcp_intercept(listener, events, runtime, stop, TcpInterceptMode::Tproxy).await
+    run_tcp_intercept(
+        listener,
+        events,
+        runtime,
+        inbound_tag,
+        stop,
+        TcpInterceptMode::Tproxy,
+    )
+    .await
 }
 
 /// Run an ordinary TCP NAT REDIRECT listener.
@@ -384,15 +393,25 @@ pub(crate) async fn run_tcp_redirect(
     listener: TcpListener,
     events: mpsc::Sender<CaptureEvent>,
     runtime: Arc<core_runtime::Runtime>,
+    inbound_tag: Arc<str>,
     stop: oneshot::Receiver<()>,
 ) -> Result<(), CaptureError> {
-    run_tcp_intercept(listener, events, runtime, stop, TcpInterceptMode::Redirect).await
+    run_tcp_intercept(
+        listener,
+        events,
+        runtime,
+        inbound_tag,
+        stop,
+        TcpInterceptMode::Redirect,
+    )
+    .await
 }
 
 async fn run_tcp_intercept(
     listener: TcpListener,
     events: mpsc::Sender<CaptureEvent>,
     runtime: Arc<core_runtime::Runtime>,
+    inbound_tag: Arc<str>,
     mut stop: oneshot::Receiver<()>,
     mode: TcpInterceptMode,
 ) -> Result<(), CaptureError> {
@@ -479,15 +498,15 @@ async fn run_tcp_intercept(
         let _ = events.try_send(evt);
 
         let runtime = runtime.clone();
+        let inbound_tag = inbound_tag.clone();
         let bind_local = bind;
         connections.spawn(async move {
             let host = original_dst.ip().to_string();
             let port = original_dst.port();
             let handler = ListenerHandler::new(runtime);
-            let (inbound_tag, inbound_kind) = mode.metadata();
             let metadata = InboundMetadata::tcp(
-                inbound_tag,
-                inbound_kind,
+                inbound_tag.as_ref(),
+                mode.inbound_kind(),
                 peer,
                 bind_local,
                 host.clone(),
@@ -539,6 +558,7 @@ pub(crate) async fn run_udp_tproxy(
     socket: UdpSocket,
     events: mpsc::Sender<CaptureEvent>,
     runtime: Arc<core_runtime::Runtime>,
+    inbound_tag: Arc<str>,
     mut stop: oneshot::Receiver<()>,
 ) -> Result<(), CaptureError> {
     let bind = socket.local_addr()?;
@@ -645,7 +665,7 @@ pub(crate) async fn run_udp_tproxy(
                 let target_host = original_dst.ip().to_string();
                 let target_port = original_dst.port();
                 let metadata = InboundMetadata::udp(
-                    "tproxy",
+                    inbound_tag.as_ref(),
                     "TPROXY",
                     peer,
                     Some(bind),
@@ -1743,11 +1763,8 @@ mod tests {
 
     #[test]
     fn tcp_intercept_metadata_preserves_tproxy_and_distinguishes_redirect() {
-        assert_eq!(TcpInterceptMode::Tproxy.metadata(), ("tproxy", "TPROXY"));
-        assert_eq!(
-            TcpInterceptMode::Redirect.metadata(),
-            ("redirect", "REDIRECT")
-        );
+        assert_eq!(TcpInterceptMode::Tproxy.inbound_kind(), "TPROXY");
+        assert_eq!(TcpInterceptMode::Redirect.inbound_kind(), "REDIRECT");
     }
 
     #[test]

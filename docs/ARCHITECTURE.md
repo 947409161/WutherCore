@@ -10,7 +10,7 @@ flowchart TB
     Config --> Runtime["core-runtime"]
 
     Inbound["core-inbound"] --> Runtime
-    Capture["core-capture"] --> Runtime
+    Capture["core-capture 透明入口后端"] --> Inbound
     Runtime --> Resolver["core-resolver"]
     Runtime --> Route["core-route"]
     Route --> Ruleset["core-ruleset"]
@@ -24,7 +24,7 @@ flowchart TB
     Process["core-process"] --> Route
 ```
 
-依赖方向不是严格分层模型：`core-runtime` 负责把多个能力组合成一条连接路径，`core-capture` 和 `core-outbound` 也会调用解析、规则与观测能力。新增跨模块调用前，应先判断它属于配置编译、运行时编排还是协议细节。
+依赖方向不是严格分层模型：`core-runtime` 负责把多个能力组合成一条连接路径，`core-inbound` 统一公开 Mixed、TUN、TPROXY 和 REDIRECT，`core-capture` 只保留透明入口的平台实现。新增跨模块调用前，应先判断它属于配置编译、运行时编排还是协议细节。
 
 ## 一条 TCP/UDP 流量的路径
 
@@ -58,8 +58,8 @@ sequenceDiagram
 | --- | --- | --- |
 | `wuther-core` | CLI、进程启动、组件装配 | 协议细节和路由算法 |
 | `core-config` | YAML 模型、Profile、默认值、迁移、`RuntimePlan` | 网络 I/O |
-| `core-inbound` | HTTP/SOCKS5 监听与入站会话 | 节点选择 |
-| `core-capture` | TUN、TPROXY、REDIRECT、系统路由与平台适配 | 协议握手 |
+| `core-inbound` | HTTP/SOCKS5、TUN、TPROXY、REDIRECT 的公共入口与入站会话 | 节点选择 |
+| `core-capture` | 透明入口的系统路由、防火墙和平台适配后端 | 协议握手 |
 | `core-runtime` | 生命周期、调度、健康检查和组件编排 | 平台命令拼装 |
 | `core-resolver` | DNS、缓存、Fake IP、上游策略 | 通用路由决策 |
 | `core-route` | 规则执行、嗅探结果和匹配上下文 | 订阅下载 |

@@ -968,6 +968,7 @@ mod tests {
 
     fn capture() -> Capture {
         Capture {
+            tag: "test-in".into(),
             on: true,
             method: CaptureMethod::VirtualNic,
             traffic: CaptureTraffic::System,

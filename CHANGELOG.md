@@ -4,6 +4,16 @@
 
 ## [Unreleased]
 
+### Added
+
+- Add a sing-box-style `inbounds` catalog for Mixed, TUN, TPROXY and REDIRECT with stable tags, flat transparent options, scalar-or-list fields and strict resource conflict validation.
+
+### Changed
+
+- Expose transparent ingress through `core-inbound`; `core-capture` remains the platform backend.
+- Propagate configured inbound tags into routing, connection tracking, logs and API metadata.
+- Migrate the official multi-platform example to the unified inbound syntax while retaining legacy `listen.local` and `capture` compatibility.
+
 ### Changed
 
 - Linux 与 Android Root TUN 的接口地址、链路状态、策略规则、路由查询和崩溃恢复

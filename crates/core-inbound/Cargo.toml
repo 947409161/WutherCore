@@ -7,6 +7,7 @@ license.workspace = true
 [features]
 default = ["standard"]
 standard = ["with_grpc", "with_reality", "with_shadowsocks", "with_xhttp"]
+with_tun = ["dep:core-capture"]
 with_grpc = ["dep:core-grpc", "with_reality", "tls_inbound"]
 with_reality = ["dep:core-reality"]
 with_shadowsocks = ["dep:shadowsocks"]
@@ -34,6 +35,7 @@ tls_inbound = [
 
 [dependencies]
 core-config   = { workspace = true }
+core-capture  = { workspace = true, optional = true }
 core-grpc     = { workspace = true, optional = true }
 core-route    = { workspace = true }
 core-resolver = { workspace = true }

@@ -683,7 +683,13 @@ route:
         assert_eq!(plan.groups.len(), 23);
         assert_eq!(plan.route.sets.len(), 24);
         assert!(plan.capture.on);
-        assert_eq!(plan.capture.method, CaptureMethod::Auto);
+        assert_eq!(plan.capture.method, CaptureMethod::VirtualNic);
+        assert_eq!(plan.capture.tag, "系统接管");
+        assert_eq!(
+            plan.listen.mixed.as_ref().map(|mixed| mixed.tag.as_str()),
+            Some("本地代理")
+        );
+        assert_eq!(plan.inbounds.len(), 2);
         assert!(!plan.capture.tun.auto_redirect);
         assert!(plan.groups.contains_key("智能节点"));
         assert!(plan.groups.contains_key("负载均衡节点"));
@@ -781,5 +787,132 @@ database:
             let error = load_from_str(yaml).unwrap_err().to_string();
             assert!(error.contains("database."), "{error}");
         }
+    }
+
+    #[test]
+    fn canonical_inbounds_compile_mixed_and_flat_tun_options() {
+        let plan = load_from_str(
+            r#"
+version: 1
+inbounds:
+  - type: mixed
+    tag: local-proxy
+    listen: 127.0.0.1
+    listen_port: 7890
+    users:
+      username: alice
+      password: secret
+  - type: tun
+    tag: system-tun
+    interface_name: rpktun0
+    address: 198.18.0.1/15
+    stack: mixed
+    mtu: 1500
+    dns_mode: hijack
+    auto_route: true
+    strict_route: true
+    route_exclude_address: 192.168.0.0/16
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(plan.inbounds.len(), 2);
+        let mixed = plan.listen.mixed.expect("mixed inbound is compiled");
+        assert_eq!(mixed.tag, "local-proxy");
+        assert_eq!(mixed.socket_addr().unwrap().to_string(), "127.0.0.1:7890");
+        assert_eq!(plan.listen.auth.len(), 1);
+        assert_eq!(plan.listen.auth[0].user, "alice");
+        assert_eq!(plan.listen.auth[0].pass, "secret");
+        assert!(plan.capture.on);
+        assert_eq!(plan.capture.tag, "system-tun");
+        assert_eq!(plan.capture.method, CaptureMethod::VirtualNic);
+        assert_eq!(plan.capture.tun.interface_name.as_deref(), Some("rpktun0"));
+        assert_eq!(plan.capture.tun.address, ["198.18.0.1/15"]);
+        assert_eq!(plan.capture.tun.route_exclude_address, ["192.168.0.0/16"]);
+    }
+
+    #[test]
+    fn canonical_inbounds_reject_duplicate_tags_and_legacy_conflicts() {
+        let duplicate = load_from_str(
+            r#"
+version: 1
+inbounds:
+  - type: mixed
+    tag: duplicate
+    listen_port: 7890
+  - type: tun
+    tag: duplicate
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(duplicate.contains("tag `duplicate` 重复"), "{duplicate}");
+
+        let legacy = load_from_str(
+            r#"
+version: 1
+listen:
+  local: 7890
+inbounds:
+  - type: mixed
+    tag: local-proxy
+    listen_port: 7891
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(legacy.contains("listen.local"), "{legacy}");
+    }
+
+    #[test]
+    fn canonical_inbounds_reject_multiple_transparent_data_planes() {
+        let error = load_from_str(
+            r#"
+version: 1
+inbounds:
+  - type: tun
+    tag: tun-in
+  - type: tproxy
+    tag: tproxy-in
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("只能声明一个 tun、tproxy 或 redirect inbound"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn canonical_inbounds_serialize_list_options_as_arrays() {
+        let config: UserConfig = serde_yaml::from_str(
+            r#"
+version: 1
+inbounds:
+  - type: tun
+    tag: tun-in
+    address: 198.18.0.1/15
+    route_address:
+      - 0.0.0.0/1
+      - 128.0.0.0/1
+"#,
+        )
+        .unwrap();
+        let serialized = serde_yaml::to_string(&config).unwrap();
+        let reparsed: UserConfig = serde_yaml::from_str(&serialized).unwrap();
+
+        let Inbound::Tun(options) = &reparsed.inbounds[0] else {
+            panic!("expected tun inbound");
+        };
+        assert_eq!(options.tun.address, ["198.18.0.1/15"]);
+        assert_eq!(options.tun.route_address, ["0.0.0.0/1", "128.0.0.0/1"]);
+        let value: serde_yaml::Value = serde_yaml::from_str(&serialized).unwrap();
+        assert!(
+            value["inbounds"][0]["address"]
+                .as_sequence()
+                .is_some_and(|items| items.len() == 1)
+        );
     }
 }

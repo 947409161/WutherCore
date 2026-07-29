@@ -5,16 +5,52 @@ description: Mixed、Panel 和所有服务端协议入站的配置语义
 
 # 监听与入站
 
-`listen` 同时管理本地代理入口、管理面板和可选服务端协议。每个服务端协议都有独立
-监听地址和资源限制。二进制必须包含对应组件，否则 `run` 会拒绝启动。
+`inbounds` 是本地流量入口的统一配置。每个条目使用 `type` 选择数据面，使用
+`tag` 提供稳定身份。路由规则、连接表、日志和 Clash API 都使用这个 tag。
+
+当前统一入口支持 `mixed`、`tun`、`tproxy` 和 `redirect`。管理面板及现有服务端
+协议仍放在 `listen` 中。旧的 `listen.local` 和 `capture` 可以继续加载，但不能与
+等价的 `inbounds` 条目同时声明。
 
 完整字段、别名和枚举见[监听与入站字段索引](generated/inbounds.md)。
 
-## `listen` 字段
+## 统一入口
+
+```yaml
+inbounds:
+  - type: mixed
+    tag: 本地代理
+    listen: 127.0.0.1
+    listen_port: 7890
+    udp: true
+    users:
+      - username: alice
+        password: replace-me
+
+  - type: tun
+    tag: 系统接管
+    interface_name: rpktun0
+    address:
+      - 198.18.0.1/15
+      - fdfe:dcba:9876::1/126
+    stack: mixed
+    dns_mode: hijack
+    mtu: 1500
+    auto_route: true
+    strict_route: false
+```
+
+每个 tag 必须非空、唯一且不超过 128 字节。当前运行时最多启用一个 Mixed 入口，
+并且 `tun`、`tproxy`、`redirect` 三种透明数据面合计只能声明一个。这样可以避免
+多个入口同时争用系统路由、防火墙、TUN 设备和 DNS 劫持资源。
+
+列表字段接受单值和数组两种写法。`address: 198.18.0.1/15` 与只包含一个元素的
+数组等价，`explain` 会统一输出数组。
+
+## `listen` 保留字段
 
 | 字段 | 形态 | 用途 |
 | --- | --- | --- |
-| `local` | 端口或对象 | Mixed HTTP、SOCKS5 和 UDP 本地入口 |
 | `panel` | 端口或地址 | 原生 API 与 Clash 兼容 API 的监听地址 |
 | `xhttp` | 对象或对象列表 | XHTTP 和 SplitHTTP 服务端入站 |
 | `shadowsocks` | 对象或对象列表 | Shadowsocks SIP003、SIP004 和 SIP022 服务端 |
@@ -27,33 +63,34 @@ description: Mixed、Panel 和所有服务端协议入站的配置语义
 
 ## Mixed 本地入口
 
-端口短写：
-
 ```yaml
-listen:
-  local: 7890
-```
-
-对象长写：
-
-```yaml
-listen:
-  local:
-    host: 127.0.0.1
-    port: 7890
+inbounds:
+  - type: mixed
+    tag: mixed-in
+    listen: 127.0.0.1
+    listen_port: 7890
     udp: true
-    auth:
-      - "alice:replace-me"
+    users:
+      username: alice
+      password: replace-me
 ```
 
-`host` 默认 `127.0.0.1`，`udp` 默认开启。对象内 `auth` 只应用于这个监听；
-顶层 `listen.auth` 是 Profile 和兼容配置使用的全局认证入口。
+`listen` 默认 `127.0.0.1`，`udp` 默认开启。`users` 可以写一个对象或对象数组。
+用户名必须非空、唯一且不能包含冒号，密码不能为空。
 
 如果绑定非回环地址，应同时设置认证、防火墙和明确的共享范围。不要把开放代理端口
 直接暴露到互联网。
 
 `streamSettings` 可为监听 socket 设置 Xray 兼容策略。字段见
 [StreamSettings 字段索引](generated/stream.md)。
+
+## 透明入口
+
+`tun`、`tproxy` 和 `redirect` 使用同一套扁平字段，不再把参数拆到
+`capture.tun`。三种类型分别映射虚拟网卡、Linux 或 Android root TPROXY、
+Linux 或 Android root TCP REDIRECT。
+
+完整的地址、路由、应用过滤、平台能力和迁移示例见[系统接管](capture.md)。
 
 ## 管理面板监听
 

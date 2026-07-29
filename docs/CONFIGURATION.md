@@ -24,13 +24,14 @@ wuther-core run -c config.yaml
 | `profile` | `desktop`、`router`、`server` 或 `mobile` 默认值 |
 | `name` | 配置显示名称 |
 | `log` | 日志级别、过滤器和文件输出 |
-| `listen` | Mixed 入站、管理面板、共享和认证 |
+| `inbounds` | Mixed、TUN、TPROXY 和 REDIRECT 入口 |
+| `listen` | 管理面板和服务端协议监听 |
 | `feeds` | 订阅源 |
 | `nodes` | 手动节点 |
 | `groups` | 节点选择策略 |
 | `route` | 路由步骤、Preset、最终动作和规则集 |
 | `resolver` | DNS、Fake IP、Hosts 与上游策略 |
-| `capture` | TUN、TPROXY、REDIRECT 和排除项 |
+| `capture` | 旧版透明入口兼容配置 |
 | `smart` | 学习目标、周期、粘性和选择解释 |
 | `ui` | 管理 API、密钥、Dashboard 与 CORS |
 | `mesh` | Mesh 相关配置 |
@@ -194,15 +195,21 @@ SVCB/HTTPS、ANY 和未知类型码）；Fake IP 仅对 A/AAAA 合成地址。
 ## 流量接管
 
 ```yaml
-capture:
-  on: true
-  method: tun
-  stack: system
-  mtu: 1500
+inbounds:
+  - type: mixed
+    tag: 本地代理
+    listen: 127.0.0.1
+    listen_port: 7890
+  - type: tun
+    tag: 系统接管
+    stack: system
+    mtu: 1500
+    dns_mode: hijack
+    auto_route: true
 ```
 
 `mtu` 只用于会创建设备的 TUN 接管。取值范围为 `576..=65535`，启用
-`capture.tun.inet6` 时下限为 `1280`；`0`、超出范围的值以及在
+`inet6` 时下限为 `1280`；`0`、超出范围的值以及在
 TPROXY/REDIRECT 模式中设置 MTU 都会直接拒绝配置。Linux、Windows 和 macOS
 由 `tun-rs` 在创建设备时应用该值；Android VpnService 宿主必须把导出 JSON
 中的 `mtu` 传给 `VpnService.Builder.setMtu`，并使用
@@ -210,9 +217,9 @@ TPROXY/REDIRECT 模式中设置 MTU 都会直接拒绝配置。Linux、Windows �
 
 建议顺序：
 
-1. `capture.on: false` 验证 HTTP/SOCKS5。
+1. 只启用 `mixed`，暂不声明透明入口，先验证 HTTP/SOCKS5。
 2. 确认 DNS 和路由选择正确。
-3. 使用管理员/root 权限启用 Capture。
+3. 使用管理员或 root 权限启用透明入口。
 4. 检查默认路由、排除网段和回环保护。
 5. 停止进程，确认系统路由已经恢复。
 

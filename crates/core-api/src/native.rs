@@ -7,6 +7,8 @@ use axum::{
     response::IntoResponse,
     routing::{delete, get, patch, post},
 };
+#[cfg(feature = "with_tun")]
+use core_inbound::transparent as core_capture;
 use core_route::{FlowContext, NetworkKind};
 use core_runtime::{Runtime, UrlTester};
 use serde::{Deserialize, Serialize};
@@ -18,7 +20,7 @@ pub struct NativeState {
     pub started_at: std::time::Instant,
     pub secret: Option<String>,
     pub urltest: Arc<UrlTester>,
-    /// 由 main.rs 在 capture 启动后注入；为空时 /v1/capture/state 仅回静态配置。
+    /// 由 main.rs 在透明入口启动后注入；为空时状态端点仅返回静态配置。
     #[cfg(feature = "with_tun")]
     pub capture: Option<Arc<core_capture::CaptureSupervisor>>,
     /// 统一组网监督器；`/v1/mesh/status` 只返回脱敏后的结构化快照。
@@ -69,6 +71,7 @@ pub fn router(state: NativeState) -> Router {
         .route("/connections/{id}", delete(close_conn))
         .route("/resolver/query", get(resolver_query))
         .route("/route/check", get(route_check))
+        .route("/inbounds/state", get(capture_state))
         .route("/capture/state", get(capture_state))
         .route("/mesh/status", get(mesh_status))
         .route("/smart/why", get(smart_why))
@@ -313,8 +316,17 @@ async fn route_check(
 
 async fn capture_state(State(s): State<NativeState>) -> impl IntoResponse {
     let c = &s.runtime.plan.capture;
+    let inbound_type = match c.method {
+        core_config::model::CaptureMethod::Auto | core_config::model::CaptureMethod::VirtualNic => {
+            "tun"
+        }
+        core_config::model::CaptureMethod::Tproxy => "tproxy",
+        core_config::model::CaptureMethod::Redirect => "redirect",
+    };
     #[allow(unused_mut)]
     let mut body = json!({
+        "tag": c.tag,
+        "type": inbound_type,
         "on": c.on,
         "method": format!("{:?}", c.method).to_lowercase(),
         "traffic": format!("{:?}", c.traffic).to_lowercase(),
@@ -336,7 +348,8 @@ async fn capture_state(State(s): State<NativeState>) -> impl IntoResponse {
             "route_address_set": c.tun.route_address_set.clone(),
             "route_exclude_address_set": c.tun.route_exclude_address_set.clone(),
             "loopback_address": c.tun.loopback_address.clone(),
-        }
+        },
+        "configured": s.runtime.plan.inbounds,
     });
     #[cfg(feature = "with_tun")]
     {

@@ -21,6 +21,8 @@ use comfy_table::{
 use core_api::ApiServer;
 use core_config::loader::load_from_path;
 use core_feeds::{FeedDiskCache, FeedManager, FeedSink, FeedUpdate};
+#[cfg(feature = "with_tun")]
+use core_inbound::transparent as core_capture;
 #[cfg(feature = "with_grpc")]
 use core_inbound::{GrpcListener, run_grpc};
 use core_inbound::{MixedListener, ensure_best_effort_privilege, run_mixed};
@@ -2101,6 +2103,7 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
             Some(plan.listen.auth.clone())
         };
         let listener = MixedListener {
+            tag: mixed.tag.clone(),
             listen: addr,
             auth,
             udp: mixed.udp,

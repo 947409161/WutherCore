@@ -37,6 +37,9 @@ pub struct RuntimePlan {
     pub name: String,
     pub log: Option<Log>,
     pub database: DatabaseConfig,
+    /// Canonical typed inbound declarations as written by the user. Runtime
+    /// listener and transparent plans below are compiled from this catalog.
+    pub inbounds: Vec<Inbound>,
     pub listen: ListenPlan,
     pub feeds: BTreeMap<String, FeedDetail>,
     pub nodes: Vec<ParsedNode>,
@@ -179,6 +182,7 @@ impl YoungListen {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MixedListen {
+    pub tag: String,
     pub host: String,
     pub port: u16,
     pub udp: bool,
@@ -487,6 +491,8 @@ pub enum RouteAction {
 /// 用户配置 -> RuntimePlan。要求 [`crate::profile::apply_defaults`] 已执行。
 pub fn compile(mut cfg: UserConfig) -> ConfigResult<RuntimePlan> {
     validate_database(&cfg.database)?;
+    normalize_inbounds(&mut cfg)?;
+    let inbounds = cfg.inbounds.clone();
     let listen = compile_listen(&cfg)?;
     let feeds = compile_feeds(&cfg.feeds)?;
     let nodes = compile_nodes(&cfg.nodes)?;
@@ -514,6 +520,7 @@ pub fn compile(mut cfg: UserConfig) -> ConfigResult<RuntimePlan> {
         name: cfg.name.unwrap_or_else(|| "wuthercore".into()),
         log: cfg.log,
         database: cfg.database,
+        inbounds,
         listen,
         feeds,
         nodes,
@@ -526,6 +533,124 @@ pub fn compile(mut cfg: UserConfig) -> ConfigResult<RuntimePlan> {
         mesh,
         find_process_mode,
     })
+}
+
+fn normalize_inbounds(cfg: &mut UserConfig) -> ConfigResult<()> {
+    if cfg.inbounds.is_empty() {
+        return Ok(());
+    }
+
+    let mut tags = HashSet::new();
+    let mut mixed = None;
+    let mut transparent = None;
+
+    for (index, inbound) in cfg.inbounds.iter().enumerate() {
+        let path = format!("inbounds[{index}]");
+        let tag = inbound.tag().trim();
+        if tag.is_empty() {
+            return Err(ConfigError::invalid("inbound tag 不能为空").at(format!("{path}.tag")));
+        }
+        if tag.len() > 128 {
+            return Err(
+                ConfigError::invalid("inbound tag 不能超过 128 字节").at(format!("{path}.tag"))
+            );
+        }
+        if !tags.insert(tag.to_owned()) {
+            return Err(ConfigError::invalid(format!("inbound tag `{tag}` 重复"))
+                .at(format!("{path}.tag"))
+                .hint("每个 inbound 必须使用唯一 tag，供路由规则和连接表引用"));
+        }
+
+        match inbound {
+            Inbound::Mixed(options) if options.enabled => {
+                if mixed.replace((index, options.clone())).is_some() {
+                    return Err(
+                        ConfigError::invalid("当前运行时只允许一个启用的 mixed inbound")
+                            .at(path)
+                            .hint("HTTP 和 SOCKS5 已由 mixed 在同一端口同时提供"),
+                    );
+                }
+            }
+            Inbound::Tun(_) | Inbound::Tproxy(_) | Inbound::Redirect(_) => {
+                if transparent.replace((index, inbound.clone())).is_some() {
+                    return Err(ConfigError::invalid(
+                        "同一进程只能声明一个 tun、tproxy 或 redirect inbound",
+                    )
+                    .at(path)
+                    .hint("透明入站共同占用宿主路由和防火墙资源，不能叠加"));
+                }
+            }
+            Inbound::Mixed(_) => {}
+        }
+    }
+
+    let listen = cfg.listen.get_or_insert_with(|| Listen {
+        local: None,
+        panel: None,
+        xhttp: None,
+        shadowsocks: None,
+        share: None,
+        auth: Vec::new(),
+        reality: Vec::new(),
+        wireguard: Vec::new(),
+        young: Vec::new(),
+        grpc: Vec::new(),
+    });
+    if let Some((index, options)) = mixed {
+        if listen.local.is_some() {
+            return Err(ConfigError::invalid(
+                "inbounds[type=mixed] 与旧 listen.local 不能同时配置",
+            )
+            .at(format!("inbounds[{index}]"))
+            .hint("删除 listen.local，并把监听地址、端口和用户放入 mixed inbound"));
+        }
+        if !listen.auth.is_empty() && !options.users.is_empty() {
+            return Err(
+                ConfigError::invalid("mixed inbound users 与旧 listen.auth 不能同时配置")
+                    .at(format!("inbounds[{index}].users")),
+            );
+        }
+        let mut usernames = HashSet::new();
+        for (user_index, user) in options.users.iter().enumerate() {
+            if user.username.trim().is_empty()
+                || user.password.is_empty()
+                || user.username.contains(':')
+                || !usernames.insert(user.username.clone())
+            {
+                return Err(ConfigError::invalid(
+                    "mixed inbound 用户名必须非空、唯一且不能包含冒号，密码不能为空",
+                )
+                .at(format!("inbounds[{index}].users[{user_index}]")));
+            }
+        }
+        if !options.users.is_empty() {
+            listen.auth = options
+                .users
+                .iter()
+                .map(|user| format!("{}:{}", user.username, user.password))
+                .collect();
+        }
+        listen.local = Some(ListenLocal::Detail(ListenLocalDetail {
+            tag: Some(options.tag),
+            host: options.listen,
+            port: options.listen_port,
+            auth: Vec::new(),
+            udp: options.udp,
+            stream_settings: options.stream_settings,
+        }));
+    }
+
+    if let Some((index, inbound)) = transparent {
+        if cfg.capture.is_some() {
+            return Err(
+                ConfigError::invalid("透明 inbound 与旧 capture 配置不能同时存在")
+                    .at(format!("inbounds[{index}]"))
+                    .hint("删除 capture，并把原 capture.tun 字段直接放到 inbound 条目中"),
+            );
+        }
+        cfg.capture = inbound.transparent_capture();
+    }
+    Ok(())
 }
 
 fn validate_resolver_group_exits(resolver: &Resolver) -> ConfigResult<()> {
@@ -593,12 +718,14 @@ fn compile_listen(cfg: &UserConfig) -> ConfigResult<ListenPlan> {
 
     let mixed = listen.local.map(|l| match l {
         ListenLocal::Port(p) => MixedListen {
+            tag: default_mixed_inbound_tag(),
             host: host_for(share).into(),
             port: p,
             udp: true,
             stream_settings: None,
         },
         ListenLocal::Detail(d) => MixedListen {
+            tag: d.tag.unwrap_or_else(default_mixed_inbound_tag),
             host: if d.host.is_empty() {
                 host_for(share).into()
             } else {

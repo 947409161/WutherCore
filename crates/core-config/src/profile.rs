@@ -9,6 +9,7 @@ use crate::model::*;
 pub fn apply_defaults(cfg: &mut UserConfig) {
     // listen
     let profile = cfg.profile;
+    let canonical_inbounds = !cfg.inbounds.is_empty();
     let listen = cfg.listen.get_or_insert_with(|| Listen {
         local: None,
         panel: None,
@@ -21,7 +22,7 @@ pub fn apply_defaults(cfg: &mut UserConfig) {
         young: vec![],
         grpc: vec![],
     });
-    if listen.local.is_none() {
+    if listen.local.is_none() && !canonical_inbounds {
         listen.local = match profile {
             Profile::Server => None,
             _ => Some(ListenLocal::Port(7890)),
@@ -102,8 +103,10 @@ pub fn apply_defaults(cfg: &mut UserConfig) {
         resolver.fallback.push("cloudflare".into());
     }
 
-    // capture
-    if cfg.capture.is_none() {
+    // Legacy capture defaults are only synthesized when the canonical
+    // `inbounds` catalog is absent. Once a catalog is present it is the sole
+    // authority for data-plane listeners.
+    if cfg.capture.is_none() && !canonical_inbounds {
         cfg.capture = Some(Capture {
             on: matches!(profile, Profile::Router),
             ..Capture::default()

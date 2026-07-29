@@ -127,6 +127,7 @@ async fn http_connect_through_mixed() {
     let plan = core_config::loader::load_from_str(&yaml).unwrap();
     let runtime = Arc::new(Runtime::build(plan).unwrap());
     let listener = MixedListener {
+        tag: "mixed-test".into(),
         listen: format!("127.0.0.1:{mixed_port}").parse().unwrap(),
         auth: None,
         udp: true,
@@ -170,7 +171,7 @@ async fn http_connect_through_mixed() {
     assert_eq!(conn.metadata.destination_port, echo_port.to_string());
     assert_eq!(conn.metadata.inbound_ip, "127.0.0.1");
     assert_eq!(conn.metadata.inbound_port, mixed_port.to_string());
-    assert_eq!(conn.metadata.inbound_name, "http-connect");
+    assert_eq!(conn.metadata.inbound_name, "mixed-test");
     assert_eq!(conn.metadata.host, "127.0.0.1");
     assert_eq!(
         conn.metadata.remote_destination,
@@ -195,6 +196,7 @@ async fn http_absolute_post_preserves_body_and_rewrites_hop_headers() {
     let plan = core_config::loader::load_from_str(&yaml).unwrap();
     let runtime = Arc::new(Runtime::build(plan).unwrap());
     let listener = MixedListener {
+        tag: "mixed-test".into(),
         listen: format!("127.0.0.1:{mixed_port}").parse().unwrap(),
         auth: None,
         udp: true,
@@ -244,6 +246,7 @@ async fn http_absolute_chunked_post_stops_at_message_boundary() {
     let plan = core_config::loader::load_from_str(&yaml).unwrap();
     let runtime = Arc::new(Runtime::build(plan).unwrap());
     let listener = MixedListener {
+        tag: "mixed-test".into(),
         listen: format!("127.0.0.1:{mixed_port}").parse().unwrap(),
         auth: None,
         udp: true,
@@ -292,6 +295,7 @@ async fn socks5_connect_through_mixed() {
     let plan = core_config::loader::load_from_str(&yaml).unwrap();
     let runtime = Arc::new(Runtime::build(plan).unwrap());
     let listener = MixedListener {
+        tag: "mixed-test".into(),
         listen: format!("127.0.0.1:{mixed_port}").parse().unwrap(),
         auth: None,
         udp: true,

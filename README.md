@@ -192,13 +192,17 @@ Naive 依赖 GPL-3.0-or-later 的 Cronet 组件，默认 MIT 构建和默认 Rel
 推荐配置：
 
 ```yaml
-capture:
-  on: true
-  method: auto
-  stack: mixed
-  mtu: 1500
-  offload: true
-  tun:
+inbounds:
+  - type: mixed
+    tag: 本地代理
+    listen: 127.0.0.1
+    listen_port: 7890
+  - type: tun
+    tag: 系统接管
+    stack: mixed
+    dns_mode: hijack
+    mtu: 1500
+    offload: true
     auto-route: true
     strict-route: true
     endpoint-independent-nat: true
@@ -243,7 +247,7 @@ Linux 自动接管细节见 [Linux TUN auto_redirect](docs/LINUX-TUN-AUTO-REDIRE
 * 出站套接字按接口索引绑定，避免默认路由切换后发生自循环。
 * 支持进程路径和进程名识别。
 
-透明代理需要管理员、root 或宿主 VPN 权限。首次部署应先关闭 `capture` 验证普通 HTTP/SOCKS5 和 DNS，再启用系统接管。排错步骤见 [排错手册](docs/TROUBLESHOOTING.md)。
+透明代理需要管理员、root 或宿主 VPN 权限。首次部署应先只启用 `mixed` 验证普通 HTTP/SOCKS5 和 DNS，再加入 `tun`、`tproxy` 或 `redirect`。排错步骤见 [排错手册](docs/TROUBLESHOOTING.md)。
 
 ## 快速开始
 

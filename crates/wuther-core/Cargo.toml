@@ -50,7 +50,7 @@ all_components = ["standard", "with_naive"]
 
 # Runtime components.
 with_api = ["dep:core-api"]
-with_tun = ["dep:core-capture", "core-api?/with_tun"]
+with_tun = ["core-inbound/with_tun", "core-api?/with_tun"]
 
 # Transport/capability tags.
 with_quic = ["core-outbound/with_quic"]
@@ -104,7 +104,6 @@ core-route    = { workspace = true }
 core-resolver = { workspace = true }
 core-smart    = { workspace = true }
 core-api      = { workspace = true, optional = true, default-features = false }
-core-capture  = { workspace = true, optional = true }
 core-mesh     = { workspace = true }
 core-observe  = { workspace = true }
 core-young    = { workspace = true, optional = true }

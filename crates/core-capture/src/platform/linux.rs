@@ -693,14 +693,18 @@ impl CaptureEngine for LinuxTun {
         let listeners = std::mem::take(&mut g.redirect_listeners);
         let mut tasks = JoinSet::new();
         let mut stops = Vec::with_capacity(listeners.len());
+        let inbound_tag: Arc<str> = Arc::from(plan.tag.as_str());
         for listener in listeners {
             let (listener, local_addr) = listener.into_parts();
             let (stop_tx, stop_rx) = oneshot::channel();
             stops.push(stop_tx);
             let events = events.clone();
             let runtime = runtime.clone();
+            let inbound_tag = inbound_tag.clone();
             tasks.spawn(async move {
-                if let Err(error) = run_tcp_redirect(listener, events, runtime, stop_rx).await {
+                if let Err(error) =
+                    run_tcp_redirect(listener, events, runtime, inbound_tag, stop_rx).await
+                {
                     warn!(
                         target: "capture::linux::auto_redirect",
                         %local_addr,
@@ -2290,6 +2294,7 @@ impl CaptureEngine for LinuxTproxy {
         let mut listener_tasks = JoinSet::new();
         let mut listener_stops = Vec::with_capacity(listeners.len() * 2);
         let mut bound_addrs = Vec::with_capacity(listeners.len());
+        let inbound_tag: Arc<str> = Arc::from(self.plan.tag.as_str());
 
         for listeners in listeners {
             let (tcp_listener, udp_socket, bound) = listeners.into_parts();
@@ -2300,11 +2305,13 @@ impl CaptureEngine for LinuxTproxy {
             listener_stops.push(stop_tcp_tx);
             let evt_tcp = events.clone();
             let rt_tcp = runtime.clone();
+            let tcp_inbound_tag = inbound_tag.clone();
             listener_tasks.spawn(async move {
                 if let Err(error) = crate::platform::linux_tproxy::run_tcp_tproxy(
                     tcp_listener,
                     evt_tcp,
                     rt_tcp,
+                    tcp_inbound_tag,
                     stop_tcp_rx,
                 )
                 .await
@@ -2322,11 +2329,13 @@ impl CaptureEngine for LinuxTproxy {
             listener_stops.push(stop_udp_tx);
             let evt_udp = events.clone();
             let rt_udp = runtime.clone();
+            let udp_inbound_tag = inbound_tag.clone();
             listener_tasks.spawn(async move {
                 if let Err(error) = crate::platform::linux_tproxy::run_udp_tproxy(
                     udp_socket,
                     evt_udp,
                     rt_udp,
+                    udp_inbound_tag,
                     stop_udp_rx,
                 )
                 .await
@@ -2436,6 +2445,7 @@ impl CaptureEngine for LinuxRedirect {
         let mut listener_tasks = JoinSet::new();
         let mut listener_stops = Vec::with_capacity(listeners.len());
         let mut bound_addrs = Vec::with_capacity(listeners.len());
+        let inbound_tag: Arc<str> = Arc::from(self.plan.tag.as_str());
         for listener in listeners {
             let (listener, local_addr) = listener.into_parts();
             bound_addrs.push(local_addr);
@@ -2443,8 +2453,11 @@ impl CaptureEngine for LinuxRedirect {
             listener_stops.push(stop_tx);
             let events = events.clone();
             let runtime = runtime.clone();
+            let inbound_tag = inbound_tag.clone();
             listener_tasks.spawn(async move {
-                if let Err(error) = run_tcp_redirect(listener, events, runtime, stop_rx).await {
+                if let Err(error) =
+                    run_tcp_redirect(listener, events, runtime, inbound_tag, stop_rx).await
+                {
                     warn!(
                         target: "capture::redirect",
                         %local_addr,

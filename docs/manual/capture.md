@@ -1,55 +1,58 @@
 ---
 title: 系统接管
-description: Capture、TUN、透明代理与平台差异的完整配置说明
+description: TUN、TPROXY、REDIRECT 入口与平台差异的完整配置说明
 ---
 
 # 系统接管
 
-`capture` 决定哪些系统流量进入 WutherCore，以及进入后由哪种数据面处理。它涉及
+透明 `inbound` 决定哪些系统流量进入 WutherCore，以及进入后由哪种数据面处理。它涉及
 操作系统权限、路由表、防火墙和 TUN 设备，配置成功不代表当前进程一定具备激活权限。
 部署前应先运行 `wuther-core check`，再用与正式服务相同的用户启动。
 
-全部 48 个接管相关字段及枚举见
-[系统接管字段索引](generated/capture-runtime.md#capture)。
+`type` 可选 `tun`、`tproxy` 或 `redirect`。入口参数采用 sing-box 风格的扁平结构，
+不再拆成 `capture` 与 `capture.tun` 两层。
 
 ## 顶层字段
 
 | 字段 | 默认值 | 作用 |
 | --- | --- | --- |
-| `on` | `false` | 是否启用系统流量接管 |
-| `method` | `auto` | 选择 TUN、TPROXY 或 REDIRECT 数据面 |
+| `type` | 必填 | 选择 `tun`、`tproxy` 或 `redirect` |
+| `tag` | 按类型生成 | 路由、连接表、日志和 API 使用的稳定入口名称 |
+| `enabled` | `true` | 是否启用该入口 |
 | `traffic` | `system` | 接管本机、局域网或应用范围 |
-| `resolver` | `hijack` | 是否劫持进入数据面的 DNS 请求 |
+| `dns_mode` | `hijack` | 是否劫持进入数据面的 DNS 请求 |
 | `stack` | `mixed` | 选择 TCP 和 UDP 的协议栈实现 |
 | `mtu` | 平台决定 | 覆盖 TUN 接口 MTU |
 | `offload` | `true` | 在支持的数据面启用批处理或校验和卸载 |
 | `exclude` | 空对象 | 按 CIDR 或进程排除流量 |
-| `tun` | 类型默认值 | TUN 接口、路由与平台过滤参数 |
 
 最小桌面配置：
 
 ```yaml
-capture:
-  on: true
-  method: auto
-  traffic: system
-  resolver: hijack
-  stack: mixed
+inbounds:
+  - type: mixed
+    tag: 本地代理
+    listen_port: 7890
+  - type: tun
+    tag: 系统接管
+    traffic: system
+    dns_mode: hijack
+    stack: mixed
+    auto_route: true
 ```
 
-`profile: router` 会在整个 `capture` 块缺失时默认开启接管。其它 Profile 默认关闭。
-显式写出 `capture` 后，各字段按上表解析。
+只要显式写出 `inbounds`，Profile 就不会再创建旧式 Mixed 或透明接管默认值。
+不写 `inbounds` 的旧配置仍按原 Profile 行为补全。
 
 ## 接管方法
 
-| `method` | 适用场景 | 关键限制 |
+| `type` | 适用场景 | 关键限制 |
 | --- | --- | --- |
-| `auto` | 让运行计划按平台选择 | 生产配置仍应检查 `explain` 的最终结果 |
-| `virtual_nic` | TUN 虚拟网卡 | 兼容别名为 `tun`，要求组件 `with_tun` |
+| `tun` | TUN 虚拟网卡 | 要求组件 `with_tun` |
 | `tproxy` | Linux 或 Android root 透明代理 | 需要策略路由、防火墙权限和内核支持 |
 | `redirect` | Linux 或 Android root TCP REDIRECT | UDP 需要其它数据面配合 |
 
-`virtual_nic` 是跨平台配置入口，但设备创建方式不同。Linux 可以由进程创建和管理
+`tun` 是跨平台配置入口，但设备创建方式不同。Linux 可以由进程创建和管理
 设备。Android root daemon 优先直接打开 `/dev/net/tun`，打开失败后才使用宿主
 注入的 VpnService 文件描述符。macOS 和 Windows 受系统扩展、签名、权限和宿主
 集成约束。
@@ -72,13 +75,13 @@ Android 的 root TUN、TPROXY、REDIRECT、VpnService、权限边界和完整配
 
 ## DNS 劫持
 
-`resolver: hijack` 将进入接管数据面的 DNS 请求交给 WutherCore Resolver。
-`resolver: off` 保留原有 DNS 路径。要避免循环：
+`dns_mode: hijack` 将进入接管数据面的 DNS 请求交给 WutherCore Resolver。
+`dns_mode: off` 保留原有 DNS 路径。要避免循环：
 
 1. Resolver 上游必须能通过选定出站访问。
 2. 本地监听地址不能再次被 TUN 接管。
 3. Fake IP 模式必须与路由和应用兼容。
-4. 调试时先用 `resolver: off` 区分 DNS 问题和数据面问题。
+4. 调试时先用 `dns_mode: off` 区分 DNS 问题和数据面问题。
 
 Resolver 的服务器、策略、Fallback 和 Fake IP 配置见
 [策略组、路由与 DNS](routing-dns.md)。
@@ -108,14 +111,16 @@ Resolver 的服务器、策略、Fallback 和 Fake IP 配置见
 ## 排除项
 
 ```yaml
-capture:
-  exclude:
-    cidr:
-      - 127.0.0.0/8
-      - ::1/128
-      - 192.168.0.0/16
-    process:
-      - wuther-core
+inbounds:
+  - type: tun
+    tag: system-tun
+    exclude:
+      cidr:
+        - 127.0.0.0/8
+        - ::1/128
+        - 192.168.0.0/16
+      process:
+        - wuther-core
 ```
 
 `exclude.cidr` 使用 CIDR。`exclude.process` 使用平台进程查询结果，能力受操作系统、
@@ -137,10 +142,9 @@ capture:
 地址示例：
 
 ```yaml
-capture:
-  on: true
-  method: virtual_nic
-  tun:
+inbounds:
+  - type: tun
+    tag: system-tun
     interface_name: rpktun0
     address:
       - 172.19.0.1/30
@@ -197,8 +201,9 @@ UID 和 GID 范围写成闭区间字符串，例如 `"1000:99999"`。
 ### 平台 HTTP 代理
 
 ```yaml
-capture:
-  tun:
+inbounds:
+  - type: tun
+    tag: system-tun
     platform:
       http_proxy:
         enabled: true
@@ -215,13 +220,13 @@ capture:
 
 ## Linux `auto_redirect`
 
-`tun.auto_redirect` 是 Linux root-managed TUN 的安全子集：
+`auto_redirect` 是 Linux root-managed TUN 的安全子集：
 
 - TCP 通过 nftables NAT REDIRECT 进入临时监听。
 - UDP 通过策略路由进入 TUN。
 - ICMP 和其它协议不新增接管规则。
 - `traffic` 必须为 `system`。
-- `method` 必须为 `virtual_nic`。
+- `type` 必须为 `tun`。
 - `auto_route` 必须开启，`strict_route` 必须关闭。
 
 输出 mark 可以省略，省略或写 `0` 时使用 `0x2024`。当前实现拒绝显式 input mark、
@@ -236,7 +241,7 @@ reset mark、NFQUEUE、fallback rule index、动态路由集合及平台过滤�
 
 | 能力 | Linux | Android | macOS | Windows |
 | --- | --- | --- | --- | --- |
-| `virtual_nic` 配置模型 | 支持 | 支持 | 支持 | 支持 |
+| `tun` 配置模型 | 支持 | 支持 | 支持 | 支持 |
 | 进程自行创建 TUN | 支持，需要权限 | root daemon 支持 `/dev/net/tun` | 取决于宿主集成 | 取决于宿主集成 |
 | 非 root TUN | 不适用 | VpnService fd | 取决于宿主集成 | 取决于宿主集成 |
 | 显式 TPROXY | 支持 | root daemon 支持 TCP 和 UDP | 不支持 | 不支持 |
@@ -248,6 +253,22 @@ reset mark、NFQUEUE、fallback rule index、动态路由集合及平台过滤�
 
 该表描述配置入口，不替代运行时能力检查。最终结果以 `check`、`explain` 和启动日志
 为准。
+
+## 旧配置迁移
+
+旧的 `capture` 仍可读取。迁移时按下面的规则展开：
+
+| 旧字段 | 新字段 |
+| --- | --- |
+| `capture.on` | `inbounds[].enabled` |
+| `capture.method: virtual_nic` | `inbounds[].type: tun` |
+| `capture.method: tproxy` | `inbounds[].type: tproxy` |
+| `capture.method: redirect` | `inbounds[].type: redirect` |
+| `capture.resolver` | `inbounds[].dns_mode` |
+| `capture.tun.*` | 直接放入同一个 `inbounds[]` 条目 |
+
+新旧透明入口不能同时配置。`capture.method: auto` 没有直接对应的新值，迁移时应根据
+目标平台明确选择 `tun`、`tproxy` 或 `redirect`。
 
 ## 验证顺序
 

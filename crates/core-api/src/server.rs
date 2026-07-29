@@ -35,6 +35,8 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
+#[cfg(feature = "with_tun")]
+use core_inbound::transparent as core_capture;
 use core_runtime::{Runtime, UrlTester};
 use serde::Deserialize;
 use serde_json::json;
