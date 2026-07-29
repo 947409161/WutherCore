@@ -25,6 +25,7 @@ const ETH_P_IPV6: u16 = 0x86dd;
 const ETH_P_8021Q: u16 = 0x8100;
 const ETH_P_8021AD: u16 = 0x88a8;
 const ETH_HEADER_LEN: usize = 14;
+const IPV6_TRANSPORT_NONE: u64 = u64::MAX;
 
 const FLAG_INCLUDE_UID: u32 = 1 << 0;
 const FLAG_IPV4: u32 = 1 << 1;
@@ -342,12 +343,14 @@ fn select_shared_v6(ctx: &TcContext, offset: usize, config: &EbpfConfig) {
             return;
         }
     };
-    let Some((transport, transport_offset, first_fragment)) =
-        ipv6_transport(ctx, offset + 40, offset)
-    else {
+    let transport_result = ipv6_transport(ctx, offset + 40, offset);
+    if transport_result == IPV6_TRANSPORT_NONE {
         increment_shared(config.flags, STAT_SHARED_UNSUPPORTED);
         return;
-    };
+    }
+    let transport = transport_result as u8;
+    let first_fragment = transport_result & (1 << 8) != 0;
+    let transport_offset = (transport_result >> 16) as usize;
     if transport != IPPROTO_TCP as u8 && transport != IPPROTO_UDP as u8 {
         increment_shared(config.flags, STAT_SHARED_UNSUPPORTED);
         return;
@@ -387,9 +390,11 @@ fn assign_marked_socket(ctx: &TcContext) {
             assign_tc_transport(ctx, AF_INET, transport)
         }
         ETH_P_IPV6 if config.flags & FLAG_IPV6 != 0 => {
-            let Some((transport, _, _)) = ipv6_transport(ctx, 40, 0) else {
+            let transport_result = ipv6_transport(ctx, 40, 0);
+            if transport_result == IPV6_TRANSPORT_NONE {
                 return;
-            };
+            }
+            let transport = transport_result as u8;
             assign_tc_transport(ctx, AF_INET6, transport)
         }
         _ => return,
@@ -428,37 +433,56 @@ fn assign_tc_socket(ctx: &TcContext, sockets: &SockMap, mut index: u32) -> Resul
     }
 }
 
-fn ipv6_transport(
-    ctx: &TcContext,
-    mut offset: usize,
-    ipv6_offset: usize,
-) -> Option<(u8, usize, bool)> {
-    let mut next = ctx.load::<u8>(ipv6_offset + 6).ok()?;
+fn ipv6_transport(ctx: &TcContext, mut offset: usize, ipv6_offset: usize) -> u64 {
+    let mut next = match ctx.load::<u8>(ipv6_offset + 6) {
+        Ok(value) => value,
+        Err(_) => return IPV6_TRANSPORT_NONE,
+    };
     let mut first_fragment = true;
     let mut depth = 0;
     while depth < 6 {
         match next {
             0 | 43 | 60 => {
-                next = ctx.load::<u8>(offset).ok()?;
-                let length = usize::from(ctx.load::<u8>(offset + 1).ok()?);
+                next = match ctx.load::<u8>(offset) {
+                    Ok(value) => value,
+                    Err(_) => return IPV6_TRANSPORT_NONE,
+                };
+                let length = match ctx.load::<u8>(offset + 1) {
+                    Ok(value) => usize::from(value),
+                    Err(_) => return IPV6_TRANSPORT_NONE,
+                };
                 offset += (length + 1) * 8;
             }
             44 => {
-                next = ctx.load::<u8>(offset).ok()?;
-                let fragment = u16::from_be(ctx.load::<u16>(offset + 2).ok()?);
+                next = match ctx.load::<u8>(offset) {
+                    Ok(value) => value,
+                    Err(_) => return IPV6_TRANSPORT_NONE,
+                };
+                let fragment = match ctx.load::<u16>(offset + 2) {
+                    Ok(value) => u16::from_be(value),
+                    Err(_) => return IPV6_TRANSPORT_NONE,
+                };
                 first_fragment = fragment & 0xfff8 == 0;
                 offset += 8;
             }
             51 => {
-                next = ctx.load::<u8>(offset).ok()?;
-                let length = usize::from(ctx.load::<u8>(offset + 1).ok()?);
+                next = match ctx.load::<u8>(offset) {
+                    Ok(value) => value,
+                    Err(_) => return IPV6_TRANSPORT_NONE,
+                };
+                let length = match ctx.load::<u8>(offset + 1) {
+                    Ok(value) => usize::from(value),
+                    Err(_) => return IPV6_TRANSPORT_NONE,
+                };
                 offset += (length + 2) * 4;
             }
-            _ => return Some((next, offset, first_fragment)),
+            _ => {
+                return u64::from(next) | ((first_fragment as u64) << 8) | ((offset as u64) << 16);
+            }
         }
         depth += 1;
     }
-    None
+    IPV6_TRANSPORT_NONE
 }
 
 fn shared_source_v4_allowed(address: [u8; 4], flags: u32) -> bool {
