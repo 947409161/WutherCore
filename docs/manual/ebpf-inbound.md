@@ -1,6 +1,6 @@
 ---
 title: Aya eBPF 入站
-description: Linux 与 Android root 的无 netfilter 流量接管、UID 过滤、规则集旁路和 DNS 劫持
+description: Linux 与 Android root 的本机流量、热点共享、规则集旁路和 DNS 劫持
 ---
 
 # Aya eBPF 入站
@@ -12,10 +12,17 @@ Aya eBPF 入站属于 `core-inbound`。配置直接写在 `inbounds`，不会转
 
 本机进程创建 TCP 连接或发送 UDP 数据时，挂在 cgroup v2 的 connect4、
 connect6、sendmsg4 和 sendmsg6 程序读取 UID、TGID、目标地址和目标端口。
-符合条件的 socket 获得专用 mark。对应的 IPv4 或 IPv6 策略路由把带 mark 的
-包送到本机 local route。挂在当前 network namespace 的 sk_lookup 程序只接受
-从 loopback 策略路由返回的包，再把 TCP 或 UDP 包分配给 `core-inbound` 持有的
-透明 socket。物理接口进入的真实服务流量不会被该程序接管。
+符合条件的 socket 获得专用 mark。
+
+启用 `shared_network` 后，TC ingress 程序会挂到匹配的热点、USB 共享、蓝牙
+PAN、网桥或路由下游接口。它解析 Ethernet、双层 VLAN、IPv4、IPv6 扩展头和
+分片信息，按源地址与目标旁路集合筛选 TCP/UDP。选中的转发包直接写入同一个
+mark，不依赖发起进程 UID。
+
+对应的 IPv4 或 IPv6 策略路由把带 mark 的包送到本机 local route。挂在当前
+network namespace 的 sk_lookup 程序只接受 loopback 返回流量和已经登记的共享
+网络接口，再把 TCP 或 UDP 包分配给 `core-inbound` 持有的透明 socket。未匹配
+接口进入的真实服务流量不会被接管。
 
 核心进程自身的 TGID 始终旁路，避免出站再次进入 eBPF 入站。回环、链路本地、
 RFC1918、CGNAT、ULA、组播、广播、redirect 地址和宿主接口地址也会进入内核
@@ -52,6 +59,38 @@ inbounds:
     rule_priority: 8999
     mark: 721
     map_capacity: 65536
+
+    shared_network:
+      enabled: true
+      include_interface:
+        - ap*
+        - swlan*
+        - wlan*
+        - rndis*
+        - usb*
+        - bt-pan*
+        - bnep*
+        - br*
+        - eth*
+        - en*
+      exclude_interface:
+        - lo
+        - tun*
+        - tap*
+        - wg*
+        - rpktun*
+        - docker*
+        - veth*
+        - rmnet*
+        - ccmni*
+        - wwan*
+      include_source_address:
+        - 0.0.0.0/0
+        - ::/0
+      exclude_source_address: []
+      interface_refresh_interval: 3s
+      tc_priority: 1
+
     dns_mode: hijack
 ```
 
@@ -72,10 +111,44 @@ inbounds:
 | `rule_priority` | fwmark rule 优先级，必须排在 main rule 之前 |
 | `mark` | eBPF 写入 socket 的非零 mark |
 | `map_capacity` | 每个 UID hash map 和每个 IP LPM map 的容量 |
+| `shared_network` | 热点、网络共享和路由转发流量接管 |
 | `dns_mode` | `hijack` 接管 TCP/UDP 53，`off` 按普通流量处理 |
 
 包含 UID 列表和区间都为空时，默认接管所有 UID。精确 UID 和区间可以同时使用，
 两者是并集。任何排除条件命中后都不会接管。
+
+## 热点与共享网络
+
+`shared_network.enabled: true` 开启转发设备接管。该功能不会创建热点、DHCP、
+NAT 或修改系统 IP forwarding。Android 系统、NetworkManager、hostapd 或用户
+自己的路由服务仍负责建立共享网络，核心只处理进入下游接口的 TCP 和 UDP。
+
+| 字段 | 行为 |
+| --- | --- |
+| `enabled` | 开启 TC ingress 共享网络接管 |
+| `include_interface` | 允许挂载的 Linux 接口名 glob，支持接口数组或单值 |
+| `exclude_interface` | 排除接口名 glob，优先级高于包含模式 |
+| `include_source_address` | 允许接管的下游源 CIDR；空列表表示任意源地址 |
+| `exclude_source_address` | 不接管的源 CIDR，优先级高于包含地址 |
+| `interface_refresh_interval` | 接口重扫周期，范围 `1s..=5m` |
+| `tc_priority` | 旧内核 clsact 挂载的 TC 优先级，数值越小越先执行 |
+
+接口会按刷新周期重新扫描。Android 开启或关闭 Wi-Fi 热点、USB 网络共享、蓝牙
+网络共享时，不需要重启核心。Linux 新增或删除 bridge、AP 和有线下游接口也会
+自动挂载或卸载。
+
+Linux 6.6 及更新内核优先使用 TCX，并把程序放在已有 TCX 链的前面。旧内核自动
+使用 clsact direct-action，`tc_priority` 默认 1，使接管发生在常见硬件 offload
+和 Android tethering offload 程序之前。已经存在的 clsact 不会被删除或替换。
+
+默认接口模式覆盖常见的 `ap`、`swlan`、`wlan`、`rndis`、`usb`、`bt-pan`、
+`bnep`、bridge 和以太网名称，并排除 TUN、WireGuard、容器 veth 与移动数据
+上游接口。目标是宿主地址、私网、链路本地、组播或广播时仍按内核旁路集合直接
+通过；53 端口在 `dns_mode: hijack` 下例外，会进入核心 DNS 服务。
+
+热点客户端的真实源地址作为连接表 `source`，原始远端地址作为 `destination`，
+不会把节点服务器地址写入连接表。TCP、UDP 和 QUIC 都进入统一路由、策略组、
+Clash API 与流量统计。ICMP、ARP、NDP 和其它非 TCP/UDP 协议保持系统原路径。
 
 ## 规则集同步
 
@@ -126,6 +199,7 @@ GitHub Build Matrix 在选择该标签时会安装并缓存同一套工具。
 - Linux 或 Android root 环境
 - cgroup v2 挂载点
 - 支持 cgroup sock_addr 与 sk_lookup 的内核
+- 热点共享需要 SCHED_CLS、TCX 或 clsact 支持
 - 可加载 BPF 程序和创建 BPF map 的权限
 - 修改策略路由、socket mark 与透明 socket 的权限
 
@@ -136,12 +210,12 @@ sk_lookup 需要 Linux 5.9 或更新内核。Android 厂商内核还可能单独
 ## 启动与清理
 
 启动顺序是加载 map 和程序、绑定透明 socket、挂载 sk_lookup、安装策略路由、
-最后挂载 cgroup 程序。只有最后一步完成后应用流量才会获得 mark。
+挂载共享接口 TC，最后挂载 cgroup 程序。TC 或 cgroup 挂载失败时会回滚已有
+link、策略路由和 socket。
 
-关闭时顺序相反。核心先移除 cgroup 程序，阻止新 socket 进入，再删除策略路由，
-移除 sk_lookup，停止 TCP 和 UDP relay。启动失败会回滚已经完成的步骤。进程异常
-退出后 BPF link 随文件描述符关闭，下一次启动还会删除该 tag 配置对应的旧策略
-路由状态。
+关闭时核心先移除共享接口 TC 和 cgroup 程序，阻止新流量进入，再删除策略路由、
+移除 sk_lookup，停止 TCP 和 UDP relay。进程异常退出后 BPF link 随文件描述符
+关闭，下一次启动还会删除该 tag 配置对应的旧策略路由状态。
 
 ## 诊断
 
@@ -159,6 +233,8 @@ wuther-core components
 | 加载或 verifier 失败 | 内核 BPF 配置、程序类型和权限 |
 | 创建透明 socket 失败 | root 或网络管理能力，redirect 地址格式 |
 | 安装 fwmark rule 失败 | `route_table`、`rule_priority`、外部策略路由冲突 |
+| 热点客户端未进入连接表 | 接口是否匹配、TC 能力、源 CIDR、状态中的共享接口列表 |
+| Android 热点开关后无流量 | 缩短 `interface_refresh_interval`，检查实际下游接口名 |
 | 规则集不可用 | 规则集 URL、缓存、格式、类型和首次刷新日志 |
 | map 容量不足 | 增大 `map_capacity`，或缩小旁路规则集 |
 

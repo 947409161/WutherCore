@@ -98,6 +98,8 @@ Linux 或 Android root TCP REDIRECT。
 capture supervisor，也不安装 iptables、nftables、TPROXY 或 REDIRECT 规则。
 它使用 cgroup socket address 程序选择本机进程流量，使用策略路由把选中的
 socket 送回本机协议栈，再由 `sk_lookup` 分配给核心持有的 TCP 和 UDP socket。
+启用 `shared_network` 时，它还会把 TC ingress 挂到热点和共享网络的下游接口，
+接管转发设备的 TCP、UDP、DNS 与 QUIC 流量。
 
 ```yaml
 inbounds:
@@ -116,6 +118,14 @@ inbounds:
     rule_priority: 8999
     mark: 721
     map_capacity: 65536
+    shared_network:
+      enabled: true
+      include_interface: [ap*, wlan*, rndis*, usb*, bt-pan*, br*, eth*, en*]
+      exclude_interface: [lo, tun*, wg*, rpktun*, docker*, veth*, rmnet*, ccmni*]
+      include_source_address: [0.0.0.0/0, "::/0"]
+      exclude_source_address: []
+      interface_refresh_interval: 3s
+      tc_priority: 1
     dns_mode: hijack
 ```
 
@@ -123,6 +133,7 @@ inbounds:
 `bypass_rule_set` 必须引用已经加载并能提取目标 IP 前缀的规则集。规则集刷新
 先写入备用 LPM map，全部成功后再切换活动 map，因此运行流量不会看到半份规则。
 `dns_mode: hijack` 同时接管 UDP 和 TCP 53，并交给核心 DNS 服务处理。
+共享接口按 glob 动态发现，Android 开关热点或 USB 共享后无需重启核心。
 
 该入口要求 `with_ebpf` 组件、root 或等价的 BPF 与网络管理能力、cgroup v2，
 以及支持 cgroup sock_addr 和 sk_lookup 的内核。完整部署、字段语义和诊断方法见

@@ -2,6 +2,7 @@
 //!
 //! The data plane is independent from the legacy capture subsystem:
 //! cgroup socket-address programs select eligible local TCP/UDP sockets,
+//! a TC ingress classifier selects hotspot and forwarded-device traffic,
 //! policy routing feeds marked packets back into the local transport lookup,
 //! and an `sk_lookup` program assigns them directly to proxy-owned sockets.
 
@@ -79,6 +80,7 @@ pub struct EbpfInboundStatus {
     pub tag: String,
     pub running: bool,
     pub anchors: Vec<std::net::SocketAddr>,
+    pub shared_interfaces: Vec<String>,
     pub rule_set_revision: u64,
     pub stats: EbpfStats,
 }
@@ -156,8 +158,18 @@ pub async fn start_ebpf_inbound(
             return Err(error);
         }
     };
+    let shared_interfaces = match plane.reconcile_shared_interfaces(&options.shared_network) {
+        Ok(interfaces) => interfaces,
+        Err(error) => {
+            let _ = plane.detach_shared_interfaces();
+            policy.remove().await;
+            let _ = plane.detach_lookup();
+            return Err(error);
+        }
+    };
     if let Err(error) = plane.attach_cgroup(&options.cgroup_path) {
         let _ = plane.detach_cgroup();
+        let _ = plane.detach_shared_interfaces();
         policy.remove().await;
         let _ = plane.detach_lookup();
         return Err(error);
@@ -194,6 +206,7 @@ pub async fn start_ebpf_inbound(
         tag: options.tag.clone(),
         running: true,
         anchors: anchors.clone(),
+        shared_interfaces: shared_interfaces.clone(),
         rule_set_revision: snapshot.revision,
         stats: initial_stats,
     };
@@ -215,6 +228,7 @@ pub async fn start_ebpf_inbound(
         target: "inbound::ebpf",
         tag = %tag,
         ?anchors,
+        ?shared_interfaces,
         revision = snapshot.revision,
         "Aya eBPF inbound started"
     );
@@ -258,6 +272,11 @@ async fn run_controller(
 ) -> Result<(), EbpfInboundError> {
     let mut stats_tick = tokio::time::interval(Duration::from_secs(10));
     stats_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut interface_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + options.shared_network.interface_refresh_interval,
+        options.shared_network.interface_refresh_interval,
+    );
+    interface_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut revision = status.borrow().rule_set_revision;
     loop {
         tokio::select! {
@@ -266,6 +285,18 @@ async fn run_controller(
             _ = stats_tick.tick() => {
                 if let Ok(stats) = plane.stats() {
                     status.send_modify(|current| current.stats = stats);
+                }
+            }
+            _ = interface_tick.tick(), if options.shared_network.enabled => {
+                match plane.reconcile_shared_interfaces(&options.shared_network) {
+                    Ok(interfaces) => {
+                        status.send_modify(|current| current.shared_interfaces = interfaces);
+                    }
+                    Err(error) => warn!(
+                        target: "inbound::ebpf",
+                        %error,
+                        "failed to reconcile shared-network eBPF interfaces"
+                    ),
                 }
             }
             changed = async {
@@ -308,6 +339,7 @@ async fn run_controller(
         }
     }
 
+    let shared_detach_result = plane.detach_shared_interfaces();
     let detach_result = plane.detach_cgroup();
     policy.remove().await;
     let lookup_result = plane.detach_lookup();
@@ -318,9 +350,11 @@ async fn run_controller(
         tag: options.tag.clone(),
         running: false,
         anchors,
+        shared_interfaces: plane.shared_interfaces(),
         rule_set_revision: revision,
         stats,
     });
+    shared_detach_result?;
     detach_result?;
     lookup_result?;
     info!(target: "inbound::ebpf", tag = %options.tag, "Aya eBPF inbound stopped");

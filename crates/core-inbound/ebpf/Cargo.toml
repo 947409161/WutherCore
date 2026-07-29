@@ -2,7 +2,7 @@
 
 [package]
 name = "core-inbound-ebpf"
-version = "0.3.7"
+version = "0.3.8"
 edition = "2024"
 license = "MIT"
 
@@ -21,4 +21,3 @@ debug = 2
 codegen-units = 1
 strip = false
 lto = "off"
-

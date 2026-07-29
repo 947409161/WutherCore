@@ -66,6 +66,7 @@ subtle        = "2.6"
 rand          = { workspace = true }
 url           = { workspace = true }
 ipnet         = { workspace = true }
+globset       = { workspace = true }
 shadowsocks   = { workspace = true, optional = true }
 
 # XHTTP/SplitHTTP inbound: HTTP/1.1 + HTTP/2 over TCP/TLS and HTTP/3 over QUIC.

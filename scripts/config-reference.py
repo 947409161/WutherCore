@@ -512,6 +512,7 @@ def category_for(name: str, source: Path) -> str:
         "InboundUser",
         "MixedInboundOptions",
         "EbpfInboundOptions",
+        "EbpfSharedNetworkOptions",
         "TransparentInboundOptions",
         "Listen",
         "PanelBind",

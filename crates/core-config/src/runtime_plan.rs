@@ -761,6 +761,11 @@ fn validate_ebpf_inbound(options: &EbpfInboundOptions, path: &str, os: &str) -> 
         return Err(ConfigError::invalid("map_capacity 必须在 1024..=1048576")
             .at(format!("{path}.map_capacity")));
     }
+    validate_ebpf_shared_network(
+        &options.shared_network,
+        options.map_capacity,
+        &format!("{path}.shared_network"),
+    )?;
     for (field, values) in [
         ("include_uid", &options.include_uid),
         ("exclude_uid", &options.exclude_uid),
@@ -789,6 +794,81 @@ fn validate_ebpf_inbound(options: &EbpfInboundOptions, path: &str, os: &str) -> 
                     .at(format!("{path}.bypass_rule_set[{index}]")),
             );
         }
+    }
+    Ok(())
+}
+
+fn validate_ebpf_shared_network(
+    shared: &EbpfSharedNetworkOptions,
+    map_capacity: u32,
+    path: &str,
+) -> ConfigResult<()> {
+    if !shared.enabled {
+        return Ok(());
+    }
+    if shared.include_interface.is_empty() {
+        return Err(
+            ConfigError::invalid("启用共享网络接管时 include_interface 不能为空")
+                .at(format!("{path}.include_interface"))
+                .hint("热点可使用 ap*、wlan*，USB 共享可使用 rndis*、usb*"),
+        );
+    }
+    for (field, patterns) in [
+        ("include_interface", &shared.include_interface),
+        ("exclude_interface", &shared.exclude_interface),
+    ] {
+        let mut unique = HashSet::new();
+        for (index, pattern) in patterns.iter().enumerate() {
+            if pattern.trim().is_empty() || !unique.insert(pattern.as_str()) {
+                return Err(
+                    ConfigError::invalid(format!("{field} 不能包含空值或重复模式"))
+                        .at(format!("{path}.{field}[{index}]")),
+                );
+            }
+            Glob::new(pattern).map_err(|error| {
+                ConfigError::invalid(format!("{field}[{index}] 不是合法 glob: {error}"))
+                    .at(format!("{path}.{field}[{index}]"))
+            })?;
+        }
+    }
+    for (field, addresses) in [
+        ("include_source_address", &shared.include_source_address),
+        ("exclude_source_address", &shared.exclude_source_address),
+    ] {
+        if addresses.len() > map_capacity as usize {
+            return Err(
+                ConfigError::invalid(format!("{field} 条目数不能超过 map_capacity"))
+                    .at(format!("{path}.{field}")),
+            );
+        }
+        let mut unique = HashSet::new();
+        for (index, value) in addresses.iter().enumerate() {
+            if value.parse::<ipnet::IpNet>().is_err() {
+                return Err(ConfigError::invalid(format!(
+                    "{field}[{index}] 不是合法 CIDR: {value}"
+                ))
+                .at(format!("{path}.{field}[{index}]")));
+            }
+            if !unique.insert(value.as_str()) {
+                return Err(
+                    ConfigError::invalid(format!("{field} 不能包含重复 CIDR: {value}"))
+                        .at(format!("{path}.{field}[{index}]")),
+                );
+            }
+        }
+    }
+    if !(Duration::from_secs(1)..=Duration::from_secs(300))
+        .contains(&shared.interface_refresh_interval)
+    {
+        return Err(
+            ConfigError::invalid("interface_refresh_interval 必须在 1s..=5m")
+                .at(format!("{path}.interface_refresh_interval")),
+        );
+    }
+    if shared.tc_priority == 0 {
+        return Err(
+            ConfigError::invalid("tc_priority 必须在 1..=65535").at(format!("{path}.tc_priority"))
+        );
     }
     Ok(())
 }
@@ -7722,6 +7802,39 @@ route: {preset: direct, final: direct}
                 .unwrap_err()
                 .to_string()
                 .contains("重复 UID")
+        );
+    }
+
+    #[test]
+    fn ebpf_shared_network_validates_interface_and_source_filters() {
+        let mut options: EbpfInboundOptions = serde_json::from_value(serde_json::json!({
+            "shared_network": {
+                "enabled": true,
+                "include_interface": ["ap*", "rndis*"],
+                "exclude_interface": ["rmnet*"],
+                "include_source_address": ["192.168.43.0/24", "fd00:43::/64"],
+                "exclude_source_address": ["192.168.43.1/32"],
+                "interface_refresh_interval": "2s",
+                "tc_priority": 1
+            }
+        }))
+        .unwrap();
+        validate_ebpf_inbound(&options, "inbounds[0]", "android").unwrap();
+
+        options.shared_network.include_interface = vec!["[".into()];
+        assert!(
+            validate_ebpf_inbound(&options, "inbounds[0]", "linux")
+                .unwrap_err()
+                .to_string()
+                .contains("合法 glob")
+        );
+        options.shared_network.include_interface = vec!["ap*".into()];
+        options.shared_network.include_source_address = vec!["192.168.43.999/24".into()];
+        assert!(
+            validate_ebpf_inbound(&options, "inbounds[0]", "linux")
+                .unwrap_err()
+                .to_string()
+                .contains("合法 CIDR")
         );
     }
 

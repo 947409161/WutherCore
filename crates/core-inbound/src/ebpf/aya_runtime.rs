@@ -1,4 +1,8 @@
-use std::{collections::BTreeSet, fs::File, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::{self, File},
+    path::Path,
+};
 
 use aya::{
     Ebpf, EbpfLoader, Pod,
@@ -7,16 +11,20 @@ use aya::{
         lpm_trie::{Key, LpmTrie},
     },
     programs::{
-        CgroupAttachMode, CgroupSockAddr, SkLookup, cgroup_sock_addr::CgroupSockAddrLinkId,
+        CgroupAttachMode, CgroupSockAddr, LinkOrder, SchedClassifier, SkLookup, TcAttachType,
+        cgroup_sock_addr::CgroupSockAddrLinkId,
         sk_lookup::SkLookupLinkId,
+        tc::{NlOptions, SchedClassifierLinkId, TcAttachOptions, TcHandle, qdisc_add_clsact},
     },
 };
-use core_config::model::EbpfInboundOptions;
+use core_config::model::{EbpfInboundOptions, EbpfSharedNetworkOptions};
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use nix::{
     ifaddrs::getifaddrs,
     net::if_::if_nametoindex,
     sys::resource::{RLIM_INFINITY, Resource, setrlimit},
 };
+use tracing::{debug, info};
 
 use super::{BypassPrefixSnapshot, EbpfInboundError, socket::FamilySockets};
 
@@ -24,9 +32,21 @@ const FLAG_INCLUDE_UID: u32 = 1 << 0;
 const FLAG_IPV4: u32 = 1 << 1;
 const FLAG_IPV6: u32 = 1 << 2;
 const FLAG_HIJACK_DNS: u32 = 1 << 3;
+const FLAG_SHARED_NETWORK: u32 = 1 << 4;
+const FLAG_SHARED_SOURCE_ANY: u32 = 1 << 5;
 const MAX_UID_RANGES: usize = 256;
+const MAX_SHARED_INTERFACES: usize = 256;
 
 const CGROUP_PROGRAMS: [&str; 4] = ["connect4", "connect6", "sendmsg4", "sendmsg6"];
+
+type V4PrefixSet = BTreeSet<(u8, [u8; 4])>;
+type V6PrefixSet = BTreeSet<(u8, [u8; 16])>;
+type PrefixSets = (V4PrefixSet, V6PrefixSet);
+type RelaySockets = (
+    Vec<tokio::net::TcpListener>,
+    Vec<tokio::net::UdpSocket>,
+    Vec<std::net::SocketAddr>,
+);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -60,6 +80,22 @@ pub struct EbpfStats {
     pub lookup_assigned: u64,
     pub lookup_failed: u64,
     pub bypass_ingress: u64,
+    pub shared_selected: u64,
+    pub shared_bypass_source: u64,
+    pub shared_bypass_destination: u64,
+    pub shared_unsupported: u64,
+    pub shared_lookup_assigned: u64,
+    pub shared_lookup_failed: u64,
+}
+
+struct SharedLink {
+    ifindex: u32,
+    link: SchedClassifierLinkId,
+}
+
+struct SharedInterfaceMatcher {
+    include: GlobSet,
+    exclude: GlobSet,
 }
 
 pub(super) struct AyaDataPlane {
@@ -67,9 +103,12 @@ pub(super) struct AyaDataPlane {
     sockets: FamilySockets,
     cgroup_links: Vec<(&'static str, CgroupSockAddrLinkId)>,
     lookup_link: Option<SkLookupLinkId>,
+    shared_program_loaded: bool,
+    shared_links: BTreeMap<String, SharedLink>,
+    shared_matcher: Option<SharedInterfaceMatcher>,
     active_bypass_bank: usize,
-    bank_v4: [BTreeSet<(u8, [u8; 4])>; 2],
-    bank_v6: [BTreeSet<(u8, [u8; 16])>; 2],
+    bank_v4: [V4PrefixSet; 2],
+    bank_v6: [V6PrefixSet; 2],
 }
 
 impl AyaDataPlane {
@@ -103,7 +142,11 @@ impl AyaDataPlane {
             .map_max_entries("BYPASS_V4", options.map_capacity)
             .map_max_entries("BYPASS_V6", options.map_capacity)
             .map_max_entries("BYPASS_V4_ALT", options.map_capacity)
-            .map_max_entries("BYPASS_V6_ALT", options.map_capacity);
+            .map_max_entries("BYPASS_V6_ALT", options.map_capacity)
+            .map_max_entries("SHARED_SOURCE_V4", options.map_capacity)
+            .map_max_entries("SHARED_SOURCE_V6", options.map_capacity)
+            .map_max_entries("SHARED_EXCLUDE_SOURCE_V4", options.map_capacity)
+            .map_max_entries("SHARED_EXCLUDE_SOURCE_V6", options.map_capacity);
         let mut ebpf = loader
             .load(aya::include_bytes_aligned!(concat!(
                 env!("OUT_DIR"),
@@ -141,6 +184,12 @@ impl AyaDataPlane {
         ) {
             flags |= FLAG_HIJACK_DNS;
         }
+        if options.shared_network.enabled {
+            flags |= FLAG_SHARED_NETWORK;
+            if options.shared_network.include_source_address.is_empty() {
+                flags |= FLAG_SHARED_SOURCE_ANY;
+            }
+        }
         {
             let map = ebpf
                 .map_mut("CONFIG")
@@ -166,13 +215,22 @@ impl AyaDataPlane {
         populate_uid_hash(&mut ebpf, "EXCLUDE_UIDS", &options.exclude_uid)?;
         populate_uid_ranges(&mut ebpf, "INCLUDE_UID_RANGES", &include_ranges)?;
         populate_uid_ranges(&mut ebpf, "EXCLUDE_UID_RANGES", &exclude_ranges)?;
+        populate_shared_source_maps(&mut ebpf, &options.shared_network)?;
         populate_socket_maps(&mut ebpf, &sockets)?;
+        let shared_matcher = options
+            .shared_network
+            .enabled
+            .then(|| SharedInterfaceMatcher::compile(&options.shared_network))
+            .transpose()?;
 
         let mut plane = Self {
             ebpf,
             sockets,
             cgroup_links: Vec::new(),
             lookup_link: None,
+            shared_program_loaded: false,
+            shared_links: BTreeMap::new(),
+            shared_matcher,
             active_bypass_bank: 0,
             bank_v4: [BTreeSet::new(), BTreeSet::new()],
             bank_v6: [BTreeSet::new(), BTreeSet::new()],
@@ -229,6 +287,163 @@ impl AyaDataPlane {
         Ok(())
     }
 
+    pub(super) fn reconcile_shared_interfaces(
+        &mut self,
+        shared: &EbpfSharedNetworkOptions,
+    ) -> Result<Vec<String>, EbpfInboundError> {
+        if !shared.enabled {
+            self.detach_shared_interfaces()?;
+            return Ok(Vec::new());
+        }
+        let matcher = self.shared_matcher.as_ref().ok_or_else(|| {
+            EbpfInboundError::Configuration(
+                "shared-network matcher is unavailable for an enabled configuration".into(),
+            )
+        })?;
+        let desired = discover_shared_interfaces(matcher)?;
+        if desired.len() > MAX_SHARED_INTERFACES {
+            return Err(EbpfInboundError::Configuration(format!(
+                "shared_network matched {} interfaces; the limit is {MAX_SHARED_INTERFACES}",
+                desired.len()
+            )));
+        }
+
+        let stale = self
+            .shared_links
+            .iter()
+            .filter_map(|(name, link)| {
+                (desired.get(name).copied() != Some(link.ifindex)).then_some(name.clone())
+            })
+            .collect::<Vec<_>>();
+        for name in stale {
+            self.detach_shared_interface(&name)?;
+        }
+        for (name, ifindex) in desired {
+            if !self.shared_links.contains_key(&name) {
+                self.attach_shared_interface(&name, ifindex, shared.tc_priority)?;
+            }
+        }
+        Ok(self.shared_interfaces())
+    }
+
+    pub(super) fn detach_shared_interfaces(&mut self) -> Result<(), EbpfInboundError> {
+        let names = self.shared_links.keys().cloned().collect::<Vec<_>>();
+        let mut first_error = None;
+        for name in names {
+            if let Err(error) = self.detach_shared_interface(&name)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    pub(super) fn shared_interfaces(&self) -> Vec<String> {
+        self.shared_links.keys().cloned().collect()
+    }
+
+    fn attach_shared_interface(
+        &mut self,
+        name: &str,
+        ifindex: u32,
+        priority: u16,
+    ) -> Result<(), EbpfInboundError> {
+        set_shared_interface(&mut self.ebpf, ifindex, true)?;
+        let result = (|| {
+            let program: &mut SchedClassifier = self
+                .ebpf
+                .program_mut("capture_shared_ingress")
+                .ok_or_else(|| missing_program("capture_shared_ingress"))?
+                .try_into()
+                .map_err(program_error)?;
+            if !self.shared_program_loaded {
+                program.load().map_err(program_error)?;
+                self.shared_program_loaded = true;
+            }
+            match program.attach_with_options(
+                name,
+                TcAttachType::Ingress,
+                TcAttachOptions::TcxOrder(LinkOrder::first()),
+            ) {
+                Ok(link) => Ok(link),
+                Err(error) => {
+                    debug!(
+                        target: "inbound::ebpf",
+                        interface = name,
+                        %error,
+                        "TCX attach unavailable; falling back to clsact"
+                    );
+                    match qdisc_add_clsact(name) {
+                        Ok(()) | Err(aya::programs::tc::TcError::AlreadyAttached) => {}
+                        Err(error) => return Err(program_error(error)),
+                    }
+                    program
+                        .attach_with_options(
+                            name,
+                            TcAttachType::Ingress,
+                            TcAttachOptions::Netlink(NlOptions {
+                                priority,
+                                handle: TcHandle::AUTO_ASSIGN,
+                                classid: None,
+                            }),
+                        )
+                        .map_err(program_error)
+                }
+            }
+        })();
+        match result {
+            Ok(link) => {
+                self.shared_links
+                    .insert(name.to_owned(), SharedLink { ifindex, link });
+                info!(
+                    target: "inbound::ebpf",
+                    interface = name,
+                    ifindex,
+                    tc_priority = priority,
+                    "shared-network TC ingress attached"
+                );
+                Ok(())
+            }
+            Err(error) => {
+                let _ = set_shared_interface(&mut self.ebpf, ifindex, false);
+                Err(EbpfInboundError::Aya(format!(
+                    "attach shared-network TC ingress to {name}: {error}"
+                )))
+            }
+        }
+    }
+
+    fn detach_shared_interface(&mut self, name: &str) -> Result<(), EbpfInboundError> {
+        let Some(link) = self.shared_links.remove(name) else {
+            return Ok(());
+        };
+        let program: &mut SchedClassifier = self
+            .ebpf
+            .program_mut("capture_shared_ingress")
+            .ok_or_else(|| missing_program("capture_shared_ingress"))?
+            .try_into()
+            .map_err(program_error)?;
+        match program.detach(link.link) {
+            Ok(()) => {
+                set_shared_interface(&mut self.ebpf, link.ifindex, false)?;
+                info!(
+                    target: "inbound::ebpf",
+                    interface = name,
+                    ifindex = link.ifindex,
+                    "shared-network TC ingress detached"
+                );
+                Ok(())
+            }
+            Err(error) => Err(EbpfInboundError::Aya(format!(
+                "detach shared-network TC ingress from {name}: {error}"
+            ))),
+        }
+    }
+
     pub(super) fn detach_lookup(&mut self) -> Result<(), EbpfInboundError> {
         let Some(link) = self.lookup_link.take() else {
             return Ok(());
@@ -242,16 +457,7 @@ impl AyaDataPlane {
         program.detach(link).map_err(program_error)
     }
 
-    pub(super) fn take_sockets(
-        &mut self,
-    ) -> Result<
-        (
-            Vec<tokio::net::TcpListener>,
-            Vec<tokio::net::UdpSocket>,
-            Vec<std::net::SocketAddr>,
-        ),
-        EbpfInboundError,
-    > {
+    pub(super) fn take_sockets(&mut self) -> Result<RelaySockets, EbpfInboundError> {
         let mut tcp = Vec::new();
         let mut udp = Vec::new();
         for listener in [self.sockets.tcp4.take(), self.sockets.tcp6.take()]
@@ -324,8 +530,69 @@ impl AyaDataPlane {
             lookup_assigned: read(5)?,
             lookup_failed: read(6)?,
             bypass_ingress: read(7)?,
+            shared_selected: read(8)?,
+            shared_bypass_source: read(9)?,
+            shared_bypass_destination: read(10)?,
+            shared_unsupported: read(11)?,
+            shared_lookup_assigned: read(12)?,
+            shared_lookup_failed: read(13)?,
         })
     }
+}
+
+impl SharedInterfaceMatcher {
+    fn compile(shared: &EbpfSharedNetworkOptions) -> Result<Self, EbpfInboundError> {
+        Ok(Self {
+            include: compile_globs("include_interface", &shared.include_interface)?,
+            exclude: compile_globs("exclude_interface", &shared.exclude_interface)?,
+        })
+    }
+
+    fn matches(&self, name: &str) -> bool {
+        self.include.is_match(name) && !self.exclude.is_match(name)
+    }
+}
+
+fn compile_globs(field: &str, patterns: &[String]) -> Result<GlobSet, EbpfInboundError> {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        builder.add(Glob::new(pattern).map_err(|error| {
+            EbpfInboundError::Configuration(format!(
+                "shared_network.{field} contains invalid glob {pattern}: {error}"
+            ))
+        })?);
+    }
+    builder.build().map_err(|error| {
+        EbpfInboundError::Configuration(format!("compile shared_network.{field}: {error}"))
+    })
+}
+
+fn discover_shared_interfaces(
+    matcher: &SharedInterfaceMatcher,
+) -> Result<BTreeMap<String, u32>, EbpfInboundError> {
+    let entries = fs::read_dir("/sys/class/net").map_err(|error| {
+        EbpfInboundError::Aya(format!(
+            "enumerate network interfaces from /sys/class/net: {error}"
+        ))
+    })?;
+    let mut interfaces = BTreeMap::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            EbpfInboundError::Aya(format!("read network interface entry: {error}"))
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !matcher.matches(name) {
+            continue;
+        }
+        let ifindex = if_nametoindex(name).map_err(|error| {
+            EbpfInboundError::Aya(format!("resolve interface index for {name}: {error}"))
+        })?;
+        interfaces.insert(name.to_owned(), ifindex);
+    }
+    Ok(interfaces)
 }
 
 fn parse_ranges(values: &[String]) -> Result<Vec<UidRange>, EbpfInboundError> {
@@ -374,6 +641,77 @@ fn populate_uid_ranges(
     Ok(())
 }
 
+fn populate_shared_source_maps(
+    ebpf: &mut Ebpf,
+    shared: &EbpfSharedNetworkOptions,
+) -> Result<(), EbpfInboundError> {
+    let (include_v4, include_v6) = parse_prefix_sets(&shared.include_source_address)?;
+    let (exclude_v4, exclude_v6) = parse_prefix_sets(&shared.exclude_source_address)?;
+    populate_lpm_v4(ebpf, "SHARED_SOURCE_V4", &include_v4)?;
+    populate_lpm_v6(ebpf, "SHARED_SOURCE_V6", &include_v6)?;
+    populate_lpm_v4(ebpf, "SHARED_EXCLUDE_SOURCE_V4", &exclude_v4)?;
+    populate_lpm_v6(ebpf, "SHARED_EXCLUDE_SOURCE_V6", &exclude_v6)
+}
+
+fn parse_prefix_sets(values: &[String]) -> Result<PrefixSets, EbpfInboundError> {
+    let mut v4 = BTreeSet::new();
+    let mut v6 = BTreeSet::new();
+    for value in values {
+        let prefix = value.parse::<ipnet::IpNet>().map_err(|_| {
+            EbpfInboundError::Configuration(format!("invalid shared-network CIDR: {value}"))
+        })?;
+        push_prefix(prefix, &mut v4, &mut v6);
+    }
+    Ok((v4, v6))
+}
+
+fn populate_lpm_v4(
+    ebpf: &mut Ebpf,
+    name: &'static str,
+    values: &V4PrefixSet,
+) -> Result<(), EbpfInboundError> {
+    let map = ebpf.map_mut(name).ok_or_else(|| missing_map(name))?;
+    let mut map: LpmTrie<_, [u8; 4], u8> = map.try_into().map_err(map_error)?;
+    for (prefix, address) in values.iter().copied() {
+        map.insert(&Key::new(u32::from(prefix), address), 1, 0)
+            .map_err(map_error)?;
+    }
+    Ok(())
+}
+
+fn populate_lpm_v6(
+    ebpf: &mut Ebpf,
+    name: &'static str,
+    values: &V6PrefixSet,
+) -> Result<(), EbpfInboundError> {
+    let map = ebpf.map_mut(name).ok_or_else(|| missing_map(name))?;
+    let mut map: LpmTrie<_, [u8; 16], u8> = map.try_into().map_err(map_error)?;
+    for (prefix, address) in values.iter().copied() {
+        map.insert(&Key::new(u32::from(prefix), address), 1, 0)
+            .map_err(map_error)?;
+    }
+    Ok(())
+}
+
+fn set_shared_interface(
+    ebpf: &mut Ebpf,
+    ifindex: u32,
+    enabled: bool,
+) -> Result<(), EbpfInboundError> {
+    let map = ebpf
+        .map_mut("SHARED_INTERFACES")
+        .ok_or_else(|| missing_map("SHARED_INTERFACES"))?;
+    let mut map: HashMap<_, u32, u8> = map.try_into().map_err(map_error)?;
+    if enabled {
+        map.insert(ifindex, 1, 0).map_err(map_error)
+    } else {
+        match map.remove(&ifindex) {
+            Ok(()) | Err(aya::maps::MapError::KeyNotFound) => Ok(()),
+            Err(error) => Err(map_error(error)),
+        }
+    }
+}
+
 fn populate_socket_maps(ebpf: &mut Ebpf, sockets: &FamilySockets) -> Result<(), EbpfInboundError> {
     {
         let map = ebpf
@@ -405,7 +743,7 @@ fn populate_socket_maps(ebpf: &mut Ebpf, sockets: &FamilySockets) -> Result<(), 
 fn desired_prefixes(
     options: &EbpfInboundOptions,
     snapshot: &BypassPrefixSnapshot,
-) -> Result<(BTreeSet<(u8, [u8; 4])>, BTreeSet<(u8, [u8; 16])>), EbpfInboundError> {
+) -> Result<PrefixSets, EbpfInboundError> {
     let mut v4 = BTreeSet::new();
     let mut v6 = BTreeSet::new();
     for value in [
@@ -471,11 +809,7 @@ fn desired_prefixes(
     Ok((v4, v6))
 }
 
-fn push_prefix(
-    prefix: ipnet::IpNet,
-    v4: &mut BTreeSet<(u8, [u8; 4])>,
-    v6: &mut BTreeSet<(u8, [u8; 16])>,
-) {
+fn push_prefix(prefix: ipnet::IpNet, v4: &mut V4PrefixSet, v6: &mut V6PrefixSet) {
     match prefix {
         ipnet::IpNet::V4(prefix) => {
             v4.insert((prefix.prefix_len(), prefix.network().octets()));
@@ -489,8 +823,8 @@ fn push_prefix(
 fn replace_lpm_v4(
     ebpf: &mut Ebpf,
     name: &'static str,
-    current: &mut BTreeSet<(u8, [u8; 4])>,
-    next: &BTreeSet<(u8, [u8; 4])>,
+    current: &mut V4PrefixSet,
+    next: &V4PrefixSet,
 ) -> Result<(), EbpfInboundError> {
     let map = ebpf.map_mut(name).ok_or_else(|| missing_map(name))?;
     let mut map: LpmTrie<_, [u8; 4], u8> = map.try_into().map_err(map_error)?;
@@ -510,8 +844,8 @@ fn replace_lpm_v4(
 fn replace_lpm_v6(
     ebpf: &mut Ebpf,
     name: &'static str,
-    current: &mut BTreeSet<(u8, [u8; 16])>,
-    next: &BTreeSet<(u8, [u8; 16])>,
+    current: &mut V6PrefixSet,
+    next: &V6PrefixSet,
 ) -> Result<(), EbpfInboundError> {
     let map = ebpf.map_mut(name).ok_or_else(|| missing_map(name))?;
     let mut map: LpmTrie<_, [u8; 16], u8> = map.try_into().map_err(map_error)?;
@@ -561,4 +895,37 @@ fn map_error(error: impl std::fmt::Display) -> EbpfInboundError {
 
 fn program_error(error: impl std::fmt::Display) -> EbpfInboundError {
     EbpfInboundError::Aya(format!("eBPF program operation failed: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_interface_matcher_honors_exclusions() {
+        let shared = EbpfSharedNetworkOptions {
+            enabled: true,
+            include_interface: vec!["ap*".into(), "rndis*".into(), "br*".into()],
+            exclude_interface: vec!["br-docker*".into()],
+            ..EbpfSharedNetworkOptions::default()
+        };
+        let matcher = SharedInterfaceMatcher::compile(&shared).unwrap();
+        assert!(matcher.matches("ap0"));
+        assert!(matcher.matches("rndis0"));
+        assert!(matcher.matches("br-hotspot"));
+        assert!(!matcher.matches("br-docker0"));
+        assert!(!matcher.matches("rmnet_data0"));
+    }
+
+    #[test]
+    fn shared_source_prefixes_preserve_both_families() {
+        let (v4, v6) = parse_prefix_sets(&[
+            "192.168.43.0/24".into(),
+            "fd00:43::/64".into(),
+            "192.168.43.0/24".into(),
+        ])
+        .unwrap();
+        assert_eq!(v4.len(), 1);
+        assert_eq!(v6.len(), 1);
+    }
 }

@@ -5462,8 +5462,9 @@ pub struct TransparentInboundOptions {
 /// Aya eBPF inbound.
 ///
 /// The cgroup programs select local TCP and UDP sockets by UID and destination,
-/// while an `sk_lookup` program assigns the packet to the proxy sockets without
-/// iptables, nftables, TPROXY, or destination NAT.
+/// TC ingress selects hotspot and forwarded-device traffic, while `sk_lookup`
+/// assigns both paths to proxy sockets without iptables, nftables, TPROXY, or
+/// destination NAT.
 #[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -5500,12 +5501,77 @@ pub struct EbpfInboundOptions {
     pub mark: u32,
     #[serde(default = "default_ebpf_map_capacity")]
     pub map_capacity: u32,
+    /// Optional hotspot, tethering, bridge, and router-forwarding data path.
+    #[serde(
+        default,
+        rename = "shared_network",
+        alias = "shared-network",
+        alias = "hotspot",
+        alias = "tethering"
+    )]
+    pub shared_network: EbpfSharedNetworkOptions,
     #[serde(
         default = "default_capture_resolver",
         rename = "dns_mode",
         alias = "dns-mode"
     )]
     pub resolver: CaptureResolver,
+}
+
+/// Forwarded-device capture for Linux routers and Android hotspot/tethering.
+///
+/// The TC ingress program is attached only to interfaces matched by
+/// `include_interface` and not matched by `exclude_interface`. Source filters
+/// are evaluated before a packet receives the eBPF inbound mark.
+#[serde_as]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EbpfSharedNetworkOptions {
+    /// Enable TC ingress capture for forwarded devices.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Interface-name glob patterns eligible for dynamic TC attachment.
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
+    #[serde(default = "default_ebpf_shared_interfaces")]
+    pub include_interface: Vec<String>,
+    /// Interface-name glob patterns removed from the eligible set.
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
+    #[serde(default = "default_ebpf_shared_excluded_interfaces")]
+    pub exclude_interface: Vec<String>,
+    /// Source CIDRs accepted from selected downstream interfaces.
+    ///
+    /// An empty list accepts every source address.
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
+    #[serde(default = "default_ebpf_shared_source_address")]
+    pub include_source_address: Vec<String>,
+    /// Source CIDRs bypassed before the include set is evaluated.
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
+    #[serde(default)]
+    pub exclude_source_address: Vec<String>,
+    /// Polling interval used to attach newly created hotspot interfaces and
+    /// detach interfaces removed by Android or Linux network management.
+    #[serde(
+        default = "default_ebpf_interface_refresh_interval",
+        with = "humantime_serde"
+    )]
+    pub interface_refresh_interval: Duration,
+    /// Legacy clsact filter priority. Lower values run before tethering offload.
+    #[serde(default = "default_ebpf_tc_priority")]
+    pub tc_priority: u16,
+}
+
+impl Default for EbpfSharedNetworkOptions {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            include_interface: default_ebpf_shared_interfaces(),
+            exclude_interface: default_ebpf_shared_excluded_interfaces(),
+            include_source_address: default_ebpf_shared_source_address(),
+            exclude_source_address: Vec::new(),
+            interface_refresh_interval: default_ebpf_interface_refresh_interval(),
+            tc_priority: default_ebpf_tc_priority(),
+        }
+    }
 }
 
 fn default_ebpf_inbound_tag() -> String {
@@ -5534,6 +5600,36 @@ const fn default_ebpf_mark() -> u32 {
 
 const fn default_ebpf_map_capacity() -> u32 {
     65_536
+}
+
+fn default_ebpf_shared_interfaces() -> Vec<String> {
+    [
+        "ap*", "swlan*", "wlan*", "rndis*", "usb*", "bt-pan*", "bnep*", "br*", "eth*", "en*",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn default_ebpf_shared_excluded_interfaces() -> Vec<String> {
+    [
+        "lo", "tun*", "tap*", "wg*", "rpktun*", "docker*", "veth*", "rmnet*", "ccmni*", "wwan*",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn default_ebpf_shared_source_address() -> Vec<String> {
+    vec!["0.0.0.0/0".into(), "::/0".into()]
+}
+
+const fn default_ebpf_interface_refresh_interval() -> Duration {
+    Duration::from_secs(3)
+}
+
+const fn default_ebpf_tc_priority() -> u16 {
+    1
 }
 
 #[derive(Serialize, Deserialize)]
@@ -6424,6 +6520,14 @@ bypass_rule_set: cnip
 include_uid: [1000, 1001]
 include_uid_range: "10000:19999"
 exclude_uid: 0
+shared_network:
+  enabled: true
+  include_interface: [ap*, rndis*]
+  exclude_interface: lo
+  include_source_address: [192.168.43.0/24, "fd00:43::/64"]
+  exclude_source_address: 192.168.43.1/32
+  interface_refresh_interval: 2s
+  tc_priority: 2
 dns_mode: hijack
 "#,
         )
@@ -6436,6 +6540,17 @@ dns_mode: hijack
         assert_eq!(options.include_uid, [1000, 1001]);
         assert_eq!(options.include_uid_range, ["10000:19999"]);
         assert_eq!(options.exclude_uid, [0]);
+        assert!(options.shared_network.enabled);
+        assert_eq!(options.shared_network.include_interface, ["ap*", "rndis*"]);
+        assert_eq!(
+            options.shared_network.include_source_address,
+            ["192.168.43.0/24", "fd00:43::/64"]
+        );
+        assert_eq!(
+            options.shared_network.interface_refresh_interval,
+            Duration::from_secs(2)
+        );
+        assert_eq!(options.shared_network.tc_priority, 2);
         assert!(inbound.transparent_capture().is_none());
 
         let canonical = serde_json::to_value(inbound).unwrap();

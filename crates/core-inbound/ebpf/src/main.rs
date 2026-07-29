@@ -5,12 +5,13 @@ use aya_ebpf::{
     EbpfContext,
     bindings::BPF_F_NO_PREALLOC,
     helpers::bpf_setsockopt,
-    macros::{cgroup_sock_addr, map, sk_lookup},
+    macros::{cgroup_sock_addr, classifier, map, sk_lookup},
     maps::{Array, HashMap, LpmTrie, PerCpuArray, SockMap},
-    programs::{SkLookupContext, SockAddrContext},
+    programs::{SkLookupContext, SockAddrContext, TcContext},
 };
 
 const SK_PASS: u32 = 1;
+const TC_ACT_OK: i32 = 0;
 
 const AF_INET: u32 = 2;
 const AF_INET6: u32 = 10;
@@ -19,11 +20,18 @@ const IPPROTO_UDP: u32 = 17;
 const SOL_SOCKET: i32 = 1;
 const SO_MARK: i32 = 36;
 const MAX_UID_RANGES: u32 = 256;
+const ETH_P_IP: u16 = 0x0800;
+const ETH_P_IPV6: u16 = 0x86dd;
+const ETH_P_8021Q: u16 = 0x8100;
+const ETH_P_8021AD: u16 = 0x88a8;
+const ETH_HEADER_LEN: usize = 14;
 
 const FLAG_INCLUDE_UID: u32 = 1 << 0;
 const FLAG_IPV4: u32 = 1 << 1;
 const FLAG_IPV6: u32 = 1 << 2;
 const FLAG_HIJACK_DNS: u32 = 1 << 3;
+const FLAG_SHARED_NETWORK: u32 = 1 << 4;
+const FLAG_SHARED_SOURCE_ANY: u32 = 1 << 5;
 
 const STAT_SELECTED: u32 = 0;
 const STAT_BYPASS_SELF: u32 = 1;
@@ -33,7 +41,13 @@ const STAT_MARK_FAILED: u32 = 4;
 const STAT_LOOKUP_ASSIGNED: u32 = 5;
 const STAT_LOOKUP_FAILED: u32 = 6;
 const STAT_BYPASS_INGRESS: u32 = 7;
-const STAT_COUNT: u32 = 8;
+const STAT_SHARED_SELECTED: u32 = 8;
+const STAT_SHARED_BYPASS_SOURCE: u32 = 9;
+const STAT_SHARED_BYPASS_DESTINATION: u32 = 10;
+const STAT_SHARED_UNSUPPORTED: u32 = 11;
+const STAT_SHARED_LOOKUP_ASSIGNED: u32 = 12;
+const STAT_SHARED_LOOKUP_FAILED: u32 = 13;
+const STAT_COUNT: u32 = 14;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -68,6 +82,26 @@ static INCLUDE_UID_RANGES: Array<UidRange> = Array::with_max_entries(MAX_UID_RAN
 
 #[map]
 static EXCLUDE_UID_RANGES: Array<UidRange> = Array::with_max_entries(MAX_UID_RANGES, 0);
+
+#[map]
+static SHARED_INTERFACES: HashMap<u32, u8> =
+    HashMap::with_max_entries(256, BPF_F_NO_PREALLOC as u32);
+
+#[map]
+static SHARED_SOURCE_V4: LpmTrie<[u8; 4], u8> =
+    LpmTrie::with_max_entries(65_536, BPF_F_NO_PREALLOC as u32);
+
+#[map]
+static SHARED_SOURCE_V6: LpmTrie<[u8; 16], u8> =
+    LpmTrie::with_max_entries(65_536, BPF_F_NO_PREALLOC as u32);
+
+#[map]
+static SHARED_EXCLUDE_SOURCE_V4: LpmTrie<[u8; 4], u8> =
+    LpmTrie::with_max_entries(65_536, BPF_F_NO_PREALLOC as u32);
+
+#[map]
+static SHARED_EXCLUDE_SOURCE_V6: LpmTrie<[u8; 16], u8> =
+    LpmTrie::with_max_entries(65_536, BPF_F_NO_PREALLOC as u32);
 
 #[map]
 static BYPASS_V4: LpmTrie<[u8; 4], u8> =
@@ -114,6 +148,12 @@ pub fn sendmsg6(ctx: SockAddrContext) -> i32 {
     select_socket(ctx, AF_INET6)
 }
 
+#[classifier]
+pub fn capture_shared_ingress(ctx: TcContext) -> i32 {
+    select_shared_packet(&ctx);
+    TC_ACT_OK
+}
+
 fn select_socket(ctx: SockAddrContext, family: u32) -> i32 {
     let Some(config) = CONFIG.get(0) else {
         return 1;
@@ -154,6 +194,208 @@ fn select_socket(ctx: SockAddrContext, family: u32) -> i32 {
     }
     increment(STAT_SELECTED);
     1
+}
+
+fn select_shared_packet(ctx: &TcContext) {
+    let Some(config) = CONFIG.get(0) else {
+        return;
+    };
+    if config.flags & FLAG_SHARED_NETWORK == 0 {
+        return;
+    }
+    let Some((protocol, offset)) = ethernet_protocol(ctx) else {
+        increment(STAT_SHARED_UNSUPPORTED);
+        return;
+    };
+    match protocol {
+        ETH_P_IP if config.flags & FLAG_IPV4 != 0 => select_shared_v4(ctx, offset, config),
+        ETH_P_IPV6 if config.flags & FLAG_IPV6 != 0 => select_shared_v6(ctx, offset, config),
+        _ => increment(STAT_SHARED_UNSUPPORTED),
+    }
+}
+
+fn ethernet_protocol(ctx: &TcContext) -> Option<(u16, usize)> {
+    let mut protocol = u16::from_be(ctx.load::<u16>(12).ok()?);
+    let mut offset = ETH_HEADER_LEN;
+    let mut depth = 0;
+    while (protocol == ETH_P_8021Q || protocol == ETH_P_8021AD) && depth < 2 {
+        protocol = u16::from_be(ctx.load::<u16>(offset + 2).ok()?);
+        offset += 4;
+        depth += 1;
+    }
+    Some((protocol, offset))
+}
+
+fn select_shared_v4(ctx: &TcContext, offset: usize, config: &EbpfConfig) {
+    let version_ihl = match ctx.load::<u8>(offset) {
+        Ok(value) => value,
+        Err(_) => {
+            increment(STAT_SHARED_UNSUPPORTED);
+            return;
+        }
+    };
+    if version_ihl >> 4 != 4 {
+        increment(STAT_SHARED_UNSUPPORTED);
+        return;
+    }
+    let header_len = usize::from(version_ihl & 0x0f) * 4;
+    if header_len < 20 {
+        increment(STAT_SHARED_UNSUPPORTED);
+        return;
+    }
+    let source = match ctx.load::<[u8; 4]>(offset + 12) {
+        Ok(value) => value,
+        Err(_) => {
+            increment(STAT_SHARED_UNSUPPORTED);
+            return;
+        }
+    };
+    if !shared_source_v4_allowed(source, config.flags) {
+        increment(STAT_SHARED_BYPASS_SOURCE);
+        return;
+    }
+    let destination = match ctx.load::<[u8; 4]>(offset + 16) {
+        Ok(value) => value,
+        Err(_) => {
+            increment(STAT_SHARED_UNSUPPORTED);
+            return;
+        }
+    };
+    let transport = match ctx.load::<u8>(offset + 9) {
+        Ok(value) => value,
+        Err(_) => {
+            increment(STAT_SHARED_UNSUPPORTED);
+            return;
+        }
+    };
+    if transport != IPPROTO_TCP as u8 && transport != IPPROTO_UDP as u8 {
+        increment(STAT_SHARED_UNSUPPORTED);
+        return;
+    }
+    let fragment = ctx
+        .load::<u16>(offset + 6)
+        .map(u16::from_be)
+        .unwrap_or(u16::MAX);
+    let first_fragment = fragment & 0x1fff == 0;
+    let destination_port = if first_fragment {
+        ctx.load::<u16>(offset + header_len + 2)
+            .map(u16::from_be)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let hijack_dns = config.flags & FLAG_HIJACK_DNS != 0 && destination_port == 53;
+    if !hijack_dns && lookup_v4_bypassed(u32::from_ne_bytes(destination), config.bypass_bank) {
+        increment(STAT_SHARED_BYPASS_DESTINATION);
+        return;
+    }
+    ctx.set_mark(config.mark);
+    increment(STAT_SHARED_SELECTED);
+}
+
+fn select_shared_v6(ctx: &TcContext, offset: usize, config: &EbpfConfig) {
+    let version = match ctx.load::<u8>(offset) {
+        Ok(value) => value >> 4,
+        Err(_) => {
+            increment(STAT_SHARED_UNSUPPORTED);
+            return;
+        }
+    };
+    if version != 6 {
+        increment(STAT_SHARED_UNSUPPORTED);
+        return;
+    }
+    let source = match ctx.load::<[u8; 16]>(offset + 8) {
+        Ok(value) => value,
+        Err(_) => {
+            increment(STAT_SHARED_UNSUPPORTED);
+            return;
+        }
+    };
+    if !shared_source_v6_allowed(source, config.flags) {
+        increment(STAT_SHARED_BYPASS_SOURCE);
+        return;
+    }
+    let destination = match ctx.load::<[u8; 16]>(offset + 24) {
+        Ok(value) => value,
+        Err(_) => {
+            increment(STAT_SHARED_UNSUPPORTED);
+            return;
+        }
+    };
+    let Some((transport, transport_offset, first_fragment)) =
+        ipv6_transport(ctx, offset + 40, offset)
+    else {
+        increment(STAT_SHARED_UNSUPPORTED);
+        return;
+    };
+    if transport != IPPROTO_TCP as u8 && transport != IPPROTO_UDP as u8 {
+        increment(STAT_SHARED_UNSUPPORTED);
+        return;
+    }
+    let destination_port = if first_fragment {
+        ctx.load::<u16>(transport_offset + 2)
+            .map(u16::from_be)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let hijack_dns = config.flags & FLAG_HIJACK_DNS != 0 && destination_port == 53;
+    if !hijack_dns && lookup_v6_bypassed(bytes_to_ipv6_words(destination), config.bypass_bank) {
+        increment(STAT_SHARED_BYPASS_DESTINATION);
+        return;
+    }
+    ctx.set_mark(config.mark);
+    increment(STAT_SHARED_SELECTED);
+}
+
+fn ipv6_transport(
+    ctx: &TcContext,
+    mut offset: usize,
+    ipv6_offset: usize,
+) -> Option<(u8, usize, bool)> {
+    let mut next = ctx.load::<u8>(ipv6_offset + 6).ok()?;
+    let mut first_fragment = true;
+    let mut depth = 0;
+    while depth < 6 {
+        match next {
+            0 | 43 | 60 => {
+                next = ctx.load::<u8>(offset).ok()?;
+                let length = usize::from(ctx.load::<u8>(offset + 1).ok()?);
+                offset += (length + 1) * 8;
+            }
+            44 => {
+                next = ctx.load::<u8>(offset).ok()?;
+                let fragment = u16::from_be(ctx.load::<u16>(offset + 2).ok()?);
+                first_fragment = fragment & 0xfff8 == 0;
+                offset += 8;
+            }
+            51 => {
+                next = ctx.load::<u8>(offset).ok()?;
+                let length = usize::from(ctx.load::<u8>(offset + 1).ok()?);
+                offset += (length + 2) * 4;
+            }
+            _ => return Some((next, offset, first_fragment)),
+        }
+        depth += 1;
+    }
+    None
+}
+
+fn shared_source_v4_allowed(address: [u8; 4], flags: u32) -> bool {
+    let key = aya_ebpf::maps::lpm_trie::Key::new(32, address);
+    if SHARED_EXCLUDE_SOURCE_V4.get(&key).is_some() {
+        return false;
+    }
+    flags & FLAG_SHARED_SOURCE_ANY != 0 || SHARED_SOURCE_V4.get(&key).is_some()
+}
+
+fn shared_source_v6_allowed(address: [u8; 16], flags: u32) -> bool {
+    let key = aya_ebpf::maps::lpm_trie::Key::new(128, address);
+    if SHARED_EXCLUDE_SOURCE_V6.get(&key).is_some() {
+        return false;
+    }
+    flags & FLAG_SHARED_SOURCE_ANY != 0 || SHARED_SOURCE_V6.get(&key).is_some()
 }
 
 fn uid_allowed(uid: u32, config: &EbpfConfig) -> bool {
@@ -213,7 +455,8 @@ pub fn assign_proxy_socket(ctx: SkLookupContext) -> u32 {
     let Some(config) = CONFIG.get(0) else {
         return SK_PASS;
     };
-    if lookup.ingress_ifindex != config.loopback_ifindex {
+    let shared = lookup.ingress_ifindex != config.loopback_ifindex;
+    if shared && unsafe { SHARED_INTERFACES.get(&lookup.ingress_ifindex).is_none() } {
         increment(STAT_BYPASS_INGRESS);
         return SK_PASS;
     }
@@ -235,7 +478,9 @@ pub fn assign_proxy_socket(ctx: SkLookupContext) -> u32 {
         _ => return SK_PASS,
     };
     match result {
+        Ok(()) if shared => increment(STAT_SHARED_LOOKUP_ASSIGNED),
         Ok(()) => increment(STAT_LOOKUP_ASSIGNED),
+        Err(_) if shared => increment(STAT_SHARED_LOOKUP_FAILED),
         Err(_) => increment(STAT_LOOKUP_FAILED),
     }
     SK_PASS
@@ -277,6 +522,15 @@ fn ipv6_bytes(words: [u32; 4]) -> [u8; 16] {
         index += 1;
     }
     address
+}
+
+fn bytes_to_ipv6_words(address: [u8; 16]) -> [u32; 4] {
+    [
+        u32::from_ne_bytes([address[0], address[1], address[2], address[3]]),
+        u32::from_ne_bytes([address[4], address[5], address[6], address[7]]),
+        u32::from_ne_bytes([address[8], address[9], address[10], address[11]]),
+        u32::from_ne_bytes([address[12], address[13], address[14], address[15]]),
+    ]
 }
 
 fn increment(index: u32) {

@@ -20,6 +20,36 @@ inbounds:
     rule_priority: 8999
     mark: 721
     map_capacity: 65536
+    shared_network:
+      enabled: true
+      include_interface:
+        - ap*
+        - swlan*
+        - wlan*
+        - rndis*
+        - usb*
+        - bt-pan*
+        - bnep*
+        - br*
+        - eth*
+        - en*
+      exclude_interface:
+        - lo
+        - tun*
+        - tap*
+        - wg*
+        - rpktun*
+        - docker*
+        - veth*
+        - rmnet*
+        - ccmni*
+        - wwan*
+      include_source_address:
+        - 0.0.0.0/0
+        - ::/0
+      exclude_source_address: []
+      interface_refresh_interval: 3s
+      tc_priority: 1
     dns_mode: hijack
 
 listen:
