@@ -62,6 +62,7 @@ env:
   # Minimum supported Android release. NSS and the Rust binary are both built
   # against it; raising it here raises the floor for published Android archives.
   ANDROID_API_LEVEL: "24"
+  ANDROID_NDK_VERSION: "r29"
 
 jobs:
   prepare:
@@ -338,7 +339,7 @@ jobs:
         id: ndk
         uses: nttld/setup-ndk@v1.6.0
         with:
-          ndk-version: r29
+          ndk-version: ${{ env.ANDROID_NDK_VERSION }}
           add-to-path: true
           local-cache: true
 
@@ -357,6 +358,7 @@ jobs:
           target: ${{ matrix.platform.target }}
           api-level: ${{ env.ANDROID_API_LEVEL }}
           ndk-home: ${{ steps.ndk.outputs.ndk-path }}
+          ndk-version: ${{ env.ANDROID_NDK_VERSION }}
 
       - name: Build Android binary
         shell: bash

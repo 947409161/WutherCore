@@ -19,6 +19,9 @@ inputs:
   ndk-home:
     description: Path to the Android NDK.
     required: true
+  ndk-version:
+    description: Android NDK version used to scope the compiled library cache.
+    required: true
   nss-version:
     description: NSS release to build.
     required: false
@@ -78,7 +81,7 @@ runs:
       with:
         path: .nss-android/dist
         key: >-
-          nss-android-${{ inputs.target }}-api${{ inputs.api-level }}-nss${{ inputs.nss-version }}-nspr${{ inputs.nspr-version }}-as${{ inputs.appservices-version }}
+          nss-android-${{ inputs.target }}-api${{ inputs.api-level }}-ndk${{ inputs.ndk-version }}-nss${{ inputs.nss-version }}-nspr${{ inputs.nspr-version }}-as${{ inputs.appservices-version }}
 
     - name: Install NSS build dependencies
       if: steps.cache.outputs.cache-hit != 'true'
@@ -138,6 +141,8 @@ runs:
         TOOLCHAIN: ${{ steps.toolchain.outputs.toolchain }}
         API_LEVEL: ${{ inputs.api-level }}
         NDK_HOME: ${{ inputs.ndk-home }}
+        ANDROID_NDK_HOME: ${{ inputs.ndk-home }}
+        ANDROID_NDK_ROOT: ${{ inputs.ndk-home }}
         APPSERVICES_VERSION: ${{ inputs.appservices-version }}
       run: |
         set -euo pipefail
