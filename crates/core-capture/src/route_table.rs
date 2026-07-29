@@ -7,7 +7,7 @@
 //!
 //! | 平台    | add 命令                                              | del 命令                                |
 //! |---------|-------------------------------------------------------|-----------------------------------------|
-//! | Linux   | `ip route add <dest> dev <iface> [via <gw>] metric N` | `ip route del <dest> ...`               |
+//! | Linux/Android | rtnetlink `RTM_NEWROUTE`                        | rtnetlink `RTM_DELROUTE`                 |
 //! | macOS   | `route -n add -net <dest> -interface <iface>`         | `route -n delete -net <dest>`           |
 //! | Windows | IP Helper `CreateIpForwardEntry2`                    | `DeleteIpForwardEntry2`                 |
 //!
