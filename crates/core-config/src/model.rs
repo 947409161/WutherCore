@@ -5555,6 +5555,13 @@ pub struct EbpfSharedNetworkOptions {
         with = "humantime_serde"
     )]
     pub interface_refresh_interval: Duration,
+    /// Collect per-packet TC diagnostics for shared-network traffic.
+    ///
+    /// Disabled by default because updating a BPF counter for every forwarded
+    /// packet adds measurable CPU cost on mobile hotspots. Flow-level lookup
+    /// and local socket counters remain available when this is disabled.
+    #[serde(default)]
+    pub packet_stats: bool,
     /// Legacy clsact filter priority. Lower values run before tethering offload.
     #[serde(default = "default_ebpf_tc_priority")]
     pub tc_priority: u16,
@@ -5569,6 +5576,7 @@ impl Default for EbpfSharedNetworkOptions {
             include_source_address: default_ebpf_shared_source_address(),
             exclude_source_address: Vec::new(),
             interface_refresh_interval: default_ebpf_interface_refresh_interval(),
+            packet_stats: false,
             tc_priority: default_ebpf_tc_priority(),
         }
     }
@@ -6527,6 +6535,7 @@ shared_network:
   include_source_address: [192.168.43.0/24, "fd00:43::/64"]
   exclude_source_address: 192.168.43.1/32
   interface_refresh_interval: 2s
+  packet_stats: true
   tc_priority: 2
 dns_mode: hijack
 "#,
@@ -6550,6 +6559,7 @@ dns_mode: hijack
             options.shared_network.interface_refresh_interval,
             Duration::from_secs(2)
         );
+        assert!(options.shared_network.packet_stats);
         assert_eq!(options.shared_network.tc_priority, 2);
         assert!(inbound.transparent_capture().is_none());
 

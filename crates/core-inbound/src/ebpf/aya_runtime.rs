@@ -33,7 +33,15 @@ const FLAG_IPV4: u32 = 1 << 1;
 const FLAG_IPV6: u32 = 1 << 2;
 const FLAG_HIJACK_DNS: u32 = 1 << 3;
 const FLAG_SHARED_NETWORK: u32 = 1 << 4;
-const FLAG_SHARED_SOURCE_ANY: u32 = 1 << 5;
+const FLAG_SHARED_SOURCE_ANY_V4: u32 = 1 << 5;
+const FLAG_SHARED_SOURCE_ANY_V6: u32 = 1 << 6;
+const FLAG_SHARED_HAS_INCLUDE_V4: u32 = 1 << 7;
+const FLAG_SHARED_HAS_INCLUDE_V6: u32 = 1 << 8;
+const FLAG_SHARED_HAS_EXCLUDE_V4: u32 = 1 << 9;
+const FLAG_SHARED_HAS_EXCLUDE_V6: u32 = 1 << 10;
+const FLAG_SHARED_BLOCK_ALL_V4: u32 = 1 << 11;
+const FLAG_SHARED_BLOCK_ALL_V6: u32 = 1 << 12;
+const FLAG_SHARED_PACKET_STATS: u32 = 1 << 13;
 const MAX_UID_RANGES: usize = 256;
 const MAX_SHARED_INTERFACES: usize = 256;
 
@@ -98,6 +106,15 @@ struct SharedInterfaceMatcher {
     exclude: GlobSet,
 }
 
+#[derive(Default)]
+struct SharedSourcePolicy {
+    include_v4: V4PrefixSet,
+    include_v6: V6PrefixSet,
+    exclude_v4: V4PrefixSet,
+    exclude_v6: V6PrefixSet,
+    flags: u32,
+}
+
 pub(super) struct AyaDataPlane {
     ebpf: Ebpf,
     sockets: FamilySockets,
@@ -156,6 +173,12 @@ impl AyaDataPlane {
 
         let include_ranges = parse_ranges(&options.include_uid_range)?;
         let exclude_ranges = parse_ranges(&options.exclude_uid_range)?;
+        let shared_source_policy = if options.shared_network.enabled {
+            compile_shared_source_policy(&options.shared_network)?
+        } else {
+            SharedSourcePolicy::default()
+        };
+        validate_shared_source_capacity(&shared_source_policy, options.map_capacity)?;
         if include_ranges.len() > MAX_UID_RANGES || exclude_ranges.len() > MAX_UID_RANGES {
             return Err(EbpfInboundError::Configuration(format!(
                 "UID range lists support at most {MAX_UID_RANGES} entries each"
@@ -186,9 +209,7 @@ impl AyaDataPlane {
         }
         if options.shared_network.enabled {
             flags |= FLAG_SHARED_NETWORK;
-            if options.shared_network.include_source_address.is_empty() {
-                flags |= FLAG_SHARED_SOURCE_ANY;
-            }
+            flags |= shared_source_policy.flags;
         }
         {
             let map = ebpf
@@ -215,7 +236,7 @@ impl AyaDataPlane {
         populate_uid_hash(&mut ebpf, "EXCLUDE_UIDS", &options.exclude_uid)?;
         populate_uid_ranges(&mut ebpf, "INCLUDE_UID_RANGES", &include_ranges)?;
         populate_uid_ranges(&mut ebpf, "EXCLUDE_UID_RANGES", &exclude_ranges)?;
-        populate_shared_source_maps(&mut ebpf, &options.shared_network)?;
+        populate_shared_source_maps(&mut ebpf, &shared_source_policy)?;
         populate_socket_maps(&mut ebpf, &sockets)?;
         let shared_matcher = options
             .shared_network
@@ -275,16 +296,27 @@ impl AyaDataPlane {
     }
 
     pub(super) fn detach_cgroup(&mut self) -> Result<(), EbpfInboundError> {
+        let mut first_error = None;
         while let Some((name, link)) = self.cgroup_links.pop() {
-            let program: &mut CgroupSockAddr = self
-                .ebpf
-                .program_mut(name)
-                .ok_or_else(|| missing_program(name))?
-                .try_into()
-                .map_err(program_error)?;
-            program.detach(link).map_err(program_error)?;
+            let result = (|| {
+                let program: &mut CgroupSockAddr = self
+                    .ebpf
+                    .program_mut(name)
+                    .ok_or_else(|| missing_program(name))?
+                    .try_into()
+                    .map_err(program_error)?;
+                program.detach(link).map_err(program_error)
+            })();
+            if let Err(error) = result
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
         }
-        Ok(())
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     pub(super) fn reconcile_shared_interfaces(
@@ -352,7 +384,6 @@ impl AyaDataPlane {
         ifindex: u32,
         priority: u16,
     ) -> Result<(), EbpfInboundError> {
-        set_shared_interface(&mut self.ebpf, ifindex, true)?;
         let result = (|| {
             let program: &mut SchedClassifier = self
                 .ebpf
@@ -397,6 +428,26 @@ impl AyaDataPlane {
         })();
         match result {
             Ok(link) => {
+                if let Err(error) = set_shared_interface(&mut self.ebpf, ifindex, true) {
+                    let rollback = self
+                        .ebpf
+                        .program_mut("capture_shared_ingress")
+                        .ok_or_else(|| missing_program("capture_shared_ingress"))
+                        .and_then(|program| {
+                            let program: &mut SchedClassifier =
+                                program.try_into().map_err(program_error)?;
+                            program.detach(link).map_err(program_error)
+                        });
+                    return Err(EbpfInboundError::Aya(match rollback {
+                        Ok(()) => {
+                            format!("register shared-network interface {name} in eBPF map: {error}")
+                        }
+                        Err(rollback_error) => format!(
+                            "register shared-network interface {name} in eBPF map: {error}; \
+                             TC rollback also failed: {rollback_error}"
+                        ),
+                    }));
+                }
                 self.shared_links
                     .insert(name.to_owned(), SharedLink { ifindex, link });
                 info!(
@@ -408,12 +459,9 @@ impl AyaDataPlane {
                 );
                 Ok(())
             }
-            Err(error) => {
-                let _ = set_shared_interface(&mut self.ebpf, ifindex, false);
-                Err(EbpfInboundError::Aya(format!(
-                    "attach shared-network TC ingress to {name}: {error}"
-                )))
-            }
+            Err(error) => Err(EbpfInboundError::Aya(format!(
+                "attach shared-network TC ingress to {name}: {error}"
+            ))),
         }
     }
 
@@ -643,14 +691,78 @@ fn populate_uid_ranges(
 
 fn populate_shared_source_maps(
     ebpf: &mut Ebpf,
-    shared: &EbpfSharedNetworkOptions,
+    policy: &SharedSourcePolicy,
 ) -> Result<(), EbpfInboundError> {
-    let (include_v4, include_v6) = parse_prefix_sets(&shared.include_source_address)?;
-    let (exclude_v4, exclude_v6) = parse_prefix_sets(&shared.exclude_source_address)?;
-    populate_lpm_v4(ebpf, "SHARED_SOURCE_V4", &include_v4)?;
-    populate_lpm_v6(ebpf, "SHARED_SOURCE_V6", &include_v6)?;
-    populate_lpm_v4(ebpf, "SHARED_EXCLUDE_SOURCE_V4", &exclude_v4)?;
-    populate_lpm_v6(ebpf, "SHARED_EXCLUDE_SOURCE_V6", &exclude_v6)
+    populate_lpm_v4(ebpf, "SHARED_SOURCE_V4", &policy.include_v4)?;
+    populate_lpm_v6(ebpf, "SHARED_SOURCE_V6", &policy.include_v6)?;
+    populate_lpm_v4(ebpf, "SHARED_EXCLUDE_SOURCE_V4", &policy.exclude_v4)?;
+    populate_lpm_v6(ebpf, "SHARED_EXCLUDE_SOURCE_V6", &policy.exclude_v6)
+}
+
+fn compile_shared_source_policy(
+    shared: &EbpfSharedNetworkOptions,
+) -> Result<SharedSourcePolicy, EbpfInboundError> {
+    let (mut include_v4, mut include_v6) = parse_prefix_sets(&shared.include_source_address)?;
+    let (mut exclude_v4, mut exclude_v6) = parse_prefix_sets(&shared.exclude_source_address)?;
+    let include_all = shared.include_source_address.is_empty();
+    let mut flags = 0;
+
+    if include_all || include_v4.contains(&(0, [0; 4])) {
+        flags |= FLAG_SHARED_SOURCE_ANY_V4;
+        include_v4.clear();
+    } else if !include_v4.is_empty() {
+        flags |= FLAG_SHARED_HAS_INCLUDE_V4;
+    }
+    if include_all || include_v6.contains(&(0, [0; 16])) {
+        flags |= FLAG_SHARED_SOURCE_ANY_V6;
+        include_v6.clear();
+    } else if !include_v6.is_empty() {
+        flags |= FLAG_SHARED_HAS_INCLUDE_V6;
+    }
+
+    if exclude_v4.contains(&(0, [0; 4])) {
+        flags |= FLAG_SHARED_BLOCK_ALL_V4;
+        exclude_v4.clear();
+    } else if !exclude_v4.is_empty() {
+        flags |= FLAG_SHARED_HAS_EXCLUDE_V4;
+    }
+    if exclude_v6.contains(&(0, [0; 16])) {
+        flags |= FLAG_SHARED_BLOCK_ALL_V6;
+        exclude_v6.clear();
+    } else if !exclude_v6.is_empty() {
+        flags |= FLAG_SHARED_HAS_EXCLUDE_V6;
+    }
+    if shared.packet_stats {
+        flags |= FLAG_SHARED_PACKET_STATS;
+    }
+
+    Ok(SharedSourcePolicy {
+        include_v4,
+        include_v6,
+        exclude_v4,
+        exclude_v6,
+        flags,
+    })
+}
+
+fn validate_shared_source_capacity(
+    policy: &SharedSourcePolicy,
+    capacity: u32,
+) -> Result<(), EbpfInboundError> {
+    let capacity = capacity as usize;
+    for (name, count) in [
+        ("include_source_address IPv4", policy.include_v4.len()),
+        ("include_source_address IPv6", policy.include_v6.len()),
+        ("exclude_source_address IPv4", policy.exclude_v4.len()),
+        ("exclude_source_address IPv6", policy.exclude_v6.len()),
+    ] {
+        if count > capacity {
+            return Err(EbpfInboundError::Configuration(format!(
+                "shared_network {name} entries ({count}) exceed map_capacity ({capacity})"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn parse_prefix_sets(values: &[String]) -> Result<PrefixSets, EbpfInboundError> {
@@ -927,5 +1039,54 @@ mod tests {
         .unwrap();
         assert_eq!(v4.len(), 1);
         assert_eq!(v6.len(), 1);
+    }
+
+    #[test]
+    fn default_shared_sources_compile_to_zero_lookup_fast_paths() {
+        let shared = EbpfSharedNetworkOptions {
+            enabled: true,
+            ..EbpfSharedNetworkOptions::default()
+        };
+        let policy = compile_shared_source_policy(&shared).unwrap();
+        assert!(policy.flags & FLAG_SHARED_SOURCE_ANY_V4 != 0);
+        assert!(policy.flags & FLAG_SHARED_SOURCE_ANY_V6 != 0);
+        assert!(policy.include_v4.is_empty());
+        assert!(policy.include_v6.is_empty());
+        assert!(policy.exclude_v4.is_empty());
+        assert!(policy.exclude_v6.is_empty());
+        assert_eq!(policy.flags & FLAG_SHARED_PACKET_STATS, 0);
+    }
+
+    #[test]
+    fn shared_sources_compile_independent_family_and_exclude_paths() {
+        let shared = EbpfSharedNetworkOptions {
+            enabled: true,
+            include_source_address: vec!["192.168.43.0/24".into(), "::/0".into()],
+            exclude_source_address: vec!["192.168.43.9/32".into(), "::/0".into()],
+            packet_stats: true,
+            ..EbpfSharedNetworkOptions::default()
+        };
+        let policy = compile_shared_source_policy(&shared).unwrap();
+        assert!(policy.flags & FLAG_SHARED_HAS_INCLUDE_V4 != 0);
+        assert!(policy.flags & FLAG_SHARED_SOURCE_ANY_V6 != 0);
+        assert!(policy.flags & FLAG_SHARED_HAS_EXCLUDE_V4 != 0);
+        assert!(policy.flags & FLAG_SHARED_BLOCK_ALL_V6 != 0);
+        assert!(policy.flags & FLAG_SHARED_PACKET_STATS != 0);
+        assert_eq!(policy.include_v4.len(), 1);
+        assert!(policy.include_v6.is_empty());
+        assert_eq!(policy.exclude_v4.len(), 1);
+        assert!(policy.exclude_v6.is_empty());
+    }
+
+    #[test]
+    fn empty_shared_source_list_allows_both_families() {
+        let shared = EbpfSharedNetworkOptions {
+            enabled: true,
+            include_source_address: Vec::new(),
+            ..EbpfSharedNetworkOptions::default()
+        };
+        let policy = compile_shared_source_policy(&shared).unwrap();
+        assert!(policy.flags & FLAG_SHARED_SOURCE_ANY_V4 != 0);
+        assert!(policy.flags & FLAG_SHARED_SOURCE_ANY_V6 != 0);
     }
 }

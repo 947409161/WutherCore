@@ -290,7 +290,10 @@ async fn run_controller(
             _ = interface_tick.tick(), if options.shared_network.enabled => {
                 match plane.reconcile_shared_interfaces(&options.shared_network) {
                     Ok(interfaces) => {
-                        status.send_modify(|current| current.shared_interfaces = interfaces);
+                        let changed = status.borrow().shared_interfaces != interfaces;
+                        if changed {
+                            status.send_modify(|current| current.shared_interfaces = interfaces);
+                        }
                     }
                     Err(error) => warn!(
                         target: "inbound::ebpf",

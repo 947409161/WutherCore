@@ -31,7 +31,15 @@ const FLAG_IPV4: u32 = 1 << 1;
 const FLAG_IPV6: u32 = 1 << 2;
 const FLAG_HIJACK_DNS: u32 = 1 << 3;
 const FLAG_SHARED_NETWORK: u32 = 1 << 4;
-const FLAG_SHARED_SOURCE_ANY: u32 = 1 << 5;
+const FLAG_SHARED_SOURCE_ANY_V4: u32 = 1 << 5;
+const FLAG_SHARED_SOURCE_ANY_V6: u32 = 1 << 6;
+const FLAG_SHARED_HAS_INCLUDE_V4: u32 = 1 << 7;
+const FLAG_SHARED_HAS_INCLUDE_V6: u32 = 1 << 8;
+const FLAG_SHARED_HAS_EXCLUDE_V4: u32 = 1 << 9;
+const FLAG_SHARED_HAS_EXCLUDE_V6: u32 = 1 << 10;
+const FLAG_SHARED_BLOCK_ALL_V4: u32 = 1 << 11;
+const FLAG_SHARED_BLOCK_ALL_V6: u32 = 1 << 12;
+const FLAG_SHARED_PACKET_STATS: u32 = 1 << 13;
 
 const STAT_SELECTED: u32 = 0;
 const STAT_BYPASS_SELF: u32 = 1;
@@ -204,13 +212,13 @@ fn select_shared_packet(ctx: &TcContext) {
         return;
     }
     let Some((protocol, offset)) = ethernet_protocol(ctx) else {
-        increment(STAT_SHARED_UNSUPPORTED);
+        increment_shared(config.flags, STAT_SHARED_UNSUPPORTED);
         return;
     };
     match protocol {
         ETH_P_IP if config.flags & FLAG_IPV4 != 0 => select_shared_v4(ctx, offset, config),
         ETH_P_IPV6 if config.flags & FLAG_IPV6 != 0 => select_shared_v6(ctx, offset, config),
-        _ => increment(STAT_SHARED_UNSUPPORTED),
+        _ => increment_shared(config.flags, STAT_SHARED_UNSUPPORTED),
     }
 }
 
@@ -230,48 +238,48 @@ fn select_shared_v4(ctx: &TcContext, offset: usize, config: &EbpfConfig) {
     let version_ihl = match ctx.load::<u8>(offset) {
         Ok(value) => value,
         Err(_) => {
-            increment(STAT_SHARED_UNSUPPORTED);
+            increment_shared(config.flags, STAT_SHARED_UNSUPPORTED);
             return;
         }
     };
     if version_ihl >> 4 != 4 {
-        increment(STAT_SHARED_UNSUPPORTED);
+        increment_shared(config.flags, STAT_SHARED_UNSUPPORTED);
         return;
     }
     let header_len = usize::from(version_ihl & 0x0f) * 4;
     if header_len < 20 {
-        increment(STAT_SHARED_UNSUPPORTED);
+        increment_shared(config.flags, STAT_SHARED_UNSUPPORTED);
+        return;
+    }
+    let transport = match ctx.load::<u8>(offset + 9) {
+        Ok(value) => value,
+        Err(_) => {
+            increment_shared(config.flags, STAT_SHARED_UNSUPPORTED);
+            return;
+        }
+    };
+    if transport != IPPROTO_TCP as u8 && transport != IPPROTO_UDP as u8 {
+        increment_shared(config.flags, STAT_SHARED_UNSUPPORTED);
         return;
     }
     let source = match ctx.load::<[u8; 4]>(offset + 12) {
         Ok(value) => value,
         Err(_) => {
-            increment(STAT_SHARED_UNSUPPORTED);
+            increment_shared(config.flags, STAT_SHARED_UNSUPPORTED);
             return;
         }
     };
     if !shared_source_v4_allowed(source, config.flags) {
-        increment(STAT_SHARED_BYPASS_SOURCE);
+        increment_shared(config.flags, STAT_SHARED_BYPASS_SOURCE);
         return;
     }
     let destination = match ctx.load::<[u8; 4]>(offset + 16) {
         Ok(value) => value,
         Err(_) => {
-            increment(STAT_SHARED_UNSUPPORTED);
+            increment_shared(config.flags, STAT_SHARED_UNSUPPORTED);
             return;
         }
     };
-    let transport = match ctx.load::<u8>(offset + 9) {
-        Ok(value) => value,
-        Err(_) => {
-            increment(STAT_SHARED_UNSUPPORTED);
-            return;
-        }
-    };
-    if transport != IPPROTO_TCP as u8 && transport != IPPROTO_UDP as u8 {
-        increment(STAT_SHARED_UNSUPPORTED);
-        return;
-    }
     let fragment = ctx
         .load::<u16>(offset + 6)
         .map(u16::from_be)
@@ -286,51 +294,51 @@ fn select_shared_v4(ctx: &TcContext, offset: usize, config: &EbpfConfig) {
     };
     let hijack_dns = config.flags & FLAG_HIJACK_DNS != 0 && destination_port == 53;
     if !hijack_dns && lookup_v4_bypassed(u32::from_ne_bytes(destination), config.bypass_bank) {
-        increment(STAT_SHARED_BYPASS_DESTINATION);
+        increment_shared(config.flags, STAT_SHARED_BYPASS_DESTINATION);
         return;
     }
     ctx.set_mark(config.mark);
-    increment(STAT_SHARED_SELECTED);
+    increment_shared(config.flags, STAT_SHARED_SELECTED);
 }
 
 fn select_shared_v6(ctx: &TcContext, offset: usize, config: &EbpfConfig) {
     let version = match ctx.load::<u8>(offset) {
         Ok(value) => value >> 4,
         Err(_) => {
-            increment(STAT_SHARED_UNSUPPORTED);
+            increment_shared(config.flags, STAT_SHARED_UNSUPPORTED);
             return;
         }
     };
     if version != 6 {
-        increment(STAT_SHARED_UNSUPPORTED);
+        increment_shared(config.flags, STAT_SHARED_UNSUPPORTED);
         return;
     }
     let source = match ctx.load::<[u8; 16]>(offset + 8) {
         Ok(value) => value,
         Err(_) => {
-            increment(STAT_SHARED_UNSUPPORTED);
+            increment_shared(config.flags, STAT_SHARED_UNSUPPORTED);
             return;
         }
     };
     if !shared_source_v6_allowed(source, config.flags) {
-        increment(STAT_SHARED_BYPASS_SOURCE);
+        increment_shared(config.flags, STAT_SHARED_BYPASS_SOURCE);
         return;
     }
     let destination = match ctx.load::<[u8; 16]>(offset + 24) {
         Ok(value) => value,
         Err(_) => {
-            increment(STAT_SHARED_UNSUPPORTED);
+            increment_shared(config.flags, STAT_SHARED_UNSUPPORTED);
             return;
         }
     };
     let Some((transport, transport_offset, first_fragment)) =
         ipv6_transport(ctx, offset + 40, offset)
     else {
-        increment(STAT_SHARED_UNSUPPORTED);
+        increment_shared(config.flags, STAT_SHARED_UNSUPPORTED);
         return;
     };
     if transport != IPPROTO_TCP as u8 && transport != IPPROTO_UDP as u8 {
-        increment(STAT_SHARED_UNSUPPORTED);
+        increment_shared(config.flags, STAT_SHARED_UNSUPPORTED);
         return;
     }
     let destination_port = if first_fragment {
@@ -342,11 +350,11 @@ fn select_shared_v6(ctx: &TcContext, offset: usize, config: &EbpfConfig) {
     };
     let hijack_dns = config.flags & FLAG_HIJACK_DNS != 0 && destination_port == 53;
     if !hijack_dns && lookup_v6_bypassed(bytes_to_ipv6_words(destination), config.bypass_bank) {
-        increment(STAT_SHARED_BYPASS_DESTINATION);
+        increment_shared(config.flags, STAT_SHARED_BYPASS_DESTINATION);
         return;
     }
     ctx.set_mark(config.mark);
-    increment(STAT_SHARED_SELECTED);
+    increment_shared(config.flags, STAT_SHARED_SELECTED);
 }
 
 fn ipv6_transport(
@@ -383,19 +391,43 @@ fn ipv6_transport(
 }
 
 fn shared_source_v4_allowed(address: [u8; 4], flags: u32) -> bool {
-    let key = aya_ebpf::maps::lpm_trie::Key::new(32, address);
-    if SHARED_EXCLUDE_SOURCE_V4.get(&key).is_some() {
+    if flags & FLAG_SHARED_BLOCK_ALL_V4 != 0 {
         return false;
     }
-    flags & FLAG_SHARED_SOURCE_ANY != 0 || SHARED_SOURCE_V4.get(&key).is_some()
+    if flags & FLAG_SHARED_HAS_EXCLUDE_V4 != 0 {
+        let key = aya_ebpf::maps::lpm_trie::Key::new(32, address);
+        if SHARED_EXCLUDE_SOURCE_V4.get(&key).is_some() {
+            return false;
+        }
+    }
+    if flags & FLAG_SHARED_SOURCE_ANY_V4 != 0 {
+        return true;
+    }
+    if flags & FLAG_SHARED_HAS_INCLUDE_V4 == 0 {
+        return false;
+    }
+    let key = aya_ebpf::maps::lpm_trie::Key::new(32, address);
+    SHARED_SOURCE_V4.get(&key).is_some()
 }
 
 fn shared_source_v6_allowed(address: [u8; 16], flags: u32) -> bool {
-    let key = aya_ebpf::maps::lpm_trie::Key::new(128, address);
-    if SHARED_EXCLUDE_SOURCE_V6.get(&key).is_some() {
+    if flags & FLAG_SHARED_BLOCK_ALL_V6 != 0 {
         return false;
     }
-    flags & FLAG_SHARED_SOURCE_ANY != 0 || SHARED_SOURCE_V6.get(&key).is_some()
+    if flags & FLAG_SHARED_HAS_EXCLUDE_V6 != 0 {
+        let key = aya_ebpf::maps::lpm_trie::Key::new(128, address);
+        if SHARED_EXCLUDE_SOURCE_V6.get(&key).is_some() {
+            return false;
+        }
+    }
+    if flags & FLAG_SHARED_SOURCE_ANY_V6 != 0 {
+        return true;
+    }
+    if flags & FLAG_SHARED_HAS_INCLUDE_V6 == 0 {
+        return false;
+    }
+    let key = aya_ebpf::maps::lpm_trie::Key::new(128, address);
+    SHARED_SOURCE_V6.get(&key).is_some()
 }
 
 fn uid_allowed(uid: u32, config: &EbpfConfig) -> bool {
@@ -545,6 +577,12 @@ fn increment(index: u32) {
         unsafe {
             *value = (*value).wrapping_add(1);
         }
+    }
+}
+
+fn increment_shared(flags: u32, index: u32) {
+    if flags & FLAG_SHARED_PACKET_STATS != 0 {
+        increment(index);
     }
 }
 
