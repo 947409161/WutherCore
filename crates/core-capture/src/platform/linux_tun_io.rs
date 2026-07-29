@@ -144,10 +144,12 @@ fn try_attach(name: &str, vnet_hdr: bool) -> Result<(OwnedFd, String), TunIoErro
     match do_open(name, true, vnet_hdr) {
         Ok(v) => return Ok(v),
         Err(TunIoError::Open(msg)) if is_ebusy(&msg) => {
-            tracing::warn!(target: "capture::linux::tun", iface = %name, "EBUSY (exclusive); tuntap del then retry");
-            let _ = std::process::Command::new("ip")
-                .args(["tuntap", "del", "dev", name, "mode", "tun"])
-                .status();
+            tracing::warn!(target: "capture::linux::tun", iface = %name, "EBUSY (exclusive); deleting stale interface through rtnetlink then retrying");
+            crate::linux_netlink::delete_interface(name.to_owned()).map_err(|error| {
+                TunIoError::Open(format!(
+                    "delete stale TUN `{name}` through rtnetlink after EBUSY: {error}"
+                ))
+            })?;
         }
         Err(e) => return Err(e),
     }

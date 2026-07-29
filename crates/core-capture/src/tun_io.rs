@@ -58,8 +58,8 @@ pub trait TunIo: Send + Sync {
     fn mtu(&self) -> u32;
     /// 设备是否已由宿主平台完成地址/路由配置。
     ///
-    /// Linux/root TUN 返回 `false`，由 native 后端负责 `ip addr`、`ip route`、
-    /// `ip rule`。Android VpnService fd 返回 `true`，因为接口和路由已经由
+    /// Linux/root TUN 返回 `false`，由 native rtnetlink 后端负责地址、路由和
+    /// policy rule。Android VpnService fd 返回 `true`，因为接口和路由已经由
     /// Android framework 根据宿主 App 的 `VpnService.Builder` 配置完成。
     fn is_preconfigured(&self) -> bool {
         false

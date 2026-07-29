@@ -4,6 +4,21 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Linux 与 Android Root TUN 的接口地址、链路状态、策略规则、路由查询和崩溃恢复
+  统一改用 rtnetlink。Android 不再依赖 ROM 自带 `ip`/toybox 的命令语法，并分别
+  使用 IPv4、IPv6 实际物理网络表。
+- Root TUN 规则安装改为事务提交，任一 netlink 操作失败会反向删除已安装规则，
+  路由写入失败不再被忽略。
+
+### Fixed
+
+- 修复 strict-route 崩溃恢复错误构造 `ip rule ... blackhole default`，导致 Android
+  报 `Failed to parse rule type` 并阻止 capture 启动的问题。
+- 修复先附着新 TUN、再恢复旧 journal 时可能误删刚创建的同名 TUN。旧状态现在
+  必须在 `TUNSETIFF` 前恢复，journal 仅在取得有效接口名后写入。
+
 ## [0.3.7] - 2026-07-29
 
 ### Added

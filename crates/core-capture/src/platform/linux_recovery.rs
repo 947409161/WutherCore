@@ -21,7 +21,6 @@ use tracing::{info, warn};
 use crate::engine::{CaptureError, CapturePlan};
 
 const JOURNAL_VERSION: u32 = 1;
-const MAX_PRIORITY_DELETES: usize = 64;
 const NFT_TABLES: [&str; 2] = ["wuther_auto_redirect", "wuthercore_redirect"];
 const IPTABLES_CHAINS: [(&str, &str, &str); 5] = [
     ("mangle", "OUTPUT", "WUTHERCORE_BYPASS"),
@@ -99,12 +98,21 @@ impl RecoveryRecord {
 pub(crate) struct LinuxCaptureGuard {
     file: File,
     path: PathBuf,
-    record: RecoveryRecord,
+    record: Option<RecoveryRecord>,
     clean: bool,
 }
 
 impl LinuxCaptureGuard {
     pub(crate) fn acquire(plan: &CapturePlan, mode: RecoveryMode) -> Result<Self, CaptureError> {
+        let mut guard = Self::recover_before_start()?;
+        guard.arm(plan, mode)?;
+        Ok(guard)
+    }
+
+    /// Recover stale host state and retain the exclusive journal lock before
+    /// a new TUN is attached. Opening first is unsafe: a version-1 recovery
+    /// record can name the same interface and would delete the new device.
+    pub(crate) fn recover_before_start() -> Result<Self, CaptureError> {
         let path = journal_path()?;
         let mut file = OpenOptions::new()
             .create(true)
@@ -130,23 +138,42 @@ impl LinuxCaptureGuard {
                 previous_pid = previous.pid,
                 "stale capture state recovered"
             );
+            file.set_len(0)
+                .and_then(|_| file.sync_all())
+                .map_err(|error| {
+                    recovery_error(format!(
+                        "clear recovered journal {}: {error}",
+                        path.display()
+                    ))
+                })?;
         }
-
-        let record = RecoveryRecord::from_plan(plan, mode);
-        write_record(&mut file, &record, &path)?;
         Ok(Self {
             file,
             path,
-            record,
-            clean: false,
+            record: None,
+            clean: true,
         })
+    }
+
+    pub(crate) fn arm(
+        &mut self,
+        plan: &CapturePlan,
+        mode: RecoveryMode,
+    ) -> Result<(), CaptureError> {
+        let record = RecoveryRecord::from_plan(plan, mode);
+        write_record(&mut self.file, &record, &self.path)?;
+        self.record = Some(record);
+        self.clean = false;
+        Ok(())
     }
 
     pub(crate) fn mark_clean(mut self) -> Result<(), CaptureError> {
         // Ordinary engine cleanup contains legacy best-effort branches. Run
         // the same ownership-bounded sweep used after a crash before declaring
         // the durable journal clean.
-        recover(&self.record)?;
+        if let Some(record) = self.record.as_ref() {
+            recover(record)?;
+        }
         self.file
             .set_len(0)
             .and_then(|_| self.file.sync_all())
@@ -158,7 +185,7 @@ impl LinuxCaptureGuard {
 
 impl Drop for LinuxCaptureGuard {
     fn drop(&mut self) {
-        if !self.clean {
+        if !self.clean && self.record.is_some() {
             warn!(
                 target: "capture::recovery",
                 journal = %self.path.display(),
@@ -239,33 +266,24 @@ fn recover(record: &RecoveryRecord) -> Result<(), CaptureError> {
     cleanup_iptables();
 
     if record.auto_route || record.auto_redirect || record.strict_route {
-        ensure_ip_available()?;
-        let custom_table = record.table.to_string();
-        for family in ["-4", "-6"] {
-            for priority in [
-                record.rule_priority.saturating_sub(3).max(1),
-                record.rule_priority,
-            ] {
-                delete_all_matching_rules(family, priority, Some(&custom_table), false)?;
-            }
-            for table in &record.bypass_tables {
-                for priority in [
-                    record.rule_priority.saturating_sub(2).max(1),
-                    record.rule_priority.saturating_sub(1).max(1),
-                ] {
-                    delete_all_matching_rules(family, priority, Some(table), false)?;
-                }
-            }
-            if record.strict_route {
-                delete_all_matching_rules(
-                    family,
-                    record.rule_priority.saturating_add(1),
-                    None,
-                    true,
-                )?;
-            }
-        }
-        flush_table(record.table);
+        let bypass_tables = record
+            .bypass_tables
+            .iter()
+            .filter_map(|table| parse_route_table(table))
+            .collect::<Vec<_>>();
+        let bypass_any_table = record
+            .bypass_tables
+            .iter()
+            .any(|table| parse_route_table(table).is_none());
+        crate::linux_netlink::recover_owned_policy(
+            record.table,
+            record.rule_priority,
+            bypass_tables,
+            bypass_any_table,
+            record.strict_route,
+        )
+        .map_err(recovery_error)?;
+        crate::linux_netlink::flush_route_table(record.table).map_err(recovery_error)?;
     }
 
     if matches!(record.mode, RecoveryMode::Legacy | RecoveryMode::Tproxy) {
@@ -279,100 +297,38 @@ fn recover(record: &RecoveryRecord) -> Result<(), CaptureError> {
         }
     }
     if matches!(record.mode, RecoveryMode::Legacy | RecoveryMode::Tun) {
-        delete_tun(&record.interface_name);
+        crate::linux_netlink::delete_interface(record.interface_name.clone())
+            .map_err(recovery_error)?;
     }
     Ok(())
 }
 
-fn ensure_ip_available() -> Result<(), CaptureError> {
-    Command::new("ip")
-        .arg("-Version")
-        .stdin(Stdio::null())
-        .output()
-        .map(|_| ())
-        .map_err(|error| recovery_error(format!("cannot run ip for stale-rule recovery: {error}")))
-}
-
-fn delete_all_matching_rules(
-    family: &str,
-    priority: u32,
-    lookup: Option<&str>,
-    blackhole: bool,
-) -> Result<(), CaptureError> {
-    let priority = priority.to_string();
-    for _ in 0..MAX_PRIORITY_DELETES {
-        let mut args = vec![family, "rule", "del", "priority", priority.as_str()];
-        if let Some(table) = lookup {
-            args.extend(["lookup", table]);
-        }
-        if blackhole {
-            args.extend(["blackhole", "default"]);
-        }
-        let output = command_output("ip", &args)?;
-        if output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-            continue;
-        }
-        if is_absent(&output) {
-            return Ok(());
-        }
-        return Err(command_error("ip", &output));
+fn parse_route_table(table: &str) -> Option<u32> {
+    match table.trim() {
+        "local" => Some(255),
+        "main" => Some(254),
+        "default" => Some(253),
+        value => value.parse().ok(),
     }
-    Err(recovery_error(format!(
-        "too many stale {family} rules at priority {priority}"
-    )))
 }
 
 fn probe_bypass_tables() -> Vec<String> {
     let mut tables = Vec::new();
-    for (family, target) in [("-4", "1.1.1.1"), ("-6", "2606:4700:4700::1111")] {
-        let Some(output) = command_output("ip", &[family, "route", "get", target])
-            .ok()
-            .filter(|output| output.status.success())
-        else {
+    for target in ["1.1.1.1", "2606:4700:4700::1111"] {
+        let Ok(target) = target.parse() else {
             continue;
         };
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let words = stdout.split_whitespace().collect::<Vec<_>>();
-        let table = words
-            .windows(2)
-            .find_map(|pair| (pair[0] == "table").then_some(pair[1]))
-            .unwrap_or("main");
-        if !tables.iter().any(|known| known == table) {
-            tables.push(table.to_owned());
+        if let Ok(route) = crate::linux_netlink::lookup_route(target) {
+            let table = route.table.to_string();
+            if !tables.contains(&table) {
+                tables.push(table);
+            }
         }
     }
     if tables.is_empty() {
-        tables.push("main".to_owned());
+        tables.push("254".to_owned());
     }
     tables
-}
-
-fn flush_table(table: u32) {
-    let table = table.to_string();
-    for family in ["-4", "-6"] {
-        let _ = command_output("ip", &[family, "route", "flush", "table", &table]);
-    }
-}
-
-fn delete_exact_ip_rule(family: &str, mark: &str, table: &str) {
-    // Some iproute2 environments (notably WSL) report a netlink permission
-    // error on stderr while still returning exit status 0. Treat diagnostics
-    // as failure and cap retries so crash recovery can never spin forever.
-    for _ in 0..MAX_PRIORITY_DELETES {
-        let Ok(output) = command_output(
-            "ip",
-            &["-f", family, "rule", "del", "fwmark", mark, "lookup", table],
-        ) else {
-            break;
-        };
-        if !output.status.success() || !output.stdout.is_empty() || !output.stderr.is_empty() {
-            break;
-        }
-    }
-}
-
-fn flush_named_table(family: &str, table: &str) {
-    let _ = command_output("ip", &["-f", family, "route", "flush", "table", table]);
 }
 
 fn delete_nft_table(table: &str) {
@@ -399,50 +355,12 @@ fn cleanup_iptables() {
     }
 }
 
-fn delete_tun(interface: &str) {
-    if interface.is_empty() || interface == "lo" {
-        return;
-    }
-    let _ = command_output("ip", &["tuntap", "del", "dev", interface, "mode", "tun"]);
-}
-
 fn command_output(program: &str, args: &[&str]) -> Result<Output, CaptureError> {
     Command::new(program)
         .args(args)
         .stdin(Stdio::null())
         .output()
         .map_err(|error| recovery_error(format!("spawn {program}: {error}")))
-}
-
-fn is_absent(output: &Output) -> bool {
-    let text = format!(
-        "{} {}",
-        String::from_utf8_lossy(&output.stderr),
-        String::from_utf8_lossy(&output.stdout)
-    )
-    .to_ascii_lowercase();
-    [
-        "no such process",
-        "no such file",
-        "cannot find",
-        "not found",
-        "does not exist",
-    ]
-    .iter()
-    .any(|needle| text.contains(needle))
-}
-
-fn command_error(program: &str, output: &Output) -> CaptureError {
-    let detail = if output.stderr.is_empty() {
-        String::from_utf8_lossy(&output.stdout)
-    } else {
-        String::from_utf8_lossy(&output.stderr)
-    };
-    recovery_error(format!(
-        "{program} failed (status={:?}): {}",
-        output.status.code(),
-        detail.trim()
-    ))
 }
 
 fn recovery_error(message: impl Into<String>) -> CaptureError {
@@ -500,5 +418,14 @@ mod tests {
         }"#;
         let record: RecoveryRecord = serde_json::from_str(json).unwrap();
         assert_eq!(record.mode, RecoveryMode::Legacy);
+    }
+
+    #[test]
+    fn legacy_and_android_route_table_names_normalize_to_kernel_ids() {
+        assert_eq!(parse_route_table("local"), Some(255));
+        assert_eq!(parse_route_table("main"), Some(254));
+        assert_eq!(parse_route_table("default"), Some(253));
+        assert_eq!(parse_route_table("10517"), Some(10_517));
+        assert_eq!(parse_route_table("wlan0"), None);
     }
 }

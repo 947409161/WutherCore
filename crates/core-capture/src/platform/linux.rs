@@ -1,7 +1,7 @@
 //! Linux 后端：TUN（/dev/net/tun, ioctl TUNSETIFF）+ TProxy + nftables / iptables。
 //!
 //! M4 完整化：
-//! * `EngineKind::Tun` —— 通过 [`linux_tun_io::open`] 拿到真实 fd；spawn packet
+//! * `EngineKind::Tun` —— 通过 root `/dev/net/tun` 或 tun-rs 拿到真实 fd；spawn packet
 //!   read loop，把 IP 包解析成 [`CaptureEvent`] 推到 channel；写默认路由。
 //! * `EngineKind::Tproxy` —— 安装 nftables 临时规则集，把 mark 流量重定向到本地
 //!   tproxy socket；停止时通过 nft delete table 回滚。
@@ -23,7 +23,6 @@ use crate::{
         linux_auto_redirect::{self, AutoRedirectBackend, RedirectPorts},
         linux_auto_redirect_route::{self, AutoRedirectRouteLease},
         linux_tproxy::{RedirectTcpListener, bind_tcp_redirect_listener_set, run_tcp_redirect},
-        linux_tun_io,
     },
     route_table::{ManagedRoute, RouteTable},
     tproxy_rules,
@@ -72,6 +71,7 @@ struct TunState {
     redirect_listeners: Vec<RedirectTcpListener>,
     redirect_backend: Option<AutoRedirectBackend>,
     redirect_route_lease: Option<AutoRedirectRouteLease>,
+    policy_rule_lease: Option<crate::linux_netlink::PolicyRuleLease>,
     crash_recovery: Option<crate::platform::linux_recovery::LinuxCaptureGuard>,
     redirect_tasks: Option<JoinSet<()>>,
     redirect_stops: Vec<oneshot::Sender<()>>,
@@ -215,142 +215,31 @@ impl LinuxTun {
         plan: &CapturePlan,
         device: &dyn crate::tun_io::TunIo,
     ) -> Result<(), CaptureError> {
-        // tun-rs DeviceBuilder（Linux/Windows/macOS）已配好地址 + MTU + link up。
-        // Android root 走旧 linux_tun_io（仅 ioctl TUNSETIFF），需要手动配置。
         if device.is_preconfigured() {
-            // VpnService：Android framework 已配
             return Ok(());
         }
-
-        // 检查接口是否已经 UP（tun-rs DeviceBuilder 会自动处理）
-        let snapshot = log_iface_snapshot(&plan.interface_name);
-        if snapshot.contains("UP") && snapshot.contains(&plan.tun_v4_cidr.addr().to_string()) {
-            return Ok(());
+        let v4 = plan.tun_v4_addr_cidr().parse().map_err(|error| {
+            CaptureError::DeviceFailed(format!("invalid effective TUN IPv4 address: {error}"))
+        })?;
+        let mut addresses = vec![v4];
+        if is_ipv6_available(&plan.interface_name)
+            && let Some(v6) = plan.tun_v6_addr_cidr()
+        {
+            addresses.push(v6.parse().map_err(|error| {
+                CaptureError::DeviceFailed(format!("invalid effective TUN IPv6 address: {error}"))
+            })?);
         }
-
-        // 未配置（Android root linux_tun_io 路径）：手动 addr + mtu + link up
-        let v4 = plan.tun_v4_addr_cidr();
-        let mtu_s = plan.mtu.to_string();
-        let mtu_ok = matches!(
-            run_logged(
-            "root-tun.link-mtu",
-            "ip",
-            &["link", "set", "dev", &plan.interface_name, "mtu", &mtu_s],
-            true,
-            ),
-            Some(status) if status.success()
-        );
-        let v4_ok = configure_addr_with_ip(false, &v4, &plan.interface_name);
-        let mut v6_ok = true;
-        if let Some(ref v6_cidr) = plan.tun_v6_addr_cidr() {
-            if is_ipv6_available(&plan.interface_name) {
-                v6_ok = configure_addr_with_ip(true, v6_cidr, &plan.interface_name);
-            } else {
-                debug!(
-                    target: "capture::linux::tun",
-                    iface = %plan.interface_name,
-                    "IPv6 disabled on system or interface; skipping v6 addr config"
-                );
-            }
-        }
-        let ip_link_up = matches!(
-            run_logged(
-            "root-tun.link-up",
-            "ip",
-            &["link", "set", "dev", &plan.interface_name, "up"],
-            true,
-            ),
-            Some(status) if status.success()
-        );
-        let ioctl_link_up = linux_tun_io::set_link_up_ioctl(&plan.interface_name).is_ok();
-        let _ = log_iface_snapshot(&plan.interface_name);
-        if plan.auto_redirect && !(mtu_ok && v4_ok && v6_ok && (ip_link_up || ioctl_link_up)) {
-            return Err(CaptureError::DeviceFailed(format!(
-                "auto_redirect requires complete TUN interface configuration \
-                 (mtu={mtu_ok}, ipv4={v4_ok}, ipv6={v6_ok}, link={})",
-                ip_link_up || ioctl_link_up
-            )));
-        }
-        Ok(())
-    }
-}
-
-fn configure_addr_with_ip(v6: bool, cidr: &str, iface: &str) -> bool {
-    let fam_args = if v6 { vec!["-6", "addr"] } else { vec!["addr"] };
-    let mut replace_args: Vec<&str> = fam_args.clone();
-    replace_args.extend_from_slice(&["replace", cidr, "dev", iface]);
-    let r = run_logged("root-tun.addr-replace", "ip", &replace_args, false);
-    if matches!(r, Some(s) if s.success()) {
-        return true;
-    }
-    // 回落 add；EEXIST 视为 OK
-    let mut add_args: Vec<&str> = fam_args;
-    add_args.extend_from_slice(&["add", cidr, "dev", iface]);
-    match std::process::Command::new("ip").args(&add_args).output() {
-        Ok(out) if out.status.success() => {
-            debug!(
-                target: "capture::linux::cmd",
-                phase = "root-tun.addr-add",
-                cmd = "ip",
-                args = ?add_args,
-                "command ok"
-            );
-            true
-        }
-        Ok(out) => {
-            let stderr_raw = String::from_utf8_lossy(&out.stderr);
-            let stderr = stderr_raw.to_lowercase();
-            if stderr.contains("file exists") || stderr.contains("rtnetlink answers: file exists") {
-                true
-            } else if stderr.contains("permission denied") {
-                // SELinux or missing CAP_NET_ADMIN for this address family.
-                // On Android, IPv6 addr config often requires root + permissive SELinux.
-                debug!(
-                    target: "capture::linux::tun",
-                    args = ?add_args,
-                    stderr = %stderr_raw.trim(),
-                    "ip addr config denied (likely IPv6 restricted by SELinux/kernel)"
-                );
-                false
-            } else {
-                warn!(
-                    target: "capture::linux::tun",
-                    args = ?add_args,
-                    stderr = %stderr_raw.trim(),
-                    "ip addr 配置失败"
-                );
-                false
-            }
-        }
-        Err(e) => {
-            warn!(
-                target: "capture::linux::tun",
-                args = ?add_args,
-                error = %e,
-                "ip addr spawn failed"
-            );
-            false
-        }
-    }
-}
-
-fn log_iface_snapshot(iface: &str) -> String {
-    if let Ok(out) = std::process::Command::new("ip")
-        .args(["addr", "show", "dev", iface])
-        .output()
-    {
-        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        debug!(
-            target: "capture::linux::tun",
-            iface,
-            status = ?out.status.code(),
-            stdout = %stdout,
-            stderr = %String::from_utf8_lossy(&out.stderr).trim(),
-            "root tun interface snapshot"
-        );
-        stdout
-    } else {
-        String::new()
+        crate::linux_netlink::configure_tun_interface(
+            plan.interface_name.clone(),
+            u32::from(plan.mtu.get()),
+            addresses,
+        )
+        .map_err(|error| {
+            CaptureError::DeviceFailed(format!(
+                "configure root TUN `{}` via rtnetlink: {error}",
+                plan.interface_name
+            ))
+        })
     }
 }
 
@@ -608,6 +497,31 @@ impl CaptureEngine for LinuxTun {
             route_exclude_set_count = summary.route_exclude_set_count,
             "root tun starting"
         );
+        // Crash recovery must run before TUNSETIFF attaches the requested
+        // interface. Otherwise a stale journal naming the same interface can
+        // delete the newly opened device during recovery.
+        #[cfg(not(target_os = "android"))]
+        let mut startup_recovery = {
+            crate::platform::linux_caps::require_net_admin("Linux Root TUN")
+                .map_err(CaptureError::DeviceFailed)?;
+            Some(crate::platform::linux_recovery::LinuxCaptureGuard::recover_before_start()?)
+        };
+        #[cfg(target_os = "android")]
+        let mut startup_recovery =
+            match crate::platform::linux_caps::has_effective(caps::Capability::CAP_NET_ADMIN) {
+                Ok(true) => Some(
+                    crate::platform::linux_recovery::LinuxCaptureGuard::recover_before_start()?,
+                ),
+                Ok(false) => None,
+                Err(error) => {
+                    warn!(
+                        target: "capture::android",
+                        error = %error,
+                        "cannot inspect CAP_NET_ADMIN; root recovery is unavailable"
+                    );
+                    None
+                }
+            };
         // tun-rs DeviceBuilder 内部处理 ip tuntap add + ioctl TUNSETIFF + 地址配置 + offload。
         // Android VpnService fd 仅作为非 root fallback。
         #[cfg(target_os = "android")]
@@ -651,13 +565,18 @@ impl CaptureEngine for LinuxTun {
         if manage_linux_config {
             crate::platform::linux_caps::require_net_admin("Linux/Android Root TUN")
                 .map_err(CaptureError::DeviceFailed)?;
-            // The device is now known to be root-managed rather than an
-            // Android VpnService fd. Persist crash ownership before the first
-            // route, rule, firewall, or interface mutation.
-            g.crash_recovery = Some(crate::platform::linux_recovery::LinuxCaptureGuard::acquire(
+            let mut recovery = startup_recovery.take().ok_or_else(|| {
+                CaptureError::DeviceFailed(
+                    "root TUN opened without a CAP_NET_ADMIN recovery lock".into(),
+                )
+            })?;
+            // Persist ownership only after the effective kernel-selected name
+            // is known, but before address, route or policy mutation.
+            recovery.arm(
                 &effective_plan,
                 crate::platform::linux_recovery::RecoveryMode::Tun,
-            )?);
+            )?;
+            g.crash_recovery = Some(recovery);
             Self::configure_iface(&effective_plan, device.as_ref())?;
 
             // Bind every required address family before routes or firewall
@@ -673,10 +592,14 @@ impl CaptureEngine for LinuxTun {
 
             // auto_route：将所有目标流量导入 TUN（按 sing-box 默认拆 0/1 + 128/1 双半区
             // 路由，避免覆盖系统已有的 0/0 默认路由），并写入指定 iproute2 表。
+            if (effective_plan.auto_route || effective_plan.strict_route)
+                && !effective_plan.auto_redirect
+            {
+                g.policy_rule_lease = Some(install_root_tun_policy(&self.routes, &effective_plan)?);
+            }
             if effective_plan.auto_route && !effective_plan.auto_redirect {
-                install_auto_route(&self.routes, &effective_plan);
                 // 内核级身份旁路：在 OUTPUT/mangle 链上为 excluded UID/GID/package
-                // 打 fwmark = tun_outbound_mark，触发 install_auto_route 注册的
+                // 打 fwmark = tun_outbound_mark，触发 native policy lease 注册的
                 // `ip rule fwmark ... lookup main` 把这些包从主路由表送出，根本
                 // 不进 TUN（与 mihomo / sing-tun 行为一致）。
                 let bypass_mark = tun_outbound_mark(&effective_plan);
@@ -692,10 +615,6 @@ impl CaptureEngine for LinuxTun {
                         "kernel-level identity bypass installed"
                     );
                 }
-            }
-            // strict_route：在主表里拒绝其它一切，强制流量必经 TUN。
-            if effective_plan.strict_route {
-                install_strict_route(&effective_plan);
             }
         } else {
             info!(
@@ -901,165 +820,30 @@ impl CaptureEngine for LinuxTun {
             return Ok(());
         }
         if !plan.auto_redirect {
-            if plan.strict_route {
-                revert_strict_route(&plan);
-            }
-            // 撤销 auto_route 安装的 main-table bypass rule
             if plan.auto_route {
-                // 内核级身份旁路：与 install 对称，先于 ip rule 清理顺序由
-                // iptables -X 自身管理（与 catch-all 规则无依赖关系）。
                 crate::platform::linux_identity_bypass::revert(&plan);
             }
-            if plan.auto_route && ip_rule_supported() {
-                let out_mark = tun_outbound_mark(&plan);
-                let mark_s = format!("{out_mark:#x}");
-                let bypass_prio =
-                    outbound_bypass_rule_priority(plan.iproute2_rule_index).to_string();
-                let cleanup_tables = outbound_bypass_cleanup_tables();
-                for fam in ["", "-6"] {
-                    for lookup in &cleanup_tables {
-                        let _ = run_ip_logged(
-                            "root-tun.rule-del.outbound-bypass",
-                            fam,
-                            &[
-                                "rule",
-                                "del",
-                                "priority",
-                                &bypass_prio,
-                                "fwmark",
-                                &mark_s,
-                                "lookup",
-                                lookup.as_str(),
-                            ],
-                            false,
-                        );
-                        // 兼容清理旧版本写入的无 priority 规则。
-                        let _ = run_ip_logged(
-                            "root-tun.rule-del.legacy-outbound-bypass",
-                            fam,
-                            &["rule", "del", "fwmark", &mark_s, "lookup", lookup.as_str()],
-                            false,
-                        );
-                    }
-                    let _ = run_ip_logged(
-                        "root-tun.rule-del.legacy-0xff-bypass",
-                        fam,
-                        &["rule", "del", "fwmark", "0xff", "lookup", "main"],
-                        false,
-                    );
-                }
-                // TUN 子网规则清理。
-                let tun_subnet_prio =
-                    tun_subnet_rule_priority(plan.iproute2_rule_index).to_string();
-                let table_s_cleanup = plan.iproute2_table_index.to_string();
-                let v4_cidr = plan.tun_v4_cidr.to_string();
-                let _ = run_ip_logged(
-                    "root-tun.rule-del.tun-subnet",
-                    "",
-                    &[
-                        "rule",
-                        "del",
-                        "priority",
-                        &tun_subnet_prio,
-                        "to",
-                        &v4_cidr,
-                        "lookup",
-                        &table_s_cleanup,
-                    ],
-                    false,
+            if let Some(lease) = g.policy_rule_lease.as_mut()
+                && let Err(error) = lease.remove()
+            {
+                warn!(
+                    target: "capture::linux::tun",
+                    error = %error,
+                    "policy lease cleanup incomplete; crash-recovery sweep will retry"
                 );
-                if let Some(v6_cidr) = plan.tun_v6_cidr {
-                    let v6_cidr = v6_cidr.to_string();
-                    let _ = run_ip_logged(
-                        "root-tun.rule-del.tun-subnet",
-                        "-6",
-                        &[
-                            "rule",
-                            "del",
-                            "priority",
-                            &tun_subnet_prio,
-                            "to",
-                            &v6_cidr,
-                            "lookup",
-                            &table_s_cleanup,
-                        ],
-                        false,
-                    );
-                }
-                // 静态 route-exclude-address 绕过 TUN 表；动态 set 在用户态强制 DIRECT。
-                // Android 的默认网络通常不在 main 表，清理时同时覆盖 main 与当前探测表。
-                let route_bypass_prio =
-                    route_bypass_rule_priority(plan.iproute2_rule_index).to_string();
-                for net in &plan.route_exclude_addresses {
-                    let dest = net.to_string();
-                    let fam = route_rule_family(net);
-                    for lookup in &cleanup_tables {
-                        let _ = run_ip_logged(
-                            "root-tun.rule-del.route-exclude-bypass",
-                            fam,
-                            &[
-                                "rule",
-                                "del",
-                                "priority",
-                                &route_bypass_prio,
-                                "to",
-                                &dest,
-                                "lookup",
-                                lookup.as_str(),
-                            ],
-                            false,
-                        );
-                    }
-                }
-                // 主 ip rule（lookup <custom>）也撤掉。
-                let prio_s = plan.iproute2_rule_index.to_string();
-                let table_s = plan.iproute2_table_index.to_string();
-                if auto_route_uses_catch_all_rule(&plan) {
-                    for fam in ["", "-6"] {
-                        let _ = run_ip_logged(
-                            "root-tun.rule-del.catch-all",
-                            fam,
-                            &["rule", "del", "priority", &prio_s, "lookup", &table_s],
-                            false,
-                        );
-                    }
-                } else {
-                    for net in &plan.route_addresses {
-                        let dest = net.to_string();
-                        let fam = route_rule_family(net);
-                        let _ = run_ip_logged(
-                            "root-tun.rule-del.static-route-address",
-                            fam,
-                            &[
-                                "rule", "del", "priority", &prio_s, "to", &dest, "lookup", &table_s,
-                            ],
-                            false,
-                        );
-                    }
-                }
-                // 兼容清理旧版本 catch-all 规则。当前配置本身就是 catch-all 时，
-                // 上面的 `root-tun.rule-del.catch-all` 已经用完全相同的 selector
-                // 删除过；重复执行只会产生误导性的 ENOENT 日志。
-                if should_cleanup_legacy_catch_all_rule(&plan) {
-                    for fam in ["", "-6"] {
-                        let _ = run_ip_logged(
-                            "root-tun.rule-del.legacy-catch-all",
-                            fam,
-                            &["rule", "del", "priority", &prio_s, "lookup", &table_s],
-                            false,
-                        );
-                    }
-                }
             }
-            self.routes.revert_all();
+            if let Err(error) = self.routes.revert_all_checked() {
+                warn!(
+                    target: "capture::linux::tun",
+                    error = %error,
+                    "route ledger cleanup incomplete; crash-recovery sweep will retry"
+                );
+            }
         }
-        let _ = run_quiet(
-            "ip",
-            &["tuntap", "del", "dev", &plan.interface_name, "mode", "tun"],
-        );
         if let Some(guard) = g.crash_recovery.take() {
             guard.mark_clean()?;
         }
+        g.policy_rule_lease = None;
         g.started = false;
         g.effective_plan = None;
         info!(target: "capture", iface = %plan.interface_name, "linux tun stopped");
@@ -1069,177 +853,186 @@ impl CaptureEngine for LinuxTun {
 
 /* ---------------- auto_route / strict_route / auto_redirect helpers ---------------- */
 
-fn install_auto_route(routes: &RouteTable, plan: &CapturePlan) {
-    // sing-box 风格双半区：0.0.0.0/1 + 128.0.0.0/1 / ::/1 + 8000::/1
-    // 避免与已有 0.0.0.0/0 互相覆盖；同时统一使用自定义路由表 + ip rule。
-    let table = plan.iproute2_table_index;
-    let rule_idx = plan.iproute2_rule_index;
+fn install_root_tun_routes(
+    routes: &RouteTable,
+    plan: &CapturePlan,
+    ipv6_tun: bool,
+) -> Result<(), CaptureError> {
+    if !plan.auto_route {
+        return Ok(());
+    }
     let mut cidrs: Vec<&str> = crate::resource_claims::LINUX_TUN_SPLIT_DEFAULT_V4.to_vec();
-    if plan.tun_v6_cidr.is_some() && is_ipv6_available(&plan.interface_name) {
+    if ipv6_tun {
         cidrs.extend_from_slice(&crate::resource_claims::LINUX_TUN_SPLIT_DEFAULT_V6);
     }
     for cidr in cidrs {
-        if let Ok(net) = cidr.parse() {
-            let _ = routes.add(ManagedRoute {
+        let net = cidr.parse().map_err(|error| {
+            CaptureError::Route(format!("invalid built-in TUN route {cidr}: {error}"))
+        })?;
+        routes
+            .add(ManagedRoute {
                 dest: net,
                 gateway: None,
                 interface: plan.interface_name.clone(),
                 metric: 0,
-                table: Some(table),
-            });
-        }
+                table: Some(plan.iproute2_table_index),
+            })
+            .map_err(CaptureError::Route)?;
     }
-    let table_s = table.to_string();
-    let prio_s = rule_idx.to_string();
-    if ip_rule_supported() {
-        let summary = root_tun_summary(plan);
-        info!(
-            target: "capture::linux::tun",
-            iface = %summary.interface_name,
-            table = summary.table,
-            rule_priority = summary.rule_priority,
-            route_mode = summary.route_mode,
-            route_address_count = summary.route_address_count,
-            route_address_set_count = summary.route_address_set_count,
-            route_exclude_count = summary.route_exclude_count,
-            route_exclude_set_count = summary.route_exclude_set_count,
-            "install root tun policy routing"
-        );
-        // ⭐ 关键：让带 SO_MARK 的 outbound socket 先绕 TUN 走主路由表，否则
-        // 所有代理出站连接节点 IP 时都会被 TUN 截走 → 无限自循环。
-        // priority 必须小于 catch-all TUN rule；Linux ip rule 按 priority 升序匹配。
-        // 探测默认出站接口名，注入全局 SO_BINDTODEVICE（对标 mihomo DefaultInterface）
-        if let Some(iface) = probe_outbound_interface() {
+    Ok(())
+}
+
+fn install_root_tun_policy(
+    routes: &RouteTable,
+    plan: &CapturePlan,
+) -> Result<crate::linux_netlink::PolicyRuleLease, CaptureError> {
+    use crate::linux_netlink::{PolicyFamily, PolicyRule};
+
+    let table = plan.iproute2_table_index;
+    let rule_idx = plan.iproute2_rule_index;
+    let ipv6_tun = plan
+        .tun_v6_cidr
+        .filter(|_| is_ipv6_available(&plan.interface_name));
+    install_root_tun_routes(routes, plan, ipv6_tun.is_some())?;
+
+    let summary = root_tun_summary(plan);
+    info!(
+        target: "capture::linux::tun",
+        iface = %summary.interface_name,
+        table = summary.table,
+        rule_priority = summary.rule_priority,
+        route_mode = summary.route_mode,
+        route_address_count = summary.route_address_count,
+        route_address_set_count = summary.route_address_set_count,
+        route_exclude_count = summary.route_exclude_count,
+        route_exclude_set_count = summary.route_exclude_set_count,
+        backend = "rtnetlink",
+        "install root tun policy routing"
+    );
+
+    let mut rules = Vec::new();
+    let mut bypass_v4 = 254;
+    let mut bypass_v6 = None;
+    if plan.auto_route {
+        let outbound_v4 = crate::linux_netlink::lookup_route(
+            "1.1.1.1"
+                .parse()
+                .expect("hard-coded IPv4 route probe must parse"),
+        )
+        .map_err(|error| {
+            CaptureError::Route(format!(
+                "kernel netlink lookup returned no IPv4 physical route; refusing to install a TUN catch-all: {error}"
+            ))
+        })?;
+        bypass_v4 = outbound_v4.table;
+        let outbound_v6 = crate::linux_netlink::lookup_route(
+            "2606:4700:4700::1111"
+                .parse()
+                .expect("hard-coded IPv6 route probe must parse"),
+        )
+        .ok();
+        bypass_v6 = outbound_v6.as_ref().map(|route| route.table);
+        if let Some(interface) = outbound_v4
+            .interface
+            .or_else(|| outbound_v6.and_then(|route| route.interface))
+        {
             debug!(
                 target: "capture::linux::tun",
-                iface = %iface,
-                "detected default outbound interface for SO_BINDTODEVICE"
+                iface = %interface,
+                table_v4 = bypass_v4,
+                table_v6 = ?bypass_v6,
+                "detected physical outbound routes via rtnetlink"
             );
-            core_outbound::set_outbound_interface(Some(iface));
+            core_outbound::set_outbound_interface(Some(interface));
+        } else {
+            warn!(
+                target: "capture::linux::tun",
+                table_v4 = bypass_v4,
+                table_v6 = ?bypass_v6,
+                "route lookup had no single output interface; SO_BINDTODEVICE remains unchanged"
+            );
         }
+
         let out_mark = tun_outbound_mark(plan);
-        let mark_s = format!("{out_mark:#x}");
-        let outbound_bypass_table = outbound_bypass_lookup_table();
-        let bypass_prio = outbound_bypass_rule_priority(rule_idx).to_string();
-        let route_bypass_prio = route_bypass_rule_priority(rule_idx).to_string();
-        for fam in ["", "-6"] {
-            let _ = run_ip_logged(
-                "root-tun.rule-add.outbound-bypass",
-                fam,
-                &[
-                    "rule",
-                    "add",
-                    "fwmark",
-                    &mark_s,
-                    "lookup",
-                    &outbound_bypass_table,
-                    "priority",
-                    &bypass_prio,
-                ],
-                true,
-            );
-        }
-        // ⭐ TUN 自身子网必须走 TUN 表，优先级高于 route-exclude-bypass，否则
-        // system stack NAT 内部流量（listener SYN-ACK 发往 inet4_next 172.19.0.2）
-        // 会被 172.16.0.0/12 的 exclude 规则截走 → rmnet_data3 → 丢包 → TCP 全死。
-        let tun_subnet_prio = tun_subnet_rule_priority(rule_idx).to_string();
-        let v4_cidr = plan.tun_v4_cidr.to_string();
-        let _ = run_ip_logged(
-            "root-tun.rule-add.tun-subnet",
-            "",
-            &[
-                "rule",
-                "add",
-                "priority",
-                &tun_subnet_prio,
-                "to",
-                &v4_cidr,
-                "lookup",
-                &table_s,
-            ],
-            true,
+        rules.push(
+            PolicyRule::lookup(
+                PolicyFamily::V4,
+                outbound_bypass_rule_priority(rule_idx),
+                bypass_v4,
+            )
+            .with_fw_mark(out_mark),
         );
-        if let Some(v6_cidr) = plan.tun_v6_cidr {
-            let v6_cidr = v6_cidr.to_string();
-            let _ = run_ip_logged(
-                "root-tun.rule-add.tun-subnet",
-                "-6",
-                &[
-                    "rule",
-                    "add",
-                    "priority",
-                    &tun_subnet_prio,
-                    "to",
-                    &v6_cidr,
-                    "lookup",
-                    &table_s,
-                ],
-                true,
+        if let Some(table_v6) = bypass_v6 {
+            rules.push(
+                PolicyRule::lookup(
+                    PolicyFamily::V6,
+                    outbound_bypass_rule_priority(rule_idx),
+                    table_v6,
+                )
+                .with_fw_mark(out_mark),
             );
         }
-        // 静态 route-exclude-address 必须在策略路由层绕回真实默认网络表；
-        // Android 的 main 表经常没有物理默认路由，硬写 main 会让 DIRECT 断网。
-        for net in &plan.route_exclude_addresses {
-            let dest = net.to_string();
-            let fam = route_rule_family(net);
-            let _ = run_ip_logged(
-                "root-tun.rule-add.route-exclude-bypass",
-                fam,
-                &[
-                    "rule",
-                    "add",
-                    "priority",
-                    &route_bypass_prio,
-                    "to",
-                    &dest,
-                    "lookup",
-                    &outbound_bypass_table,
-                ],
-                true,
+        rules.push(
+            PolicyRule::lookup(PolicyFamily::V4, tun_subnet_rule_priority(rule_idx), table)
+                .with_destination(ipnet::IpNet::V4(plan.tun_v4_cidr)),
+        );
+        if let Some(v6) = ipv6_tun {
+            rules.push(
+                PolicyRule::lookup(PolicyFamily::V6, tun_subnet_rule_priority(rule_idx), table)
+                    .with_destination(ipnet::IpNet::V6(v6)),
             );
+        }
+        for net in &plan.route_exclude_addresses {
+            let family = policy_family(net);
+            let bypass = match family {
+                PolicyFamily::V4 => Some(bypass_v4),
+                PolicyFamily::V6 => bypass_v6,
+            };
+            if let Some(bypass) = bypass {
+                rules.push(
+                    PolicyRule::lookup(family, route_bypass_rule_priority(rule_idx), bypass)
+                        .with_destination(*net),
+                );
+            }
         }
         if auto_route_uses_catch_all_rule(plan) {
-            for fam in ["", "-6"] {
-                let _ = run_ip_logged(
-                    "root-tun.rule-add.catch-all",
-                    fam,
-                    &["rule", "add", "priority", &prio_s, "lookup", &table_s],
-                    true,
-                );
+            rules.push(PolicyRule::lookup(PolicyFamily::V4, rule_idx, table));
+            if ipv6_tun.is_some() {
+                rules.push(PolicyRule::lookup(PolicyFamily::V6, rule_idx, table));
             }
         } else {
-            // 纯静态 route_address 白名单时只把命中目标导入 TUN。
-            // 如果配置了 route_address_set，动态集合无法用 ip rule 表达，
-            // 必须用 catch-all + 用户态 DIRECT fallback。
             for net in &plan.route_addresses {
-                let dest = net.to_string();
-                let fam = route_rule_family(net);
-                let _ = run_ip_logged(
-                    "root-tun.rule-add.static-route-address",
-                    fam,
-                    &[
-                        "rule", "add", "priority", &prio_s, "to", &dest, "lookup", &table_s,
-                    ],
-                    true,
+                if net.addr().is_ipv6() && ipv6_tun.is_none() {
+                    continue;
+                }
+                rules.push(
+                    PolicyRule::lookup(policy_family(net), rule_idx, table).with_destination(*net),
                 );
             }
         }
-        info!(
-            target: "capture::linux",
-            table,
-            rule_priority = rule_idx,
-            bypass_rule_priority = %bypass_prio,
-            bypass_lookup = %outbound_bypass_table,
-            route_bypass_rule_priority = %route_bypass_prio,
-            outbound_mark = format_args!("{out_mark:#x}"),
-            "auto_route installed (TUN table + bypass for outbound mark)"
-        );
-    } else {
-        warn!(
-            target: "capture::linux",
-            "ip rule 命令不可用（Android toybox 通常不带）—— auto_route 需要策略路由才能避免 TUN 回环，请安装 iproute2/busybox ip"
-        );
     }
+    if plan.strict_route {
+        let strict_priority = rule_idx.saturating_add(1);
+        rules.push(PolicyRule::blackhole(PolicyFamily::V4, strict_priority));
+        rules.push(PolicyRule::blackhole(PolicyFamily::V6, strict_priority));
+    }
+
+    let lease = crate::linux_netlink::install_policy_rules(rules).map_err(|error| {
+        CaptureError::Route(format!("install Root TUN policy via rtnetlink: {error}"))
+    })?;
+    info!(
+        target: "capture::linux",
+        table,
+        rule_priority = rule_idx,
+        bypass_rule_priority = outbound_bypass_rule_priority(rule_idx),
+        bypass_lookup_v4 = bypass_v4,
+        bypass_lookup_v6 = ?bypass_v6,
+        route_bypass_rule_priority = route_bypass_rule_priority(rule_idx),
+        outbound_mark = format_args!("{:#x}", tun_outbound_mark(plan)),
+        strict_route = plan.strict_route,
+        "root TUN policy installed transactionally"
+    );
+    Ok(lease)
 }
 
 fn tun_outbound_mark(plan: &CapturePlan) -> u32 {
@@ -1258,95 +1051,16 @@ fn tun_subnet_rule_priority(rule_idx: u32) -> u32 {
     rule_idx.saturating_sub(3).max(1)
 }
 
-fn outbound_bypass_lookup_table() -> String {
-    for (family, target) in [("", "1.1.1.1"), ("-6", "2606:4700:4700::1111")] {
-        if let Some(table) = probe_route_get_table(family, target) {
-            return table;
-        }
+fn policy_family(net: &ipnet::IpNet) -> crate::linux_netlink::PolicyFamily {
+    if net.addr().is_ipv6() {
+        crate::linux_netlink::PolicyFamily::V6
+    } else {
+        crate::linux_netlink::PolicyFamily::V4
     }
-    "main".to_string()
-}
-
-fn outbound_bypass_cleanup_tables() -> Vec<String> {
-    let mut tables = vec!["main".to_string()];
-    let current = outbound_bypass_lookup_table();
-    if !tables.contains(&current) {
-        tables.push(current);
-    }
-    tables
-}
-
-fn probe_route_get_table(family_arg: &str, target: &str) -> Option<String> {
-    let mut args = Vec::new();
-    if !family_arg.is_empty() {
-        args.push(family_arg);
-    }
-    args.extend_from_slice(&["route", "get", target]);
-    let out = match std::process::Command::new("ip").args(&args).output() {
-        Ok(out) if out.status.success() => out,
-        Ok(out) => {
-            debug!(
-                target: "capture::linux::tun",
-                args = ?args,
-                status = ?out.status.code(),
-                stderr = %String::from_utf8_lossy(&out.stderr).trim(),
-                "default route table probe failed"
-            );
-            return None;
-        }
-        Err(e) => {
-            debug!(
-                target: "capture::linux::tun",
-                args = ?args,
-                error = %e,
-                "default route table probe spawn failed"
-            );
-            return None;
-        }
-    };
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let table = crate::platform::route_probe::outbound_bypass_table_from_route_get(&stdout);
-    debug!(
-        target: "capture::linux::tun",
-        target,
-        lookup_table = %table,
-        route_get = %stdout.trim(),
-        "detected outbound bypass route table"
-    );
-    Some(table)
-}
-
-fn probe_outbound_interface() -> Option<String> {
-    for (family, target) in [("", "1.1.1.1"), ("-6", "2606:4700:4700::1111")] {
-        let mut args = Vec::new();
-        if !family.is_empty() {
-            args.push(family);
-        }
-        args.extend_from_slice(&["route", "get", target]);
-        let out = match std::process::Command::new("ip").args(&args).output() {
-            Ok(out) if out.status.success() => out,
-            _ => continue,
-        };
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        if let Some(iface) =
-            crate::platform::route_probe::outbound_interface_from_route_get(&stdout)
-        {
-            return Some(iface);
-        }
-    }
-    None
-}
-
-fn route_rule_family(net: &ipnet::IpNet) -> &'static str {
-    if net.addr().is_ipv6() { "-6" } else { "" }
 }
 
 fn auto_route_uses_catch_all_rule(plan: &CapturePlan) -> bool {
     crate::resource_claims::linux_auto_route_is_catch_all(plan)
-}
-
-fn should_cleanup_legacy_catch_all_rule(plan: &CapturePlan) -> bool {
-    !auto_route_uses_catch_all_rule(plan)
 }
 
 fn should_manage_linux_tun_config(device: &dyn TunIo) -> bool {
@@ -1468,33 +1182,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_catch_all_cleanup_is_skipped_when_current_mode_uses_catch_all() {
-        let plan = CapturePlan::from_config(&core_config::model::Capture {
-            on: true,
-            method: core_config::model::CaptureMethod::VirtualNic,
-            ..core_config::model::Capture::default()
-        })
-        .unwrap();
-
-        assert!(auto_route_uses_catch_all_rule(&plan));
-        assert!(!should_cleanup_legacy_catch_all_rule(&plan));
-    }
-
-    #[test]
-    fn legacy_catch_all_cleanup_runs_when_current_mode_uses_static_route_rules() {
-        let mut capture = core_config::model::Capture {
-            on: true,
-            method: core_config::model::CaptureMethod::VirtualNic,
-            ..core_config::model::Capture::default()
-        };
-        capture.tun.route_address = vec!["1.1.1.1/32".into()];
-        let plan = CapturePlan::from_config(&capture).unwrap();
-
-        assert!(!auto_route_uses_catch_all_rule(&plan));
-        assert!(should_cleanup_legacy_catch_all_rule(&plan));
-    }
-
-    #[test]
     fn tun_outbound_mark_defaults_to_sing_tun_output_mark() {
         let plan = CapturePlan::from_config(&core_config::model::Capture {
             on: true,
@@ -1564,7 +1251,12 @@ mod tests {
         })
         .unwrap();
 
-        install_auto_route(&routes, &plan);
+        install_root_tun_routes(
+            &routes,
+            &plan,
+            plan.tun_v6_cidr.is_some() && is_ipv6_available(&plan.interface_name),
+        )
+        .unwrap();
 
         let added = backend.added.lock();
         let expected_routes =
@@ -1657,31 +1349,6 @@ mod tests {
         assert!(stops.is_empty());
         assert!(tasks.is_empty());
         assert_eq!(stopped.load(Ordering::SeqCst), 4);
-    }
-}
-
-fn install_strict_route(plan: &CapturePlan) {
-    if !ip_rule_supported() {
-        warn!(target: "capture::linux", "strict_route 需要 ip rule 支持，但当前 ip 工具不带 —— 已跳过");
-        return;
-    }
-    let prio_s = (plan.iproute2_rule_index + 1).to_string();
-    for fam in ["", "-6"] {
-        let _ = run_ip_quiet(
-            fam,
-            &["rule", "add", "priority", &prio_s, "blackhole", "default"],
-        );
-    }
-    warn!(target: "capture::linux", "strict_route ON：未接管流量将被 drop");
-}
-
-fn revert_strict_route(plan: &CapturePlan) {
-    if !ip_rule_supported() {
-        return;
-    }
-    let prio_s = (plan.iproute2_rule_index + 1).to_string();
-    for fam in ["", "-6"] {
-        let _ = run_ip_quiet(fam, &["rule", "del", "priority", &prio_s]);
     }
 }
 
