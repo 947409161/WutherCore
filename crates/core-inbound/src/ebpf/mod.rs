@@ -133,7 +133,7 @@ pub async fn start_ebpf_inbound(
     let (snapshot, updates) = initial_snapshot(&options, provider.as_deref())?;
     let mut plane = AyaDataPlane::load(&options, &snapshot)?;
     let (tcp, udp, anchors) = plane.take_sockets()?;
-    plane.attach_lookup()?;
+    plane.attach_lookup(options.shared_network.tc_priority)?;
 
     let has_ipv4 = options
         .redirect_address

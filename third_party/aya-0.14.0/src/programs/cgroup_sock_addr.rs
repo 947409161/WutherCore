@@ -81,21 +81,33 @@ impl CgroupSockAddr {
         let prog_fd = prog_fd.as_fd();
         let cgroup_fd = cgroup.as_fd();
         if KernelVersion::at_least(5, 7, 0) {
-            let link_fd = bpf_link_create(
+            match bpf_link_create(
                 prog_fd,
                 LinkTarget::Fd(cgroup_fd),
                 *attach_type,
                 mode.into(),
                 None,
-            )
-            .map_err(|io_error| SyscallError {
-                call: "bpf_link_create",
-                io_error,
-            })?;
-            data.links
-                .insert(CgroupSockAddrLink::new(CgroupSockAddrLinkInner::Fd(
-                    FdLink::new(link_fd),
-                )))
+            ) {
+                Ok(link_fd) => data.links.insert(CgroupSockAddrLink::new(
+                    CgroupSockAddrLinkInner::Fd(FdLink::new(link_fd)),
+                )),
+                // Android vendor kernels frequently report a modern release
+                // while omitting or restricting cgroup BPF links. The legacy
+                // BPF_PROG_ATTACH API is supported by the same cgroup hook and
+                // provides equivalent lifetime management through
+                // ProgAttachLink.
+                Err(io_error) if should_retry_with_prog_attach(&io_error) => {
+                    let link = ProgAttachLink::attach(prog_fd, cgroup_fd, *attach_type, mode)?;
+                    data.links.insert(CgroupSockAddrLink::new(
+                        CgroupSockAddrLinkInner::ProgAttach(link),
+                    ))
+                }
+                Err(io_error) => Err(SyscallError {
+                    call: "bpf_link_create",
+                    io_error,
+                }
+                .into()),
+            }
         } else {
             let link = ProgAttachLink::attach(prog_fd, cgroup_fd, *attach_type, mode)?;
 
@@ -118,6 +130,17 @@ impl CgroupSockAddr {
         let data = ProgramData::from_pinned_path(path, VerifierLogLevel::default())?;
         Ok(Self { data, attach_type })
     }
+}
+
+fn should_retry_with_prog_attach(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EPERM)
+            | Some(libc::EACCES)
+            | Some(libc::EINVAL)
+            | Some(libc::ENOSYS)
+            | Some(libc::EOPNOTSUPP)
+    )
 }
 
 #[derive(Debug, Hash, Eq, PartialEq)]

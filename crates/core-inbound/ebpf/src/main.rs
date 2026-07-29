@@ -4,7 +4,7 @@
 use aya_ebpf::{
     EbpfContext,
     bindings::BPF_F_NO_PREALLOC,
-    helpers::bpf_setsockopt,
+    helpers::{bpf_map_lookup_elem, bpf_setsockopt, bpf_sk_assign, bpf_sk_release},
     macros::{cgroup_sock_addr, classifier, map, sk_lookup},
     maps::{Array, HashMap, LpmTrie, PerCpuArray, SockMap},
     programs::{SkLookupContext, SockAddrContext, TcContext},
@@ -159,6 +159,17 @@ pub fn sendmsg6(ctx: SockAddrContext) -> i32 {
 #[classifier]
 pub fn capture_shared_ingress(ctx: TcContext) -> i32 {
     select_shared_packet(&ctx);
+    TC_ACT_OK
+}
+
+/// Android vendor kernels can allow loading `BPF_PROG_TYPE_SK_LOOKUP` while
+/// rejecting the netns `BPF_LINK_CREATE` operation used to attach it.  The
+/// kernel has supported assigning a socket from TC ingress since Linux 5.7,
+/// so the userspace controller can attach this program to loopback as a
+/// functionally equivalent, link-API-independent data path.
+#[classifier]
+pub fn assign_proxy_socket_tc(ctx: TcContext) -> i32 {
+    assign_marked_socket(&ctx);
     TC_ACT_OK
 }
 
@@ -355,6 +366,66 @@ fn select_shared_v6(ctx: &TcContext, offset: usize, config: &EbpfConfig) {
     }
     ctx.set_mark(config.mark);
     increment_shared(config.flags, STAT_SHARED_SELECTED);
+}
+
+fn assign_marked_socket(ctx: &TcContext) {
+    let Some(config) = CONFIG.get(0) else {
+        return;
+    };
+    let mark = unsafe { (*ctx.skb.skb).mark };
+    if mark != config.mark {
+        return;
+    }
+
+    let protocol = u16::from_be(ctx.skb.protocol() as u16);
+    let assignment = match protocol {
+        ETH_P_IP if config.flags & FLAG_IPV4 != 0 => {
+            let transport = match ctx.load::<u8>(9) {
+                Ok(value) => value,
+                Err(_) => return,
+            };
+            assign_tc_transport(ctx, AF_INET, transport)
+        }
+        ETH_P_IPV6 if config.flags & FLAG_IPV6 != 0 => {
+            let Some((transport, _, _)) = ipv6_transport(ctx, 40, 0) else {
+                return;
+            };
+            assign_tc_transport(ctx, AF_INET6, transport)
+        }
+        _ => return,
+    };
+    match assignment {
+        Ok(()) => increment(STAT_LOOKUP_ASSIGNED),
+        Err(_) => increment(STAT_LOOKUP_FAILED),
+    }
+}
+
+fn assign_tc_transport(ctx: &TcContext, family: u32, protocol: u8) -> Result<(), i32> {
+    let index = if family == AF_INET { 0 } else { 1 };
+    match u32::from(protocol) {
+        IPPROTO_TCP => assign_tc_socket(ctx, &TCP_SOCKETS, index),
+        IPPROTO_UDP => assign_tc_socket(ctx, &UDP_SOCKETS, index),
+        _ => Err(-1),
+    }
+}
+
+fn assign_tc_socket(ctx: &TcContext, sockets: &SockMap, mut index: u32) -> Result<(), i32> {
+    // SockMap is repr(transparent) over its map definition. Taking the address
+    // of the static map produces the same map relocation used by Aya's map
+    // methods while allowing the TC form of bpf_sk_assign to be used.
+    let map = core::ptr::from_ref(sockets).cast_mut().cast();
+    let key = core::ptr::from_mut(&mut index).cast();
+    let socket = unsafe { bpf_map_lookup_elem(map, key) };
+    if socket.is_null() {
+        return Err(-2);
+    }
+    let result = unsafe { bpf_sk_assign(ctx.as_ptr(), socket, 0) };
+    let _ = unsafe { bpf_sk_release(socket) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(result as i32)
+    }
 }
 
 fn ipv6_transport(

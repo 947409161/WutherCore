@@ -57,7 +57,7 @@ pub(crate) enum Syscall<'a> {
 
 /// A system call error.
 #[derive(Debug, Error)]
-#[error("`{call}` failed")]
+#[error("`{call}` failed: {io_error}")]
 pub struct SyscallError {
     /// The name of the syscall which failed.
     pub call: &'static str,

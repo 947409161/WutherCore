@@ -24,7 +24,7 @@ use nix::{
     net::if_::if_nametoindex,
     sys::resource::{RLIM_INFINITY, Resource, setrlimit},
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::{BypassPrefixSnapshot, EbpfInboundError, socket::FamilySockets};
 
@@ -120,6 +120,7 @@ pub(super) struct AyaDataPlane {
     sockets: FamilySockets,
     cgroup_links: Vec<(&'static str, CgroupSockAddrLinkId)>,
     lookup_link: Option<SkLookupLinkId>,
+    lookup_tc_link: Option<SchedClassifierLinkId>,
     shared_program_loaded: bool,
     shared_links: BTreeMap<String, SharedLink>,
     shared_matcher: Option<SharedInterfaceMatcher>,
@@ -249,6 +250,7 @@ impl AyaDataPlane {
             sockets,
             cgroup_links: Vec::new(),
             lookup_link: None,
+            lookup_tc_link: None,
             shared_program_loaded: false,
             shared_links: BTreeMap::new(),
             shared_matcher,
@@ -260,18 +262,103 @@ impl AyaDataPlane {
         Ok(plane)
     }
 
-    pub(super) fn attach_lookup(&mut self) -> Result<(), EbpfInboundError> {
+    pub(super) fn attach_lookup(&mut self, tc_priority: u16) -> Result<(), EbpfInboundError> {
         let netns = File::open("/proc/self/ns/net")
             .map_err(|error| EbpfInboundError::Aya(format!("open current netns: {error}")))?;
-        let program: &mut SkLookup = self
+        let link_result = (|| {
+            let program: &mut SkLookup = self
+                .ebpf
+                .program_mut("assign_proxy_socket")
+                .ok_or_else(|| missing_program("assign_proxy_socket"))?
+                .try_into()
+                .map_err(|error| program_phase_error("prepare sk_lookup program", error))?;
+            program
+                .load()
+                .map_err(|error| program_phase_error("load sk_lookup program", error))?;
+            program.attach(netns).map_err(|error| {
+                program_phase_error("attach sk_lookup to /proc/self/ns/net", error)
+            })
+        })();
+        match link_result {
+            Ok(link) => {
+                self.lookup_link = Some(link);
+                info!(
+                    target: "inbound::ebpf",
+                    attach = "sk_lookup",
+                    netns = "/proc/self/ns/net",
+                    "proxy socket lookup attached"
+                );
+                Ok(())
+            }
+            Err(link_error) => {
+                warn!(
+                    target: "inbound::ebpf",
+                    error = %link_error,
+                    "netns sk_lookup link unavailable; using loopback TC socket assignment"
+                );
+                self.attach_tc_lookup(tc_priority)
+                    .map_err(|fallback_error| {
+                        EbpfInboundError::Aya(format!(
+                            "all proxy socket lookup attach methods failed; primary: {link_error}; \
+                         loopback TC fallback: {fallback_error}; runtime: {}",
+                            ebpf_runtime_diagnostics()
+                        ))
+                    })
+            }
+        }
+    }
+
+    fn attach_tc_lookup(&mut self, priority: u16) -> Result<(), EbpfInboundError> {
+        let program: &mut SchedClassifier = self
             .ebpf
-            .program_mut("assign_proxy_socket")
-            .ok_or_else(|| missing_program("assign_proxy_socket"))?
+            .program_mut("assign_proxy_socket_tc")
+            .ok_or_else(|| missing_program("assign_proxy_socket_tc"))?
             .try_into()
-            .map_err(program_error)?;
-        program.load().map_err(program_error)?;
-        let link = program.attach(netns).map_err(program_error)?;
-        self.lookup_link = Some(link);
+            .map_err(|error| program_phase_error("prepare loopback TC lookup program", error))?;
+        program
+            .load()
+            .map_err(|error| program_phase_error("load loopback TC lookup program", error))?;
+        let link = match program.attach_with_options(
+            "lo",
+            TcAttachType::Ingress,
+            TcAttachOptions::TcxOrder(LinkOrder::first()),
+        ) {
+            Ok(link) => link,
+            Err(tcx_error) => {
+                debug!(
+                    target: "inbound::ebpf",
+                    error = %format_error_chain(&tcx_error),
+                    "loopback TCX attach unavailable; falling back to clsact"
+                );
+                match qdisc_add_clsact("lo") {
+                    Ok(()) | Err(aya::programs::tc::TcError::AlreadyAttached) => {}
+                    Err(error) => {
+                        return Err(program_phase_error("install loopback clsact qdisc", error));
+                    }
+                }
+                program
+                    .attach_with_options(
+                        "lo",
+                        TcAttachType::Ingress,
+                        TcAttachOptions::Netlink(NlOptions {
+                            priority,
+                            handle: TcHandle::AUTO_ASSIGN,
+                            classid: None,
+                        }),
+                    )
+                    .map_err(|error| {
+                        program_phase_error("attach loopback TC lookup through clsact", error)
+                    })?
+            }
+        };
+        self.lookup_tc_link = Some(link);
+        info!(
+            target: "inbound::ebpf",
+            attach = "tc_ingress",
+            interface = "lo",
+            priority,
+            "proxy socket lookup compatibility path attached"
+        );
         Ok(())
     }
 
@@ -493,16 +580,40 @@ impl AyaDataPlane {
     }
 
     pub(super) fn detach_lookup(&mut self) -> Result<(), EbpfInboundError> {
-        let Some(link) = self.lookup_link.take() else {
-            return Ok(());
-        };
-        let program: &mut SkLookup = self
-            .ebpf
-            .program_mut("assign_proxy_socket")
-            .ok_or_else(|| missing_program("assign_proxy_socket"))?
-            .try_into()
-            .map_err(program_error)?;
-        program.detach(link).map_err(program_error)
+        let mut first_error = None;
+        if let Some(link) = self.lookup_link.take() {
+            let result = self
+                .ebpf
+                .program_mut("assign_proxy_socket")
+                .ok_or_else(|| missing_program("assign_proxy_socket"))
+                .and_then(|program| {
+                    let program: &mut SkLookup = program.try_into().map_err(program_error)?;
+                    program.detach(link).map_err(program_error)
+                });
+            if let Err(error) = result {
+                first_error = Some(error);
+            }
+        }
+        if let Some(link) = self.lookup_tc_link.take() {
+            let result = self
+                .ebpf
+                .program_mut("assign_proxy_socket_tc")
+                .ok_or_else(|| missing_program("assign_proxy_socket_tc"))
+                .and_then(|program| {
+                    let program: &mut SchedClassifier =
+                        program.try_into().map_err(program_error)?;
+                    program.detach(link).map_err(program_error)
+                });
+            if let Err(error) = result
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     pub(super) fn take_sockets(&mut self) -> Result<RelaySockets, EbpfInboundError> {
@@ -1007,6 +1118,55 @@ fn map_error(error: impl std::fmt::Display) -> EbpfInboundError {
 
 fn program_error(error: impl std::fmt::Display) -> EbpfInboundError {
     EbpfInboundError::Aya(format!("eBPF program operation failed: {error}"))
+}
+
+fn program_phase_error(
+    phase: &'static str,
+    error: impl std::error::Error + 'static,
+) -> EbpfInboundError {
+    EbpfInboundError::Aya(format!("{phase}: {}", format_error_chain(&error)))
+}
+
+fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(error) = source {
+        let cause = error.to_string();
+        if !message.contains(&cause) {
+            message.push_str(": ");
+            message.push_str(&cause);
+        }
+        source = error.source();
+    }
+    message
+}
+
+fn ebpf_runtime_diagnostics() -> String {
+    let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("unknown")
+    };
+    let kernel = fs::read_to_string("/proc/sys/kernel/osrelease")
+        .unwrap_or_else(|_| "unknown".into())
+        .trim()
+        .to_owned();
+    let selinux = fs::read_to_string("/proc/self/attr/current")
+        .unwrap_or_else(|_| "unavailable".into())
+        .trim_matches(['\0', '\r', '\n'])
+        .to_owned();
+    format!(
+        "kernel={kernel}, uid={}, CapEff={}, CapBnd={}, NoNewPrivs={}, Seccomp={}, SELinux={selinux}",
+        field("Uid:").split_whitespace().next().unwrap_or("unknown"),
+        field("CapEff:"),
+        field("CapBnd:"),
+        field("NoNewPrivs:"),
+        field("Seccomp:")
+    )
 }
 
 #[cfg(test)]
