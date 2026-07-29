@@ -5,6 +5,8 @@ use std::path::PathBuf;
 fn main() -> anyhow::Result<()> {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_WITH_EBPF");
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_OS");
+    println!("cargo:rerun-if-changed=ebpf/Cargo.toml");
+    println!("cargo:rerun-if-changed=ebpf/src");
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if !matches!(target_os.as_str(), "linux" | "android") {
         anyhow::bail!("with_ebpf only supports Linux and Android targets");
