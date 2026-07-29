@@ -400,10 +400,9 @@ jobs:
       fail-fast: false
       matrix:
         platform:
-          # nss-rs links NSS statically on Windows, so Young adds no runtime
-          # dependency to the archive. ARM64 stays on `portable`: the
-          # windows-11-arm image ships no MSYS2, and NSS has no native ARM64
-          # Windows build chain, so its NSS toolchain cannot be provisioned.
+          # ARM64 stays on `portable`: the windows-11-arm image ships no MSYS2,
+          # and NSS has no native ARM64 Windows build chain, so its NSS
+          # toolchain cannot be provisioned.
           - target: x86_64-pc-windows-msvc
             name: windows-amd64-msvc
             runner: windows-2025
@@ -459,6 +458,23 @@ jobs:
             cargo build --release --locked --target "$TARGET" -p wuther-core
           fi
 
+      # NSS's Windows build produces import libraries alongside its DLLs, so the
+      # executable keeps a load-time dependency on nss3.dll and friends even
+      # though nss-rs asks for the static archives. Ship them beside the binary
+      # exactly as the Linux and macOS archives do.
+      - name: Stage Windows runtime libraries
+        if: steps.components.outputs.young == 'true'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.platform.target }}
+        run: >-
+          python scripts/stage-runtime-libraries.py
+          --target "$TARGET"
+          --source "$NSS_DIR/../dist/Release/lib"
+          --require nss3.dll
+          --require nssutil3.dll
+          --require ssl3.dll
+
       - name: Smoke-test Windows binary
         shell: pwsh
         env:
@@ -466,17 +482,22 @@ jobs:
           EXPECT_YOUNG: ${{ steps.components.outputs.young }}
         run: |
           $ErrorActionPreference = 'Stop'
-          # Drop the NSS build tree and MSYS2 from PATH first. nss-rs links NSS
-          # statically on Windows, so the archive ships no NSS DLLs; running with
-          # those directories still on PATH would hide an accidental dynamic link
-          # here and only break on the user's machine.
+          # Drop the NSS build tree and MSYS2 from PATH so the run depends only
+          # on what the archive will actually contain. Windows resolves DLLs
+          # from the executable's own directory first, which is where the
+          # staging step above put them.
           $env:PATH = ($env:PATH -split ';' | Where-Object {
             $_ -and $_ -notmatch 'msys64' -and $_ -notmatch 'dist[\\/]Release[\\/]lib'
           }) -join ';'
 
           $binary = "target/$env:TARGET/release/wuther-core.exe"
           & $binary --version
-          if ($LASTEXITCODE -ne 0) { throw "wuther-core --version failed" }
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output "exit code: $LASTEXITCODE (0xC0000135 means a DLL is missing)"
+            Get-ChildItem (Split-Path $binary) -Filter *.dll |
+              ForEach-Object { Write-Output "staged: $($_.Name)" }
+            throw "wuther-core --version failed"
+          }
 
           if ($env:EXPECT_YOUNG -eq 'true') {
             $components = & $binary components

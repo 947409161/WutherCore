@@ -42,7 +42,7 @@ CI 每个目标的默认预设见下表。留空 `tags` 时按此选择，显式
 | Linux GNU AMD64 / ARM64 | `standard` | ✅ | 动态，归档携带 `.so` |
 | macOS Apple Silicon | `standard` | ✅ | 动态，归档携带 `.dylib` |
 | Linux musl AMD64 / ARM64 | `portable,with_young` | ✅ | 静态 |
-| Windows MSVC AMD64 | `portable,with_young` | ✅ | 静态 |
+| Windows MSVC AMD64 | `portable,with_young` | ✅ | 动态，归档携带 `.dll` |
 | Android ARM64 / ARMv7 | `portable,with_young` | ✅ | 静态 |
 | Windows MSVC ARM64 | `portable` | ❌ | 不适用 |
 
@@ -51,7 +51,9 @@ CI 每个目标的默认预设见下表。留空 `tags` 时按此选择，显式
 - **Linux GNU / macOS**：`nss-rs` 自行拉取并构建 NSS，`setup-neqo` 只补齐 runner
   缺的 gyp / ninja / mercurial / clang；
 - **Windows AMD64**：`mozilla/actions/nss`（neqo CI 同款）提供 NSS 与 MSVC 环境。
-  `nss-rs` 在 Windows 走静态链接，归档不额外携带 NSS 运行库；
+  `nss-rs` 虽然在 Windows 上请求静态库，但 NSS 的 Windows 构建会连同 DLL 一起产出
+  导入库，可执行文件因此仍然在加载期依赖 `nss3.dll` 等，归档与 Linux GNU、macOS
+  一样携带这些运行库；
 - **Android**：`setup-nss-android` 调用 `mozilla/application-services` 的
   `build-nss-android.sh`（Firefox for Android 同款）交叉编译静态 NSS。NSS 与 Rust
   用同一个 NDK 和同一个 API level（见 `build.yml` 的 `ANDROID_API_LEVEL`）；

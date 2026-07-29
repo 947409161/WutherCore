@@ -22,12 +22,23 @@ def arguments() -> argparse.Namespace:
         dest="required",
         help="Runtime library filename that must be staged; may be repeated.",
     )
+    parser.add_argument(
+        "--source",
+        action="append",
+        default=[],
+        dest="sources",
+        type=Path,
+        help=(
+            "Extra directory to stage libraries from; may be repeated. Needed when "
+            "NSS was prebuilt outside the crate's OUT_DIR."
+        ),
+    )
     return parser.parse_args()
 
 
-def discover(build_dir: Path) -> list[Path]:
+def discover(library_dirs: list[Path]) -> list[Path]:
     candidates: dict[str, Path] = {}
-    for library_dir in build_dir.glob("*/out/dist/Release/lib"):
+    for library_dir in library_dirs:
         for pattern in RUNTIME_PATTERNS:
             for source in library_dir.glob(pattern):
                 if not source.is_file():
@@ -45,8 +56,17 @@ def main() -> int:
     if not profile_dir.is_dir():
         raise FileNotFoundError(f"build profile directory not found: {profile_dir}")
 
+    # nss-rs writes NSS under the crate's OUT_DIR when it builds NSS itself. On
+    # targets where CI supplies a prebuilt NSS through NSS_DIR the libraries sit
+    # outside the target directory instead, so callers pass --source.
+    library_dirs = list(build_dir.glob("*/out/dist/Release/lib"))
+    for source_dir in args.sources:
+        if not source_dir.is_dir():
+            raise FileNotFoundError(f"runtime library source not found: {source_dir}")
+        library_dirs.append(source_dir)
+
     staged: set[str] = set()
-    for source in discover(build_dir):
+    for source in discover(library_dirs):
         destination = profile_dir / source.name
         shutil.copy2(source.resolve(strict=True), destination)
         staged.add(source.name)

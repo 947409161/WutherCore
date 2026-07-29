@@ -104,9 +104,9 @@ Release 不会再次调用完整 CI，也不会创建汇总 artifact 后重复�
 `portable` 避开上游尚未覆盖这些目标的 BoringSSL 构建链；可用目标仍能显式选择
 `portable_boringssl` 或具体的 `with_grpc`、`with_utls`、`with_xhttp`。
 
-除 Windows ARM64 外的全部目标都编入 `with_young`。Linux GNU 与 macOS 沿用动态
-NSS 并在归档内携带运行库；musl、Windows AMD64 与 Android 静态链接 NSS，归档仍是
-单文件二进制。Windows ARM64 的 runner 镜像没有 MSYS2，NSS 也没有原生 ARM64
+除 Windows ARM64 外的全部目标都编入 `with_young`。Linux GNU、macOS 与 Windows
+AMD64 使用动态 NSS，归档内携带对应的 `.so`、`.dylib` 与 `.dll`；musl 与 Android
+静态链接 NSS，归档仍是单文件二进制。Windows ARM64 的 runner 镜像没有 MSYS2，NSS 也没有原生 ARM64
 Windows 构建链，对它显式请求 `with_young`（含 `standard`、`all_components`）会让
 构建直接失败，不会静默降级成不含该组件的归档。各目标的 NSS 来源与本地等价命令见
 [组件化构建](BUILDING.md)。
