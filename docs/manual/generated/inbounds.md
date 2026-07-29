@@ -273,7 +273,7 @@ Xray REALITY 服务端监听配置。 字段名同时接受 Xray 的 camelCase �
 
 ## `EbpfInboundOptions`
 
-Aya eBPF inbound. The cgroup programs select local TCP and UDP sockets by UID and destination, TC ingress selects hotspot and forwarded-device traffic, while `sk_lookup` assigns both paths to proxy sockets without iptables, nftables, TPROXY, or destination NAT.
+Aya eBPF inbound. The cgroup programs select local TCP and UDP sockets by UID and destination, TC ingress selects hotspot and forwarded-device traffic. Socket assignment prefers `sk_lookup` and automatically falls back to loopback TC ingress on Android kernels that reject netns BPF links. Neither path requires iptables, nftables, TPROXY, or destination NAT.
 
 [查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5471)
 

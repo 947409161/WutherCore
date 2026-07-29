@@ -19,10 +19,12 @@ PAN、网桥或路由下游接口。它解析 Ethernet、双层 VLAN、IPv4、IP
 分片信息，按源地址与目标旁路集合筛选 TCP/UDP。选中的转发包直接写入同一个
 mark，不依赖发起进程 UID。
 
-对应的 IPv4 或 IPv6 策略路由把带 mark 的包送到本机 local route。挂在当前
-network namespace 的 sk_lookup 程序只接受 loopback 返回流量和已经登记的共享
-网络接口，再把 TCP 或 UDP 包分配给 `core-inbound` 持有的透明 socket。未匹配
-接口进入的真实服务流量不会被接管。
+对应的 IPv4 或 IPv6 策略路由把带 mark 的包送到本机 local route。核心优先把
+sk_lookup 挂到当前 network namespace，再把 TCP 或 UDP 包分配给
+`core-inbound` 持有的透明 socket。如果 Android 厂商内核允许加载程序却拒绝
+netns `BPF_LINK_CREATE`，核心会自动改用 loopback TC ingress，并通过
+`bpf_sk_assign` 完成同样的 socket 分配。该兼容路径不安装 iptables, nftables,
+TPROXY 或 DNAT。未带专用 mark 的真实本机服务流量不会被接管。
 
 核心进程自身的 TGID 始终旁路，避免出站再次进入 eBPF 入站。回环、链路本地、
 RFC1918、CGNAT、ULA、组播、广播、redirect 地址和宿主接口地址也会进入内核
@@ -206,24 +208,28 @@ GitHub Build Matrix 在选择该标签时会安装并缓存同一套工具。
 
 - Linux 或 Android root 环境
 - cgroup v2 挂载点
-- 支持 cgroup sock_addr 与 sk_lookup 的内核
+- 支持 cgroup sock_addr 的内核
+- 支持 sk_lookup，或者支持 TC ingress `bpf_sk_assign`
 - 热点共享需要 SCHED_CLS、TCX 或 clsact 支持
 - 可加载 BPF 程序和创建 BPF map 的权限
 - 修改策略路由、socket mark 与透明 socket 的权限
 
-sk_lookup 需要 Linux 5.9 或更新内核。Android 厂商内核还可能单独关闭 BPF 程序
-类型或限制未签名 BPF 加载。Aya 返回的 verifier 日志和 attach 错误会作为启动错误
-输出，入口不会降级到其它接管方式。
+sk_lookup 需要 Linux 5.9 或更新内核。TC socket assignment 从 Linux 5.7 开始
+可用。启动时先尝试 sk_lookup，程序类型不支持或 link attach 失败时自动切换到
+loopback TC。TCX 不可用时继续切换到 clsact netlink。cgroup BPF link 不可用时
+继续使用 legacy `BPF_PROG_ATTACH`。只有这些路径全部失败时入口才停止，错误会
+包含失败阶段, syscall errno, 内核版本, CapEff, CapBnd, seccomp 状态和 SELinux
+上下文。
 
 ## 启动与清理
 
-启动顺序是加载 map 和程序、绑定透明 socket、挂载 sk_lookup、安装策略路由、
-挂载共享接口 TC，最后挂载 cgroup 程序。TC 或 cgroup 挂载失败时会回滚已有
-link、策略路由和 socket。
+启动顺序是加载 map 和程序, 绑定透明 socket, 挂载 sk_lookup 或 loopback TC,
+安装策略路由, 挂载共享接口 TC, 最后挂载 cgroup 程序。TC 或 cgroup 挂载失败时
+会回滚已有 link, filter, 策略路由和 socket。
 
 关闭时核心先移除共享接口 TC 和 cgroup 程序，阻止新流量进入，再删除策略路由、
-移除 sk_lookup，停止 TCP 和 UDP relay。进程异常退出后 BPF link 随文件描述符
-关闭，下一次启动还会删除该 tag 配置对应的旧策略路由状态。
+移除 sk_lookup 或 loopback TC filter，停止 TCP 和 UDP relay。进程异常退出后
+BPF link 随文件描述符关闭，下一次启动还会删除该 tag 配置对应的旧策略路由状态。
 
 ## 诊断
 
@@ -239,6 +245,8 @@ wuther-core components
 | --- | --- |
 | 打开 cgroup 失败 | `cgroup_path` 是否存在，是否为 cgroup v2 |
 | 加载或 verifier 失败 | 内核 BPF 配置、程序类型和权限 |
+| `bpf_link_create` 失败 | 查看后续日志是否已切换为 `tc_ingress`；切换成功不影响接管 |
+| 所有 lookup 挂载方式失败 | 根据错误中的 errno、CapEff、seccomp 和 SELinux 上下文定位内核限制 |
 | 创建透明 socket 失败 | root 或网络管理能力，redirect 地址格式 |
 | 安装 fwmark rule 失败 | `route_table`、`rule_priority`、外部策略路由冲突 |
 | 热点客户端未进入连接表 | 接口是否匹配、TC 能力、源 CIDR、状态中的共享接口列表 |

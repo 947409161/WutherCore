@@ -98,6 +98,8 @@ Linux 或 Android root TCP REDIRECT。
 capture supervisor，也不安装 iptables、nftables、TPROXY 或 REDIRECT 规则。
 它使用 cgroup socket address 程序选择本机进程流量，使用策略路由把选中的
 socket 送回本机协议栈，再由 `sk_lookup` 分配给核心持有的 TCP 和 UDP socket。
+Android 内核拒绝 netns BPF link 时会自动切换到 loopback TC ingress 的
+`bpf_sk_assign`，无需修改配置。
 启用 `shared_network` 时，它还会把 TC ingress 挂到热点和共享网络的下游接口，
 接管转发设备的 TCP、UDP、DNS 与 QUIC 流量。
 
@@ -139,9 +141,9 @@ inbounds:
 默认关闭，避免热点大流量时为每个包写统计 Map；需要排障时可设置
 `packet_stats: true`。
 
-该入口要求 `with_ebpf` 组件、root 或等价的 BPF 与网络管理能力、cgroup v2，
-以及支持 cgroup sock_addr 和 sk_lookup 的内核。完整部署、字段语义和诊断方法见
-[Aya eBPF 入站](ebpf-inbound.md)。
+该入口要求 `with_ebpf` 组件, root 或等价的 BPF 与网络管理能力, cgroup v2,
+以及 cgroup sock_addr。socket 分配可以使用 sk_lookup，也可以使用 TC ingress
+兼容路径。完整部署, 字段语义和诊断方法见[Aya eBPF 入站](ebpf-inbound.md)。
 
 ## 管理面板监听
 
