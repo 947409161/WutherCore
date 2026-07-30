@@ -332,6 +332,14 @@ impl AyaDataPlane {
                 );
                 match qdisc_add_clsact("lo") {
                     Ok(()) | Err(aya::programs::tc::TcError::AlreadyAttached) => {}
+                    Err(error) if tc_filter_slot_conflict(&error) => {
+                        debug!(
+                            target: "inbound::ebpf",
+                            interface = "lo",
+                            error = %format_error_chain(&error),
+                            "loopback clsact qdisc already exists"
+                        );
+                    }
                     Err(error) => {
                         return Err(program_phase_error("install loopback clsact qdisc", error));
                     }
@@ -497,19 +505,48 @@ impl AyaDataPlane {
                     );
                     match qdisc_add_clsact(name) {
                         Ok(()) | Err(aya::programs::tc::TcError::AlreadyAttached) => {}
+                        Err(error) if tc_filter_slot_conflict(&error) => {
+                            debug!(
+                                target: "inbound::ebpf",
+                                interface = name,
+                                error = %format_error_chain(&error),
+                                "shared-network clsact qdisc already exists"
+                            );
+                        }
                         Err(error) => return Err(program_error(error)),
                     }
-                    program
-                        .attach_with_options(
-                            name,
-                            TcAttachType::Ingress,
-                            TcAttachOptions::Netlink(NlOptions {
-                                priority,
-                                handle: TcHandle::AUTO_ASSIGN,
-                                classid: None,
-                            }),
-                        )
-                        .map_err(program_error)
+                    let attach = program.attach_with_options(
+                        name,
+                        TcAttachType::Ingress,
+                        TcAttachOptions::Netlink(NlOptions {
+                            priority,
+                            handle: TcHandle::AUTO_ASSIGN,
+                            classid: None,
+                        }),
+                    );
+                    match attach {
+                        Err(error) if priority != 0 && tc_filter_slot_conflict(&error) => {
+                            warn!(
+                                target: "inbound::ebpf",
+                                interface = name,
+                                configured_priority = priority,
+                                error = %format_error_chain(&error),
+                                "shared-network TC priority is occupied; retrying with kernel-assigned priority"
+                            );
+                            program
+                                .attach_with_options(
+                                    name,
+                                    TcAttachType::Ingress,
+                                    TcAttachOptions::Netlink(NlOptions {
+                                        priority: 0,
+                                        handle: TcHandle::AUTO_ASSIGN,
+                                        classid: None,
+                                    }),
+                                )
+                                .map_err(program_error)
+                        }
+                        result => result.map_err(program_error),
+                    }
                 }
             }
         })();
@@ -1139,6 +1176,13 @@ fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
         source = error.source();
     }
     message
+}
+
+fn tc_filter_slot_conflict(error: &(dyn std::error::Error + 'static)) -> bool {
+    let message = format_error_chain(error);
+    message.contains("Exclusivity flag on")
+        || message.contains("File exists")
+        || message.contains("os error 17")
 }
 
 fn ebpf_runtime_diagnostics() -> String {
