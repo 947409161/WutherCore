@@ -126,7 +126,7 @@ impl CgroupSockAddr {
         let mut attach_flags = Some(0);
         let (_, program_ids) = query(
             ProgQueryTarget::Fd(cgroup.as_fd()),
-            self.attach_type,
+            self.attach_type.into(),
             0,
             &mut attach_flags,
         )?;
