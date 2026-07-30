@@ -9,9 +9,9 @@ use crate::{
     VerifierLogLevel,
     programs::{
         CgroupAttachMode, FdLink, Link, ProgAttachLink, ProgramData, ProgramError, ProgramType,
-        define_link_wrapper, id_as_key, impl_try_into_fdlink, load_program_with_attach_type,
+        define_link_wrapper, id_as_key, impl_try_into_fdlink, load_program_with_attach_type, query,
     },
-    sys::{LinkTarget, SyscallError, bpf_link_create},
+    sys::{LinkTarget, ProgQueryTarget, SyscallError, bpf_link_create},
     util::KernelVersion,
 };
 
@@ -88,9 +88,12 @@ impl CgroupSockAddr {
                 mode.into(),
                 None,
             ) {
-                Ok(link_fd) => data.links.insert(CgroupSockAddrLink::new(
-                    CgroupSockAddrLinkInner::Fd(FdLink::new(link_fd)),
-                )),
+                Ok(link_fd) => {
+                    data.links
+                        .insert(CgroupSockAddrLink::new(CgroupSockAddrLinkInner::Fd(
+                            FdLink::new(link_fd),
+                        )))
+                }
                 // Android vendor kernels frequently report a modern release
                 // while omitting or restricting cgroup BPF links. The legacy
                 // BPF_PROG_ATTACH API is supported by the same cgroup hook and
@@ -115,6 +118,19 @@ impl CgroupSockAddr {
                 CgroupSockAddrLinkInner::ProgAttach(link),
             ))
         }
+    }
+
+    /// Queries programs and attach flags already present for this program's
+    /// socket-address hook on the target cgroup.
+    pub fn query<T: AsFd>(&self, cgroup: T) -> Result<(u32, Vec<u32>), ProgramError> {
+        let mut attach_flags = Some(0);
+        let (_, program_ids) = query(
+            ProgQueryTarget::Fd(cgroup.as_fd()),
+            self.attach_type,
+            0,
+            &mut attach_flags,
+        )?;
+        Ok((attach_flags.unwrap_or_default(), program_ids))
     }
 
     /// Creates a program from a pinned entry on a bpffs.

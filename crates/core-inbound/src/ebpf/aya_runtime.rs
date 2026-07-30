@@ -381,10 +381,30 @@ impl AyaDataPlane {
                 .ok_or_else(|| missing_program(name))?
                 .try_into()
                 .map_err(program_error)?;
-            program.load().map_err(program_error)?;
+            program
+                .load()
+                .map_err(|error| program_phase_error(name, error))?;
+            let existing = program.query(&cgroup);
             let link = program
                 .attach(&cgroup, CgroupAttachMode::AllowMultiple)
-                .map_err(program_error)?;
+                .map_err(|error| {
+                    let existing = match &existing {
+                        Ok((flags, ids)) => {
+                            format!(
+                                "existing_attach_flags=0x{flags:x}, existing_program_ids={ids:?}"
+                            )
+                        }
+                        Err(query_error) => format!(
+                            "existing_program_query_failed={}",
+                            format_error_chain(query_error)
+                        ),
+                    };
+                    EbpfInboundError::Aya(format!(
+                        "attach cgroup program {name} to {} with allow-multiple: {}; {existing}",
+                        path.display(),
+                        format_error_chain(&error)
+                    ))
+                })?;
             self.cgroup_links.push((name, link));
         }
         Ok(())
